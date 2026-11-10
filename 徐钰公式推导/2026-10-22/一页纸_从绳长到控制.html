@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>一页纸：从一根绳到一只会用力控制的手</title>
+<style>
+  @page { size: A4 landscape; margin: 0; }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0;background:#eef1f7}
+  body{font-family:"Inter","Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;color:#0f172a;-webkit-font-smoothing:antialiased}
+  .sheet{
+    width:1600px;min-height:910px;margin:0 auto;padding:38px 48px 22px;
+    background:
+      radial-gradient(900px 500px at 10% -10%,#e8f0ff,transparent 60%),
+      radial-gradient(800px 500px at 95% 0%,#f3ecff,transparent 60%),
+      #f8fafd;
+    display:flex;flex-direction:column;gap:22px;position:relative;overflow:hidden;
+  }
+  .sheet::after{content:"";position:absolute;inset:0;pointer-events:none;
+    background-image:linear-gradient(rgba(15,23,42,.035) 1px,transparent 1px),linear-gradient(90deg,rgba(15,23,42,.035) 1px,transparent 1px);
+    background-size:56px 56px;mask-image:radial-gradient(circle at 50% 30%,#000 20%,transparent 80%);}
+  header{position:relative;z-index:2;display:flex;align-items:flex-end;justify-content:space-between;gap:24px}
+  .eyebrow{font-size:12px;letter-spacing:.22em;color:#64748b;text-transform:uppercase}
+  h1{margin:8px 0 0;font-size:33px;letter-spacing:-.01em;line-height:1.15}
+  h1 b{color:#2563eb;font-weight:700}
+  .pipeline{display:flex;align-items:center;gap:8px;font-family:Consolas,monospace;font-size:12.5px;color:#475569;flex-wrap:wrap;justify-content:flex-end}
+  .pipeline span{padding:5px 10px;border-radius:999px;background:#fff;border:1px solid #dbe3f0}
+  .pipeline i{color:#94a3b8;font-style:normal}
+
+  .cols{position:relative;z-index:2;display:grid;grid-template-columns:repeat(3,1fr);gap:18px;align-items:start}
+  .col{background:#fff;border:1px solid #e2e8f4;border-radius:16px;padding:20px 18px 18px;display:flex;flex-direction:column;justify-content:flex-start;gap:12px;box-shadow:0 10px 30px rgba(15,23,42,.05)}
+  .col h2{margin:0;font-size:16px;display:flex;align-items:center;gap:9px}
+  .num{display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;border-radius:8px;font-size:13px;color:#fff}
+  .c1 .num{background:#2563eb}.c2 .num{background:#7c3aed}.c3 .num{background:#d97706}
+  .c1 h2 em{color:#2563eb;font-style:normal;font-size:12px;font-weight:600}
+  .c2 h2 em{color:#7c3aed;font-style:normal;font-size:12px;font-weight:600}
+  .c3 h2 em{color:#d97706;font-style:normal;font-size:12px;font-weight:600}
+  .step{border-left:2px solid #e6ebf5;padding-left:11px}
+  .c1 .step{border-color:#cfdcff}.c2 .step{border-color:#e3d5ff}.c3 .step{border-color:#ffe2bd}
+  .step > b{display:block;font-size:13.8px;margin-bottom:4px}
+  .step p{margin:0;font-size:12.8px;color:#475569;line-height:1.65}
+  .f{font-family:Consolas,"Cascadia Mono",monospace;font-size:12px;color:#0f172a;background:#f4f7fd;border:1px solid #e6ecf7;border-radius:6px;padding:2px 6px;display:inline-block;margin-top:3px}
+  .hl{color:#b91c1c;font-weight:600}
+  .ok{color:#047857;font-weight:600}
+
+  footer{position:relative;z-index:2;display:grid;grid-template-columns:1.15fr 1.15fr 1fr;gap:16px}
+  .box{background:#fff;border:1px solid #e2e8f4;border-radius:14px;padding:12px 14px}
+  .box h3{margin:0 0 7px;font-size:12px;letter-spacing:.06em;color:#64748b;text-transform:uppercase}
+  .box p{margin:0;font-size:11.5px;line-height:1.7;color:#334155}
+  .box code{font-family:Consolas,monospace;font-size:11.5px;background:#f1f5fb;padding:1px 5px;border-radius:5px}
+  .warn{color:#b91c1c;font-weight:600}
+  .foot{position:relative;z-index:2;display:flex;justify-content:space-between;font-size:10.5px;color:#94a3b8}
+</style>
+</head>
+<body>
+<div class="sheet">
+
+  <header>
+    <div>
+      <div class="eyebrow">绳驱二轴腕部 · 一页纸</div>
+      <h1>从一根绳的长度，到<b>一只会用力控制的手</b></h1>
+    </div>
+    <div class="pipeline">
+      <span>几何</span><i>→</i><span>绳长</span><i>→</i><span>力臂</span><i>→</i><span>R</span><i>→</i><span>分配</span><i>→</i><span>控制</span><i>→</i><span>固件</span>
+    </div>
+  </header>
+
+  <div class="cols">
+    <!-- 列 1 -->
+    <section class="col c1">
+      <h2><span class="num">1</span>求出 R <em>几何 → 力臂</em></h2>
+
+      <div class="step">
+        <b>拆绳路：只有两段会变</b>
+        <p>P1–P4 在 base、P5–P6 在 roll 件、P7–P8 在 palm。同一刚体上距离恒定，只有 <b>P4–P5</b>（跨 roll）和 <b>P6–P7</b>（跨 pitch）随角度变长。</p>
+      </div>
+
+      <div class="step">
+        <b>每段绳长：余弦定理</b>
+        <p>a、b 是两端到轴的距离，Δ 是零位夹角，h 是沿轴错位。</p>
+        <span class="f">s(θ) = √(a² + b² + h² − 2ab·cos(Δ+θ))</span>
+      </div>
+
+      <div class="step">
+        <b>求导：力臂 = 绳长变化率</b>
+        <p>这也是“轴到绳的垂直距离”，两种算法同一个数。</p>
+        <span class="f">r = −ds/dθ = ab·sin(Δ+θ) / s</span>
+      </div>
+
+      <div class="step">
+        <b>排成 2×3 的表</b>
+        <p>行 = roll / pitch，列 = C1 / C2 / C3。每格是一次同样的计算，共 6 格。</p>
+        <span class="f">τ = R·f&nbsp;&nbsp;（R 单位 m/rad，数值即 m）</span>
+      </div>
+
+      <div class="step">
+        <b>零位长这样</b>
+        <p>C2 的 roll 段：a=27.46、b=37.15、Δ=18.5°</p>
+        <span class="f">s(0)=14.671&nbsp;→&nbsp;r(0)=<span class="hl">−22.05 mm</span></span>
+      </div>
+          <div class="step">
+        <b>为什么只有 6 格</b>
+        <p>每根绳只有 2 段跨关节，3 根绳 × 2 个关节 = 6 格；其余五段是常数，求导为零，不进 R。</p>
+      </div></section>
+
+    <!-- 列 2 -->
+    <section class="col c2">
+      <h2><span class="num">2</span>分配张力 <em>R → 每根绳多紧</em></h2>
+
+      <div class="step">
+        <b>2 个方程、3 个未知数</b>
+        <p>给定力矩 τ，能拉出这个效果的张力有无穷多组——解集的空间是一根<b>直线</b>。</p>
+        <span class="f">f = R⁺τ + t·w</span>
+      </div>
+
+      <div class="step">
+        <b>t 是坐标，w 是方向</b>
+        <p>t 只改变“整体绷多紧”，不改变力矩；w 是零空间方向。<b>t 不是某根绳的力。</b></p>
+        <span class="f">τ = R·f&nbsp;&nbsp;→&nbsp;&nbsp;R·w = 0</span>
+      </div>
+
+      <div class="step">
+        <b>合法性：能不能预紧</b>
+        <p>R 行满秩；零空间里存在<b>全正</b>向量 w（三根一起绷紧、力矩为零）；P=[R;W] 可逆。</p>
+        <span class="f">rank R = 2&nbsp;且&nbsp;w &gt; 0</span>
+      </div>
+
+      <div class="step">
+        <b>TDA：上下限夹逼</b>
+        <p>让最紧的顶到 f<sub>max</sub>、最松的踩到 f<sub>min</sub>，解 2×2 方程得 (α, t)，最多 3 轮。</p>
+        <span class="f">f = α·R⁺τ + t·w，α∈(0,1]</span>
+      </div>
+
+      <div class="step">
+        <b>α&lt;1 是正常饱和</b>
+        <p>力矩做不到就整体按比例打折，不是故障、不是撞墙，<b>不会</b>产生非线性抖动。</p>
+      </div>
+          <div class="step">
+        <b>什么时候这套会失效</b>
+        <p>如果加一根 base 直连 palm 的绳，长度同时依赖两个角，<b>解耦不再成立</b>，R 与 P 都不能再当常数用。</p>
+      </div></section>
+
+    <!-- 列 3 -->
+    <section class="col c3">
+      <h2><span class="num">3</span>闭环控制 <em>张力 → 电机电压</em></h2>
+
+      <div class="step">
+        <b>老办法：在腱空间闭环</b>
+        <p>每根腱配一个 PD，看起来各管各的，但闭环里会冒出 <b>R·Rᵀ</b>，非对角元就是关节间串扰。</p>
+        <span class="f">u = −P⁻¹·Kp·(f − f_d) − kd·ẋ</span>
+      </div>
+
+      <div class="step">
+        <b>新办法：搬到关节空间</b>
+        <p>把控制器架在 (τ, t) 上闭环，R·Rᵀ 消失，每个关节变成独立的一阶响应。</p>
+        <span class="f">u = −P⁻ᵀ·Kp·(τ − τ_d) − kd·ẋ</span>
+      </div>
+
+      <div class="step">
+        <b>只差一个上标</b>
+        <p>解耦不是调参数，是换坐标；而且 <b>P⁻ᵀ·q̇ = ẋ</b>，阻尼项可以直接用电机侧的腱速度。</p>
+        <span class="f">P⁻¹ → P⁻ᵀ</span>
+      </div>
+
+      <div class="step">
+        <b>实测效果</b>
+        <p>中段稳定时间 1.3→0.97 s，近端 2.2→1.7 s（约 −25%），且没有反向过冲。</p>
+        <span class="f ok">同样硬件，响应干净了</span>
+      </div>
+
+      <div class="step">
+        <b>每 1 ms 跑什么</b>
+        <p>采样 → τ=R·f（用<b>测量</b>张力）→ 目标 τ_d → TDA → 控制律 → ±U 限幅 → 驱动。</p>
+        <span class="f">1 kHz · 无堆 · 状态机</span>
+      </div>
+          <div class="step">
+        <b>上板前的验证顺序</b>
+        <p>R 校验（秩、w 全正）→ 上电自检（P·P⁻¹）→ 零力矩预紧 → 四象限误差 → 饱和 → 故障注入。</p>
+      </div></section>
+  </div>
+
+  <footer>
+    <div class="box">
+      <h3>三条不变式</h3>
+      <p><code>τ = R f</code> 力矩只在 R 的列空间里；<code>t = W f</code> 预紧量只在零空间里；<code>(τ,t) = P f</code> 两者拼成方阵，所以能反解。</p>
+    </div>
+    <div class="box">
+      <h3>三个坑</h3>
+      <p><span class="warn">单位</span>：R 用 m 还是 cm，Kp 差 100 倍；<span class="warn">t</span> 是坐标不是力；<span class="warn">满秩</span>≠存在全正预紧≈任意力矩可实现。</p>
+    </div>
+    <div class="box">
+      <h3>三个数</h3>
+      <p><code>3621</code> 个验证姿态；<code>0.0327 mm</code> 是差分截断不是模型误差；<code>1664</code> 个姿态无全正预紧。</p>
+    </div>
+  </footer>
+
+  <div class="foot">
+    <span>来源：绳驱二轴腕部解析公式 · Robonaut 2 解耦力矩控制（IJRR 2013）· H7 实时 R 算法</span>
+    <span>几何：24 点 CAD 中心折线模型</span>
+  </div>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,1449 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>绳驱二轴腕部 · 公式可视化沙盘</title>
+<style>
+  :root{
+    --bg:#05070f;
+    --bg2:#0a1020;
+    --panel:rgba(16,23,42,.72);
+    --line:rgba(122,152,210,.18);
+    --ink:#e9eefb;
+    --muted:#95a4c4;
+    --cyan:#22d3ee;
+    --violet:#a78bfa;
+    --amber:#fbbf24;
+    --pink:#fb7185;
+    --grad:linear-gradient(115deg,#22d3ee,#a78bfa 48%,#fbbf24);
+    --mono:"JetBrains Mono",Consolas,"Cascadia Mono",monospace;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{
+    margin:0;background:var(--bg);color:var(--ink);
+    font-family:"Inter","Segoe UI Variable","Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+    -webkit-font-smoothing:antialiased;overflow-x:hidden;
+  }
+  body::before{
+    content:"";position:fixed;inset:0;z-index:-2;pointer-events:none;
+    background:
+      radial-gradient(900px 600px at 12% -8%,rgba(34,211,238,.16),transparent 60%),
+      radial-gradient(800px 700px at 88% 8%,rgba(167,139,250,.15),transparent 60%),
+      radial-gradient(900px 700px at 50% 105%,rgba(251,191,36,.09),transparent 60%),
+      linear-gradient(180deg,#05070f,#070b16 40%,#05070f);
+  }
+  body::after{
+    content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;opacity:.35;
+    background-image:linear-gradient(rgba(120,150,210,.06) 1px,transparent 1px),
+                     linear-gradient(90deg,rgba(120,150,210,.06) 1px,transparent 1px);
+    background-size:64px 64px;
+    mask-image:radial-gradient(circle at 50% 20%,#000 10%,transparent 75%);
+  }
+  #progress{position:fixed;top:0;left:0;height:2px;width:0;z-index:100;background:var(--grad);box-shadow:0 0 12px rgba(34,211,238,.8)}
+  .wrap{width:100%;max-width:1180px;margin:0 auto;padding:0 24px}
+  .reveal{opacity:0;transform:translateY(26px);transition:opacity .9s cubic-bezier(.2,.7,.2,1),transform .9s cubic-bezier(.2,.7,.2,1)}
+  .reveal.in{opacity:1;transform:none}
+  .eyebrow{font-size:12px;letter-spacing:.22em;text-transform:uppercase;color:var(--muted)}
+  h1,h2,h3{margin:0;font-weight:650;letter-spacing:-.01em}
+  p{line-height:1.85;color:#c2cde5}
+  .grad{background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent}
+  code,.mono{font-family:var(--mono)}
+
+  /* ---------- hero ---------- */
+  header{position:relative;min-height:100vh;display:flex;align-items:center;overflow:hidden}
+  .hero-orbs{position:absolute;inset:0;pointer-events:none}
+  .orb{position:absolute;border-radius:50%;filter:blur(60px);opacity:.5;animation:float 16s ease-in-out infinite}
+  .orb.a{width:420px;height:420px;left:-80px;top:12%;background:rgba(34,211,238,.35)}
+  .orb.b{width:520px;height:520px;right:-120px;top:0;background:rgba(167,139,250,.32);animation-delay:-6s}
+  .orb.c{width:360px;height:360px;left:40%;bottom:-160px;background:rgba(251,191,36,.18);animation-delay:-11s}
+  @keyframes float{0%,100%{transform:translate3d(0,0,0) scale(1)}50%{transform:translate3d(20px,-30px,0) scale(1.08)}}
+  .hero-inner{position:relative;z-index:2;padding:120px 0 90px}
+  .badges{display:flex;flex-wrap:wrap;gap:8px;margin:22px 0 0}
+  .chip{font-size:12px;padding:6px 12px;border-radius:999px;border:1px solid var(--line);background:rgba(255,255,255,.03);color:#b9c6e2}
+  .chip b{color:var(--ink);font-weight:600}
+  h1{font-size:clamp(40px,7vw,86px);line-height:1.02;margin-top:18px}
+  .hero-sub{max-width:640px;font-size:clamp(15px,1.4vw,18px);margin-top:26px;color:#a9b7d4}
+  .hero-meta{display:flex;gap:34px;margin-top:44px;flex-wrap:wrap}
+  .stat b{display:block;font-family:var(--mono);font-size:26px;color:#fff;letter-spacing:-.02em}
+  .stat span{font-size:12px;color:var(--muted);letter-spacing:.08em}
+  .scroll-hint{position:absolute;left:50%;bottom:26px;transform:translateX(-50%);font-size:11px;letter-spacing:.28em;color:var(--muted);display:flex;flex-direction:column;align-items:center;gap:10px}
+  .scroll-hint i{display:block;width:1px;height:42px;background:linear-gradient(#22d3ee,transparent);animation:pulse 1.8s ease-in-out infinite}
+  @keyframes pulse{0%,100%{opacity:.2;transform:scaleY(.6)}50%{opacity:1;transform:scaleY(1)}}
+
+  /* ---------- sections ---------- */
+  section{position:relative;padding:96px 0}
+  .sec-head{display:flex;align-items:baseline;gap:18px;margin-bottom:10px}
+  .sec-num{font-family:var(--mono);font-size:13px;color:var(--cyan);letter-spacing:.1em}
+  h2{font-size:clamp(26px,3.4vw,40px);line-height:1.15}
+  .lead{max-width:760px;font-size:16px;margin-top:16px}
+  .divider{height:1px;background:linear-gradient(90deg,transparent,var(--line),transparent);margin:0 0 70px}
+
+  /* ---------- stage ---------- */
+  .stage{display:grid;grid-template-columns:minmax(0,1.55fr) minmax(0,1fr);gap:18px;align-items:stretch}
+  .viewport{position:relative;border:1px solid var(--line);border-radius:22px;overflow:hidden;background:
+      radial-gradient(700px 420px at 50% 0%,rgba(34,211,238,.10),transparent 70%),
+      linear-gradient(180deg,rgba(12,19,36,.9),rgba(6,10,20,.95));min-height:620px}
+  #scene{position:absolute;inset:0;display:block;width:100%;height:100%;cursor:grab;touch-action:none}
+  #scene.drag{cursor:grabbing}
+  .vp-tag{position:absolute;top:14px;left:14px;font-size:11px;letter-spacing:.16em;color:#9fb0d0;background:rgba(6,10,20,.6);border:1px solid var(--line);padding:6px 10px;border-radius:999px}
+  .vp-hint{position:absolute;bottom:12px;left:14px;font-size:11px;color:#7d8cab}
+  .legend{position:absolute;top:14px;right:14px;display:flex;flex-direction:column;gap:7px;font-size:11px;color:#a9b7d4;background:rgba(6,10,20,.55);border:1px solid var(--line);padding:10px 12px;border-radius:12px}
+  .legend i{display:inline-block;width:18px;height:3px;border-radius:2px;margin-right:8px;vertical-align:middle}
+  .panel{border:1px solid var(--line);border-radius:22px;background:var(--panel);backdrop-filter:blur(12px);padding:20px}
+  .ctl-row{display:grid;grid-template-columns:64px 1fr 74px;align-items:center;gap:12px;margin-bottom:18px}
+  .ctl-row label{font-size:12px;color:var(--muted);letter-spacing:.04em}
+  .ctl-row output{font-family:var(--mono);font-size:13px;text-align:right;color:#eaf1ff}
+  input[type=range]{-webkit-appearance:none;appearance:none;height:2px;border-radius:2px;background:linear-gradient(90deg,rgba(34,211,238,.8),rgba(167,139,250,.8));outline:none}
+  input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:16px;height:16px;border-radius:50%;background:#fff;box-shadow:0 0 0 4px rgba(34,211,238,.22),0 0 16px rgba(34,211,238,.7);cursor:pointer}
+  .btn{font:inherit;font-size:12px;color:#0a1020;background:linear-gradient(115deg,#8ee9f7,#cbb8ff);border:0;border-radius:10px;padding:9px 14px;cursor:pointer;font-weight:650;letter-spacing:.02em}
+  .btn.ghost{background:transparent;color:#bcc9e4;border:1px solid var(--line)}
+  .btn:active{transform:translateY(1px)}
+  .btn-row{display:flex;gap:8px;margin:4px 0 18px}
+  .readout{font-family:var(--mono);font-size:12.5px}
+  .ro-row{display:grid;grid-template-columns:38px 1fr 1fr 62px;gap:6px;padding:7px 0;border-top:1px dashed rgba(122,152,210,.14);align-items:baseline}
+  .ro-row.head{color:var(--muted);font-size:11px;border-top:0}
+  .ro-row .nm{font-weight:700}
+  .ro-row .d{color:#6f7f9e;font-size:11px}
+  .matrix{display:grid;grid-template-columns:44px repeat(3,1fr);gap:6px;margin-top:18px}
+  .matrix .h{font-size:10.5px;color:var(--muted);display:flex;align-items:center;justify-content:center;letter-spacing:.06em}
+  .cell{border-radius:10px;padding:10px 6px;text-align:center;font-family:var(--mono);font-size:13px;border:1px solid rgba(122,152,210,.16);background:rgba(255,255,255,.02)}
+  .cell.neg{color:#ffd7dd}
+  .cell.pos{color:#d6fff6}
+  .tau{display:flex;gap:10px;margin-top:14px;font-family:var(--mono);font-size:12.5px;color:#c9d6ef}
+  .tau div{flex:1;border:1px solid var(--line);border-radius:10px;padding:9px 10px;background:rgba(255,255,255,.02)}
+  .tau span{color:#7f8eae;font-size:11px;display:block;margin-bottom:3px}
+
+  /* ---------- generic cards ---------- */
+  .cols{display:grid;grid-template-columns:1fr 1fr;gap:36px;align-items:center}
+  .card{border:1px solid var(--line);border-radius:18px;padding:22px;background:rgba(14,21,38,.6)}
+  .card h3{font-size:15px;margin-bottom:10px;color:#eaf1ff}
+  .card p{font-size:14px;margin:0;color:#a9b7d4}
+  .eq{font-family:"Cambria Math",Cambria,"Times New Roman",serif;font-size:clamp(19px,2.2vw,27px);line-height:1.7;color:#f2f6ff;text-align:center}
+  .eq .small{font-size:.62em;color:#9fb0d0}
+  .frac{display:inline-flex;flex-direction:column;text-align:center;vertical-align:middle;margin:0 .18em}
+  .frac .num{border-bottom:1.5px solid rgba(233,238,251,.75);padding:0 .34em .1em}
+  .frac .den{padding:.12em .34em 0}
+  .eqbox{border:1px solid var(--line);border-radius:18px;padding:26px 20px;background:
+      radial-gradient(400px 160px at 50% 0%,rgba(34,211,238,.12),transparent 70%),rgba(10,16,30,.7);margin:22px 0}
+  ul.clean{margin:0;padding-left:0;list-style:none}
+  ul.clean li{position:relative;padding-left:22px;margin:14px 0;color:#b6c3dd;line-height:1.75;font-size:14.5px}
+  ul.clean li::before{content:"";position:absolute;left:2px;top:.62em;width:7px;height:7px;border-radius:2px;background:var(--grad)}
+  ul.clean b{color:#fff;font-weight:600}
+  canvas.chart{width:100%;height:240px;display:block}
+  .chart-pad{padding:8px 0 0}
+  .cap{font-size:12px;color:#7d8cab;margin-top:10px}
+  .kbd{font-family:var(--mono);font-size:12px;padding:2px 6px;border-radius:5px;border:1px solid var(--line);color:#cddaf3}
+
+  /* ---------- verification ---------- */
+  .counters{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin:26px 0 34px}
+  .counter{border:1px solid var(--line);border-radius:16px;padding:18px;background:rgba(14,21,38,.6)}
+  .counter b{display:block;font-family:var(--mono);font-size:24px;color:#fff;letter-spacing:-.02em}
+  .counter span{font-size:11.5px;color:var(--muted);display:block;margin-top:6px;line-height:1.5}
+  .bars{display:grid;gap:14px}
+  .bar-row{display:grid;grid-template-columns:190px 1fr 110px;gap:14px;align-items:center;font-size:12.5px;color:#b6c3dd}
+  .track{height:8px;border-radius:999px;background:rgba(255,255,255,.05);overflow:hidden}
+  .fill{height:100%;width:0;border-radius:999px;background:var(--grad);transition:width 1.4s cubic-bezier(.2,.8,.2,1)}
+  .bar-row .v{font-family:var(--mono);color:#e7eefc;text-align:right;font-size:12px}
+
+  /* ---------- cheat sheet ---------- */
+  .grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}
+  .formula{border:1px solid var(--line);border-radius:16px;padding:18px;background:rgba(14,21,38,.55);min-height:132px}
+  .formula .t{font-size:11px;letter-spacing:.14em;color:var(--cyan);margin-bottom:12px}
+  .formula .f{font-family:"Cambria Math",Cambria,"Times New Roman",serif;font-size:17px;color:#eef3ff;line-height:1.6}
+  .formula .n{font-size:11.5px;color:#8394b5;margin-top:10px;line-height:1.6}
+  footer{padding:70px 0 60px;border-top:1px solid var(--line);color:#7d8cab;font-size:12.5px}
+  footer a{color:#a9d8ff;text-decoration:none;border-bottom:1px dotted rgba(169,216,255,.4)}
+  .src{display:flex;flex-wrap:wrap;gap:18px;margin-top:14px}
+
+  @media (max-width:920px){
+    .stage,.cols{grid-template-columns:1fr}
+    .counters{grid-template-columns:repeat(2,1fr)}
+    .grid3{grid-template-columns:1fr}
+    .bar-row{grid-template-columns:130px 1fr 90px}
+    .viewport{min-height:480px}
+    section{padding:70px 0}
+  }
+</style>
+</head>
+<body>
+<div id="progress"></div>
+
+<header>
+  <div class="hero-orbs"><div class="orb a"></div><div class="orb b"></div><div class="orb c"></div></div>
+  <div class="wrap hero-inner">
+    <div class="eyebrow">绳驱二轴腕部 · 解析模型 v2.0 · 交互图解</div>
+    <h1>一根绳的长度<br><span class="grad">变成整只手腕的力矩</span></h1>
+    <p class="hero-sub">把 PDF 里从虚功到力臂矩阵的推理链，做成可以拖动、可以看见的东西。三根绳、两个关节、六组系数，所有数字都来自真实 CAD 标点与复核数据。</p>
+    <div class="badges">
+      <div class="chip"><b>38</b> 条公式</div>
+      <div class="chip"><b>7</b> 步推理</div>
+      <div class="chip"><b>3,621</b> 个验证姿态</div>
+      <div class="chip">单位 mm · rad</div>
+    </div>
+    <div class="hero-meta">
+      <div class="stat"><b>2 × 3</b><span>力臂矩阵 R</span></div>
+      <div class="stat"><b>24 mm</b><span>两轴最短偏置</span></div>
+      <div class="stat"><b>6</b><span>组 α / β / γ</span></div>
+      <div class="stat"><b>−22.05</b><span>mm · C2 对 roll</span></div>
+    </div>
+  </div>
+  <div class="scroll-hint"><span>向下滚动</span><i></i></div>
+</header>
+
+<main>
+<!-- 01 stage -->
+<section id="stage">
+  <div class="wrap">
+    <div class="sec-head reveal"><span class="sec-num">01 / 沙盘</span><h2>先动手：这是一个活的二轴腕</h2></div>
+    <p class="lead reveal">拖动滑块，三根绳会实时变形。右侧同时用两条完全独立的路线算绳长：<b>几何真值</b>（P1→P8 逐段量）和<b>闭式公式</b>（c + s<sub>r</sub> + s<sub>p</sub>）。它们必须相等——这就是整份推导的第一个证据。</p>
+    <div class="divider"></div>
+
+    <div class="stage reveal">
+      <div class="viewport">
+        <canvas id="scene"></canvas>
+        <div class="vp-tag">REAL GEOMETRY · P1–P8</div>
+        <div class="legend">
+          <div><i style="background:#22d3ee"></i>绳 C1</div>
+          <div><i style="background:#a78bfa"></i>绳 C2</div>
+          <div><i style="background:#fbbf24"></i>绳 C3</div>
+          <div style="opacity:.6"><i style="background:#fff"></i>导向点 / 轴线</div>
+        </div>
+        <div class="vp-hint">拖动旋转视角 · 白点 ＝ 导向点 P1–P8</div>
+      </div>
+
+      <div class="panel">
+        <div class="ctl-row">
+          <label>roll θ<sub>r</sub></label>
+          <input id="sl-r" type="range" min="-25" max="25" step="0.5" value="0">
+          <output id="out-r">0.0°</output>
+        </div>
+        <div class="ctl-row">
+          <label>pitch θ<sub>p</sub></label>
+          <input id="sl-p" type="range" min="-25" max="45" step="0.5" value="0">
+          <output id="out-p">0.0°</output>
+        </div>
+        <div class="btn-row">
+          <button class="btn" id="btn-play">暂停扫掠</button>
+          <button class="btn ghost" id="btn-zero">回零位</button>
+        </div>
+
+        <div class="readout">
+          <div class="ro-row head"><span></span><span>几何真值 l</span><span>闭式 c+s<sub>r</sub>+s<sub>p</sub></span><span>Δ</span></div>
+          <div class="ro-row" id="ro-0"><span class="nm" style="color:#22d3ee">C1</span><span class="g">—</span><span class="c">—</span><span class="d">—</span></div>
+          <div class="ro-row" id="ro-1"><span class="nm" style="color:#a78bfa">C2</span><span class="g">—</span><span class="c">—</span><span class="d">—</span></div>
+          <div class="ro-row" id="ro-2"><span class="nm" style="color:#fbbf24">C3</span><span class="g">—</span><span class="c">—</span><span class="d">—</span></div>
+        </div>
+
+        <div class="matrix" id="mat">
+          <div class="h"></div><div class="h">绳 C1</div><div class="h">绳 C2</div><div class="h">绳 C3</div>
+        </div>
+        <div class="tau">
+          <div><span>roll 力矩</span><b id="tau-r">—</b></div>
+          <div><span>pitch 力矩</span><b id="tau-p">—</b></div>
+        </div>
+        <p class="cap" style="margin-top:12px">力矩按 f = (10, 10, 10) N 计算；R 单位 mm/rad，即每 1 N 产生约 1 mN·m。</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- 02 virtual work -->
+<section id="work">
+  <div class="wrap">
+    <div class="sec-head reveal"><span class="sec-num">02 / 第①步</span><h2>为什么"绳长变化率"就是力臂</h2></div>
+    <p class="lead reveal">不用去找"力到轴的垂直距离"——绳子是折线，那个距离处处在变。只做一件事：让关节转一个极小角度，看绳被拉长多少。</p>
+    <div class="divider"></div>
+
+    <div class="cols">
+      <div class="reveal" style="border:1px solid var(--line);border-radius:20px;background:rgba(10,16,30,.6);padding:10px">
+        <canvas id="spool" class="chart" style="height:300px"></canvas>
+        <div class="cap" style="text-align:center">转 dθ → 收线 dl = r·dθ，力矩 = f·r</div>
+      </div>
+      <div class="reveal">
+        <div class="eqbox">
+          <div class="eq">τᵀdq = −fᵀdl</div>
+          <div class="eq" style="margin-top:18px">R = −(∂l/∂q)ᵀ</div>
+        </div>
+        <ul class="clean">
+          <li><b>能量守恒</b>：关节做的功，等于绳被拉长吸收的功。任意 dq 都成立，所以逐项相等。</li>
+          <li><b>半径即力臂</b>：绳绕在半径 r 的轴上，转 1 rad 收线 r——这正是"每弧度能收多少绳"。</li>
+          <li><b>符号是物理</b>：正转使绳变长 ⇒ 张力阻碍正转 ⇒ 元素为负。它是带符号的量，不是距离。</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- 03 decoupling -->
+<section id="decouple">
+  <div class="wrap">
+    <div class="sec-head reveal"><span class="sec-num">03 / 第②③步</span><h2>三根绳，五段不变，两段在动</h2></div>
+    <p class="lead reveal">P1–P4 在 base，P5–P6 在 roll_link，P7–P8 在 palm。同一刚体上的点距离恒定，所以只有 P4–P5（跨 roll）和 P6–P7（跨 pitch）会变长。再用一条性质：正交矩阵不改变长度。</p>
+    <div class="divider"></div>
+
+    <div class="cols">
+      <div class="reveal">
+        <div class="eqbox">
+          <div class="eq">l<sub>i</sub> = c<sub>i</sub> + s<sub>ri</sub>(θ<sub>r</sub>) + s<sub>pi</sub>(θ<sub>p</sub>)</div>
+        </div>
+        <ul class="clean">
+          <li><b>c<sub>i</sub> 是常数</b>：五段固定长度之和（C2 为 61.259637 mm），求导后为零，算力臂时根本用不上。</li>
+          <li><b>解耦的来历</b>：P6–P7 的差向量 = Q<sub>r</sub>·（只含 θ<sub>p</sub> 的向量），正交矩阵把模长保住，roll 被消掉。</li>
+          <li><b>但这不是通性</b>：加一根 base 直连 palm 的绳，交叉二阶导立刻从 ≈0 跳到 1.367 mm/rad²。</li>
+        </ul>
+      </div>
+      <div class="reveal">
+        <div class="card" style="padding:14px">
+          <canvas id="chart-decouple" class="chart"></canvas>
+        </div>
+        <p class="cap">同一段绳（C2 的 pitch 段）在 θ<sub>r</sub> = 0° / 10° / 20° 下逐点测量：三条曲线完全重合。这就是"解耦"的可视证据。</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- 04 alpha beta gamma -->
+<section id="abc">
+  <div class="wrap">
+    <div class="sec-head reveal"><span class="sec-num">04 / 第④步</span><h2>α、β、γ 不是拟合参数，是三个几何投影</h2></div>
+    <p class="lead reveal">把固定端、动端相对轴原点记成 u、v，动端随角度转：s = ‖Qv − u‖。平方展开，再用 Rodrigues 把旋转写成 cos、sin 两项，就自然只剩三个系数。</p>
+    <div class="divider"></div>
+
+    <div class="cols">
+      <div class="reveal">
+        <div class="eqbox" style="margin-top:0">
+          <div class="eq">s(θ) = √<span style="border-top:1.5px solid rgba(233,238,251,.75);padding:0 .2em">α + βcosθ + γsinθ</span></div>
+        </div>
+        <div class="card" style="margin-top:16px">
+          <div class="eq" style="justify-content:flex-start;font-size:17px;gap:.6em">
+            <span>α = ‖u‖²+‖v‖²−2(a·u)(a·v)</span>
+          </div>
+          <div class="eq" style="justify-content:flex-start;font-size:17px;margin-top:8px">β = −2[u·v − (a·u)(a·v)]</div>
+          <div class="eq" style="justify-content:flex-start;font-size:17px;margin-top:8px">γ = −2u·(a×v)</div>
+        </div>
+        <p style="font-size:14px">把 u、v 拆成"沿轴 / 垂直轴"两部分：绕轴旋转只改变垂直分量的夹角，所以长度必然是一条余弦波。γ 里的叉乘，就是垂直平面内的<b>有向面积</b>。</p>
+      </div>
+      <div class="reveal">
+        <div class="card" style="padding:14px">
+          <canvas id="chart-s" class="chart"></canvas>
+        </div>
+        <p class="cap" id="cap-s">曲线下方：α 决定平均长度，β、γ 决定这条波的相位与幅度。拖动上面的滑块，圆点会沿着曲线走。</p>
+        <div class="eqbox" style="padding:16px;margin-top:14px">
+          <div class="eq" style="font-size:19px">s² = α + ρ cos(θ − φ) ,&nbsp; ρ = √(β²+γ²)</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- 05 arm -->
+<section id="arm">
+  <div class="wrap">
+    <div class="sec-head reveal"><span class="sec-num">05 / 第⑤步</span><h2>求一次导，力臂就落在纸上</h2></div>
+    <p class="lead reveal">因为 s = √D，求导只剩一步。力臂 r = −ds/dθ，负号来自物理约定：张力阻碍正转。</p>
+    <div class="divider"></div>
+
+    <div class="cols">
+      <div class="reveal">
+        <div class="card" style="padding:14px">
+          <canvas id="chart-r" class="chart"></canvas>
+        </div>
+        <p class="cap">r(θ) 在 θ = φ（绳最长处）穿过零：极值点处长度变化率为零，力臂自然为零。</p>
+      </div>
+      <div class="reveal">
+        <div class="eqbox">
+          <div class="eq">
+            r(θ) =
+            <span class="frac"><span class="num">β sinθ − γ cosθ</span><span class="den">2√D</span></span>
+            =
+            <span class="frac"><span class="num">ρ sin(θ − φ)</span><span class="den">2s</span></span>
+          </div>
+        </div>
+        <ul class="clean">
+          <li><b>分母 2s</b>：绳越长，转 1 rad 收线的比例越小，力臂越小。</li>
+          <li><b>零位读数</b>：r(0) = −γ / (2√(α+β))，三个系数直接给出答案。</li>
+          <li><b>组装</b>：每根绳对每个关节各用一组系数，拼起来就是 2×3 的 R。</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- 06 hand calc -->
+<section id="calc">
+  <div class="wrap">
+    <div class="sec-head reveal"><span class="sec-num">06 / 手算</span><h2>拿计算器，把 C2 的 roll 段验一遍</h2></div>
+    <p class="lead reveal">这一组数就是 PDF 第 7 节的实例：A = P04 ≈ (−27, −16, 5)，B<sub>0</sub> = P05 ≈ (−32.5, −12, 18)，轴 o = (0,0,0)，a = (0,1,0)。</p>
+    <div class="divider"></div>
+
+    <div class="grid3 reveal">
+      <div class="formula">
+        <div class="t">① 求 α</div>
+        <div class="f mono" style="font-size:14px;line-height:1.9">
+          ‖u‖² = 729+256+25 = 1010<br>
+          ‖v‖² = 1056.25+144+324 = 1524.25<br>
+          a·u = −16 ， a·v = −12<br>
+          α = 2534.25 − 2(192) = <b style="color:#8ef0ff">2150.25</b>
+        </div>
+      </div>
+      <div class="formula">
+        <div class="t">② 求 β</div>
+        <div class="f mono" style="font-size:14px;line-height:1.9">
+          u·v = 877.5+192+90 = 1159.5<br>
+          β = −2[1159.5 − 192]<br>
+          &nbsp;&nbsp; = <b style="color:#8ef0ff">−1935</b>
+        </div>
+      </div>
+      <div class="formula">
+        <div class="t">③ 求 γ</div>
+        <div class="f mono" style="font-size:14px;line-height:1.9">
+          a×v = (18, 0, 32.5)<br>
+          u·(a×v) = −486 + 162.5 = −323.5<br>
+          γ = −2(−323.5) = <b style="color:#8ef0ff">647</b>
+        </div>
+      </div>
+    </div>
+
+    <div class="card reveal" style="margin-top:14px">
+      <div class="eq" style="font-size:19px">D(0) = 2150.25 − 1935 = 215.25 mm²&nbsp;&nbsp;→&nbsp;&nbsp;s(0) = √215.25 = 14.671 mm</div>
+      <div class="eq" style="margin-top:16px">r(0) = <span class="frac"><span class="num">−647</span><span class="den">2 × 14.671</span></span> = <b style="color:#fbbf24">−22.0497 mm</b></div>
+      <p style="font-size:13.5px;margin-top:14px">负号的意思：零位拉紧 C2，给 roll 一个反向力矩。数值上就是"每 1 N 张力约 22 mN·m"。</p>
+    </div>
+  </div>
+</section>
+
+<!-- 07 verification -->
+<section id="verify">
+  <div class="wrap">
+    <div class="sec-head reveal"><span class="sec-num">07 / 验证</span><h2>凭什么相信它没算错</h2></div>
+    <p class="lead reveal">作者没有只说"我觉得对"，而是用几条互不依赖的路线对撞：CAD 有限差分、把同一差分模板作用在解析长度上、直接跨关节取矩、灵敏度差分。</p>
+    <div class="divider"></div>
+
+    <div class="counters reveal">
+      <div class="counter"><b data-count="3621">3,621</b><span>个 0.2° 姿态逐一比对</span></div>
+      <div class="counter"><b data-count="0.032668" data-dec="6">0.032668</b><span>mm · 差分与解析最大差</span></div>
+      <div class="counter"><b data-count="1.5e-9" data-sci="1">1.5e-9</b><span>mm · 同模板自洽残差</span></div>
+      <div class="counter"><b data-count="1.4e-12" data-sci="1">1.4e-12</b><span>mm · 独立取矩路线差</span></div>
+    </div>
+
+    <div class="bars reveal" id="bars">
+      <div class="bar-row"><span>解析 vs CAD 0.2° 差分</span><div class="track"><div class="fill" data-w="100" style="width:100%"></div></div><span class="v">0.0327 mm</span></div>
+      <div class="bar-row"><span>同差分模板作用于解析长度</span><div class="track"><div class="fill" data-w="57" style="width:57%"></div></div><span class="v">1.5e-9 mm</span></div>
+      <div class="bar-row"><span>25 条边界原始长度</span><div class="track"><div class="fill" data-w="47" style="width:47%"></div></div><span class="v">2.7e-11 mm</span></div>
+      <div class="bar-row"><span>解析 vs 独立静力学取矩</span><div class="track"><div class="fill" data-w="39" style="width:39%"></div></div><span class="v">1.4e-12 mm</span></div>
+      <div class="bar-row"><span>相位参数化互算残差</span><div class="track"><div class="fill" data-w="2" style="width:2%"></div></div><span class="v">5e-19 m²</span></div>
+    </div>
+
+    <div class="card reveal" style="margin-top:22px">
+      <h3>最容易误读的一行</h3>
+      <p>0.032668 mm <b>不是模型误差</b>，而是"用 0.2° 大步伐做差分"的截断误差。证据是第二根条：同一套差分模板作用在解析长度上，差只剩 1.5e-9 mm。这也是为什么 PDF 专门辟谣"真机精度 ≤ 0.0327 mm"。</p>
+    </div>
+  </div>
+</section>
+
+<!-- 08 limits -->
+<section id="limits">
+  <div class="wrap">
+    <div class="sec-head reveal"><span class="sec-num">08 / 边界</span><h2>它不能承诺什么</h2></div>
+    <p class="lead reveal">整套公式建立在四个假设上。越出这些假设，公式依旧能算出数，但那些数不再代表真机。</p>
+    <div class="divider"></div>
+
+    <div class="grid3 reveal">
+      <div class="card"><h3>刚体</h3><p>零件不变形，点相对零件固定。真实瓷环上的滑动接触不在此列。</p></div>
+      <div class="card"><h3>无摩擦 · 同绳同张力</h3><p>导向点处摩擦为零，同一根绳各段张力相同；有摩擦时"三根单一张力"的物理解释要改。</p></div>
+      <div class="card"><h3>固定中心折线</h3><p>绳按相邻点中心直线连接，接触拓扑不变。真实绕环、绳伸长、回差、卷绕半径都不在模型内。</p></div>
+    </div>
+
+    <div class="grid3 reveal" style="margin-top:14px">
+      <div class="card"><h3 style="color:#fbbf24">短段区</h3><p>C1 的 pitch 段在 −25° 只有 3.9 mm，梯度约 15.7 mm/mm。这里力臂误差被放大，必须单独标定。</p></div>
+      <div class="card"><h3 style="color:#fbbf24">满秩 ≠ 可实现</h3><p>3,621 个姿态里有 1,664 个不存在全正预紧解。矩阵满秩，不代表任意力矩都能靠正张力做出来。</p></div>
+      <div class="card"><h3 style="color:#fbbf24">零位不可辨识</h3><p>(β, γ, δ) 只含两个可观测量。没有外部机械基准，δ 无法单独定出；只测 Δl 时 c<sub>i</sub> 也不可辨识。</p></div>
+    </div>
+  </div>
+</section>
+
+<!-- 09 cheat sheet -->
+<section id="cheat">
+  <div class="wrap">
+    <div class="sec-head reveal"><span class="sec-num">09 / 公式卡</span><h2>一张纸带走</h2></div>
+    <div class="divider"></div>
+    <div class="grid3 reveal">
+      <div class="formula"><div class="t">总纲</div><div class="f">R = −(∂l/∂q)ᵀ</div><div class="n">τ = R·f；行 = roll / pitch，列 = C1 / C2 / C3。</div></div>
+      <div class="formula"><div class="t">解耦</div><div class="f">l<sub>i</sub> = c<sub>i</sub> + s<sub>ri</sub> + s<sub>pi</sub></div><div class="n">只对当前"相邻刚体"绳路成立，改绳路就失效。</div></div>
+      <div class="formula"><div class="t">单段</div><div class="f">s = √(α+βcosθ+γsinθ)</div><div class="n">α / β / γ 由零位坐标算出，单位长度²。</div></div>
+      <div class="formula"><div class="t">力臂</div><div class="f">r = (βsinθ−γcosθ)/(2√D)</div><div class="n">θ 用 rad；结果 m/rad，数值即等效力臂。</div></div>
+      <div class="formula"><div class="t">装配</div><div class="f">R<sub>ri</sub> = r(θ<sub>r</sub>; α,β,γ)<sub>i</sub></div><div class="n">六组系数各算一次，c<sub>i</sub> 不进入力臂。</div></div>
+      <div class="formula"><div class="t">门限</div><div class="f">s<sub>guard</sub> ≥ max(s<sub>num</sub>, 2ε<sub>d</sub>/η<sub>max</sub>)</div><div class="n">不满足 ⇒ INVALID_FOR_CONTROL，不能静默输出。</div></div>
+    </div>
+
+    <div class="card reveal" style="margin-top:16px">
+      <h3>小白最容易踩的五个坑</h3>
+      <p>① 角度混用度与弧度（差 57.3 倍）；② 把带符号力臂当成距离；③ m 与 mm 混用；④ 轴与点不在同一坐标系（转置用错差 183.85 mm）；⑤ 以为"算得出来就能用"——D&gt;0 只说明数学有效。</p>
+    </div>
+  </div>
+</section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <div>数据与结论来源：<span class="mono">绳驱二轴腕部_解析公式.pdf</span>（2026-10-22 / v2.0）、复核数据 <span class="mono">points_zero.csv</span>、<span class="mono">segment_parameters.csv</span>、<span class="mono">04_独立核对报告</span>。</div>
+    <div class="src">
+      <span>几何：P1–P8 真实零位坐标（mm）</span>
+      <span>公式：与 PDF 编号 (1)–(27) 一致</span>
+      <span>页面：交互沙盘 / 6 张图 / 1 段扫掠动画</span>
+    </div>
+  </div>
+</footer>
+
+<script>
+(function(){
+  'use strict';
+
+  /* ================= 基础向量 ================= */
+  var DEG = Math.PI/180;
+  var YR = [0,1,0], XP = [1,0,0], OP = [0,0,24];
+
+  function sub(a,b){ return [a[0]-b[0], a[1]-b[1], a[2]-b[2]]; }
+  function add(a,b){ return [a[0]+b[0], a[1]+b[1], a[2]+b[2]]; }
+  function dot(a,b){ return a[0]*b[0] + a[1]*b[1] + a[2]*b[2]; }
+  function cross(a,b){ return [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]]; }
+  function len(a){ return Math.sqrt(dot(a,a)); }
+
+  /* 绕过原点的单位轴旋转（Rodrigues） */
+  function rotAxis(p, k, th){
+    var c = Math.cos(th), s = Math.sin(th), kv = cross(k,p), kd = dot(k,p);
+    return [
+      p[0]*c + kv[0]*s + k[0]*kd*(1-c),
+      p[1]*c + kv[1]*s + k[1]*kd*(1-c),
+      p[2]*c + kv[2]*s + k[2]*kd*(1-c)
+    ];
+  }
+  function rotAbout(p, o, k, th){ return add(o, rotAxis(sub(p,o), k, th)); }
+
+  /* ================= 真实几何数据（零位，mm） ================= */
+  var CABLES = [
+    { name:'C1', color:'#22d3ee', c:0,
+      rl:{a:364.5, b:-182.5, g:7.0},
+      pt:{a:7263.47364742, b:-6537.66603142, g:3130.77161942},
+      pts:[[27,85,-35],[27,85,-27],[0.5,55,-5],[0.5,55,5],
+           [2.5,58,18],[2.5,58,30],[2.3215,53,56.4722],[2.3215,53,61.4722]] },
+    { name:'C2', color:'#a78bfa', c:0,
+      rl:{a:2150.25, b:-1935, g:647},
+      pt:{a:820.33042151, b:-564.0, g:-378.0},
+      pts:[[-23,-20,-35],[-23,-20,-27],[-27,-16,-5],[-27,-16,5],
+           [-32.5,-12,18],[-32.5,-12,30],[-32.2164,-12.5,46],[-32.2164,-15.5,54]] },
+    { name:'C3', color:'#fbbf24', c:0,
+      rl:{a:2500.25, b:-2205, g:-597},
+      pt:{a:859.73346622, b:-564.0, g:-378.0},
+      pts:[[23,-20,-35],[23,-20,-27],[27,-16,-5],[27,-16,5],
+           [37.5,-12,18],[37.5,-12,30],[43.7836,-12.5,46],[43.7836,-15.5,54]] }
+  ];
+
+  /* α/β/γ 直接由零位坐标反算（式 19–21）：页面上的数字不是抄来的 */
+  function coeffs(u, v, a){
+    var au = dot(a,u), av = dot(a,v);
+    return {
+      a: dot(u,u) + dot(v,v) - 2*au*av,
+      b: -2*(dot(u,v) - au*av),
+      g: -2*dot(u, cross(a,v))
+    };
+  }
+  CABLES.forEach(function(cab){
+    cab.rl = coeffs(cab.pts[3], cab.pts[4], YR);                   /* P04、P05 绕 roll 轴 */
+    cab.pt = coeffs(sub(cab.pts[5], OP), sub(cab.pts[6], OP), XP); /* P06、P07 绕 pitch 轴 */
+  });
+
+  /* 各绳的世界坐标（base 不动；roll_link 随 θr；palm 先随 θp 再整体随 θr） */
+  function worldPts(cab, tr, tp){
+    var out = [], i, p;
+    for(i = 0; i < 8; i++){
+      p = cab.pts[i];
+      if(i < 4){
+        out.push([p[0], p[1], p[2]]);
+      } else if(i < 6){
+        out.push(rotAbout(p, [0,0,0], YR, tr));
+      } else {
+        var q = add(OP, rotAxis(sub(p, OP), XP, tp));
+        out.push(rotAbout(q, [0,0,0], YR, tr));
+      }
+    }
+    return out;
+  }
+
+  function geoLen(cab, tr, tp){
+    var w = worldPts(cab, tr, tp), L = 0;
+    for(var i = 1; i < 8; i++) L += len(sub(w[i], w[i-1]));
+    return L;
+  }
+  function closedLen(cab, tr, tp){
+    var D1 = cab.rl.a + cab.rl.b*Math.cos(tr) + cab.rl.g*Math.sin(tr);
+    var D2 = cab.pt.a + cab.pt.b*Math.cos(tp) + cab.pt.g*Math.sin(tp);
+    return cab.c + Math.sqrt(Math.max(D1,0)) + Math.sqrt(Math.max(D2,0));
+  }
+  function arm(th, k){
+    var D = k.a + k.b*Math.cos(th) + k.g*Math.sin(th);
+    return (k.b*Math.sin(th) - k.g*Math.cos(th)) / (2*Math.sqrt(Math.max(D,1e-9)));
+  }
+  /* 常数段长度：P1P2 + P2P3 + P3P4 + P5P6 + P7P8（零位） */
+  CABLES.forEach(function(cab){
+    var s = 0, i;
+    for(i = 1; i < 8; i++){
+      if(i === 4 || i === 6) continue;   /* 跳过跨关节段 P4-P5、P6-P7 */
+      s += len(sub(cab.pts[i], cab.pts[i-1]));
+    }
+    cab.c = s;
+  });
+
+  /* ================= 场景渲染 ================= */
+  var canvas = document.getElementById('scene');
+  var ctx = canvas.getContext('2d');
+  var scene = {
+    w:0, h:0, dpr:1,
+    tr:0, tp:0,
+    azBase:0.62, elBase:0.30,
+    azUser:0, elUser:0,
+    t:0, sweep:true,
+    scale:1, center:[0,0,0], offx:0, offy:0,
+    dragging:false, lastX:0, lastY:0
+  };
+
+  function fitScene(){
+    var trs = [-20,0,20], tps = [-18,0,20,40];
+    var min = [1e9,1e9,1e9], max = [-1e9,-1e9,-1e9];
+    function acc(p){
+      for(var i=0;i<3;i++){ if(p[i]<min[i]) min[i]=p[i]; if(p[i]>max[i]) max[i]=p[i]; }
+    }
+    trs.forEach(function(a){
+      tps.forEach(function(b){
+        CABLES.forEach(function(cab){
+          worldPts(cab, a*DEG, b*DEG).forEach(acc);
+        });
+      });
+    });
+    /* 只按机构本身取景，轴线允许出画 */
+    scene.center = [(min[0]+max[0])/2, (min[1]+max[1])/2, (min[2]+max[2])/2];
+    var span = Math.max(max[0]-min[0], max[1]-min[1], max[2]-min[2]);
+    scene.span = span;
+    scene.min = min; scene.max = max;
+  }
+
+  function basis(){
+    var az = scene.azBase + 0.18*Math.sin(scene.t*0.22) + scene.azUser;
+    var el = Math.max(0.06, Math.min(1.15, scene.elBase + scene.elUser));
+    var ca = Math.cos(az), sa = Math.sin(az), ce = Math.cos(el), se = Math.sin(el);
+    var dir = [ce*ca, ce*sa, se];
+    var right = [-sa, ca, 0];
+    var up = cross(dir, right);
+    return { dir:dir, right:right, up:up };
+  }
+
+  function resizeScene(){
+    var r = canvas.getBoundingClientRect();
+    scene.dpr = Math.min(window.devicePixelRatio || 1, 2);
+    scene.w = r.width; scene.h = r.height;
+    canvas.width = Math.round(r.width * scene.dpr);
+    canvas.height = Math.round(r.height * scene.dpr);
+    ctx.setTransform(scene.dpr, 0, 0, scene.dpr, 0, 0);
+    /* 用当前方位估计缩放：把包围盒 8 个角投影后塞进画布 */
+    var b = basis();
+    var minx = 1e9, maxx = -1e9, miny = 1e9, maxy = -1e9;
+    var mn = scene.min, mx = scene.max;
+    for(var i = 0; i < 8; i++){
+      var p = [i&1?mx[0]:mn[0], i&2?mx[1]:mn[1], i&4?mx[2]:mn[2]];
+      var d = sub(p, scene.center);
+      var x = dot(d, b.right), y = dot(d, b.up);
+      if(x<minx)minx=x; if(x>maxx)maxx=x; if(y<miny)miny=y; if(y>maxy)maxy=y;
+    }
+    var sx = (scene.w*0.90) / Math.max(maxx-minx, 1e-6);
+    var sy = (scene.h*0.88) / Math.max(maxy-miny, 1e-6);
+    scene.scale = Math.min(sx, sy);
+  }
+
+  function project(p, b){
+    var d = sub(p, scene.center);
+    return [ scene.w/2 + scene.offx + dot(d, b.right)*scene.scale,
+             scene.h/2 + scene.offy - dot(d, b.up)*scene.scale ];
+  }
+
+  /* 让零位机构落在画布中央：按当前视角重算屏幕偏移 */
+  function updateOffset(b){
+    var mnx = 1e9, mxx = -1e9, mny = 1e9, mxy = -1e9;
+    CABLES.forEach(function(c){
+      worldPts(c, 0, 0).forEach(function(p){
+        var d = sub(p, scene.center);
+        var x = dot(d, b.right), y = dot(d, b.up);
+        if(x < mnx) mnx = x; if(x > mxx) mxx = x;
+        if(y < mny) mny = y; if(y > mxy) mxy = y;
+      });
+    });
+    scene.offx = -((mnx + mxx)/2)*scene.scale;
+    scene.offy = ((mny + mxy)/2)*scene.scale;
+  }
+
+  function hull2d(pts){
+    if(pts.length < 3) return pts.slice();
+    var s = pts.slice().sort(function(a,b){ return a[0]-b[0] || a[1]-b[1]; });
+    var lower = [], upper = [], i;
+    for(i = 0; i < s.length; i++){
+      while(lower.length >= 2 && cross2(lower[lower.length-2], lower[lower.length-1], s[i]) <= 0) lower.pop();
+      lower.push(s[i]);
+    }
+    for(i = s.length-1; i >= 0; i--){
+      while(upper.length >= 2 && cross2(upper[upper.length-2], upper[upper.length-1], s[i]) <= 0) upper.pop();
+      upper.push(s[i]);
+    }
+    lower.pop(); upper.pop();
+    return lower.concat(upper);
+  }
+  function cross2(o,a,b){ return (a[0]-o[0])*(b[1]-o[1]) - (a[1]-o[1])*(b[0]-o[0]); }
+
+  function line(p1, p2, color, width, dash){
+    ctx.save();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = width || 1;
+    if(dash) ctx.setLineDash(dash);
+    ctx.beginPath();
+    ctx.moveTo(p1[0], p1[1]);
+    ctx.lineTo(p2[0], p2[1]);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function label(text, x, y, color, size){
+    ctx.save();
+    ctx.fillStyle = color || 'rgba(190,205,235,.8)';
+    ctx.font = (size || 11) + 'px "JetBrains Mono", Consolas, monospace';
+    ctx.fillText(text, x, y);
+    ctx.restore();
+  }
+
+  function arrowHead(from, to, color){
+    var dx = to[0]-from[0], dy = to[1]-from[1];
+    var a = Math.atan2(dy, dx), size = 7;
+    ctx.save();
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.moveTo(to[0], to[1]);
+    ctx.lineTo(to[0]-size*Math.cos(a-0.4), to[1]-size*Math.sin(a-0.4));
+    ctx.lineTo(to[0]-size*Math.cos(a+0.4), to[1]-size*Math.sin(a+0.4));
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+  }
+
+  function drawAxes(b){
+    var o = project([0,0,0], b);
+    var ry = project([0,96,0], b);
+    var py = project([54,0,24], b);
+    var px0 = project([-40,0,24], b);
+
+    line(px0, py, 'rgba(120,150,210,.28)', 1, [4,6]);
+    line(o, ry, 'rgba(120,150,210,.28)', 1, [4,6]);
+    arrowHead(px0, py, 'rgba(160,185,235,.55)');
+    arrowHead(o, ry, 'rgba(160,185,235,.55)');
+
+    label('pitch 轴 +X', py[0]+8, py[1]+4, 'rgba(170,195,240,.75)');
+    label('roll 轴 +Y', ry[0]+8, ry[1]+12, 'rgba(170,195,240,.75)');
+
+    /* 24 mm 偏置 */
+    var p0 = project([0,0,0], b);
+    var p24 = project([0,0,24], b);
+    line(p0, p24, 'rgba(251,191,36,.55)', 1.5, [3,4]);
+    var mid = [(p0[0]+p24[0])/2, (p0[1]+p24[1])/2];
+    ctx.save();
+    ctx.fillStyle = 'rgba(251,191,36,.85)';
+    ctx.font = '11px "JetBrains Mono", Consolas, monospace';
+    ctx.fillText('24 mm', mid[0]+8, mid[1]+4);
+    ctx.restore();
+
+    /* 原点 */
+    ctx.save();
+    ctx.fillStyle = 'rgba(255,255,255,.85)';
+    ctx.beginPath(); ctx.arc(o[0], o[1], 2.6, 0, Math.PI*2); ctx.fill();
+    ctx.restore();
+  }
+
+  function drawBodies(b){
+    var worlds = CABLES.map(function(cab){ return worldPts(cab, scene.tr, scene.tp); });
+
+    /* base：三块侧板的整体轮廓（12 个锚点）+ 各自的边 */
+    var baseAll2 = [];
+    worlds.forEach(function(w){
+      for(var i = 0; i < 4; i++) baseAll2.push(project(w[i], b));
+    });
+    var bh = hull2d(baseAll2);
+    ctx.save();
+    ctx.fillStyle = 'rgba(120,160,240,.05)';
+    ctx.strokeStyle = 'rgba(140,175,240,.20)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    bh.forEach(function(p,i){ if(i) ctx.lineTo(p[0],p[1]); else ctx.moveTo(p[0],p[1]); });
+    ctx.closePath(); ctx.fill(); ctx.stroke();
+    ctx.restore();
+
+    worlds.forEach(function(w){
+      var h = hull2d(w.slice(0,4).map(function(p){ return project(p,b); }));
+      ctx.save();
+      ctx.fillStyle = 'rgba(140,175,255,.06)';
+      ctx.strokeStyle = 'rgba(150,185,255,.26)';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      h.forEach(function(p,i){ if(i) ctx.lineTo(p[0],p[1]); else ctx.moveTo(p[0],p[1]); });
+      ctx.closePath();
+      ctx.fill(); ctx.stroke();
+      ctx.restore();
+    });
+
+    /* palm：六个锚点合成一块掌板 */
+    var palm2 = [];
+    worlds.forEach(function(w){ palm2.push(project(w[6],b), project(w[7],b)); });
+    var ph = hull2d(palm2);
+    ctx.save();
+    ctx.fillStyle = 'rgba(167,139,250,.075)';
+    ctx.strokeStyle = 'rgba(190,170,255,.32)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ph.forEach(function(p,i){ if(i) ctx.lineTo(p[0],p[1]); else ctx.moveTo(p[0],p[1]); });
+    ctx.closePath(); ctx.fill(); ctx.stroke();
+    ctx.restore();
+
+    /* roll_link：三根短杆 */
+    worlds.forEach(function(w){
+      var a = project(w[4],b), c = project(w[5],b);
+      ctx.save();
+      ctx.strokeStyle = 'rgba(170,200,255,.30)';
+      ctx.lineWidth = 6; ctx.lineCap = 'round';
+      ctx.beginPath(); ctx.moveTo(a[0],a[1]); ctx.lineTo(c[0],c[1]); ctx.stroke();
+      ctx.strokeStyle = 'rgba(225,238,255,.55)'; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(a[0],a[1]); ctx.lineTo(c[0],c[1]); ctx.stroke();
+      ctx.restore();
+    });
+
+    /* 刚体名字 */
+    var baseAll = [], rollAll = [];
+    worlds.forEach(function(w){
+      for(var i=0;i<4;i++) baseAll.push(project(w[i],b));
+      rollAll.push(project(w[4],b), project(w[5],b));
+    });
+    tagHull(baseAll, 'base', 18);
+    tagHull(palm2, 'palm', -16);
+    tagHull(rollAll, 'roll_link', -10);
+  }
+
+  function tagHull(pts, text, dy){
+    if(!pts.length) return;
+    var x = 0, y = 0;
+    pts.forEach(function(p){ x += p[0]; y += p[1]; });
+    x /= pts.length; y /= pts.length;
+    ctx.save();
+    ctx.fillStyle = 'rgba(175,200,240,.62)';
+    ctx.font = '10px "JetBrains Mono", Consolas, monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText(text, x, y + (dy || 0));
+    ctx.restore();
+  }
+
+  function drawRope(cab, b, t){
+    var w = worldPts(cab, scene.tr, scene.tp);
+    var p = w.map(function(q){ return project(q,b); });
+
+    /* 外发光 */
+    ctx.save();
+    ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+    ctx.shadowColor = cab.color; ctx.shadowBlur = 16;
+    ctx.strokeStyle = cab.color; ctx.globalAlpha = 0.30; ctx.lineWidth = 7;
+    ctx.beginPath();
+    p.forEach(function(q,i){ if(i) ctx.lineTo(q[0],q[1]); else ctx.moveTo(q[0],q[1]); });
+    ctx.stroke();
+    ctx.restore();
+
+    /* 主体 */
+    ctx.save();
+    ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+    ctx.strokeStyle = cab.color; ctx.globalAlpha = 0.95; ctx.lineWidth = 2.2;
+    ctx.beginPath();
+    p.forEach(function(q,i){ if(i) ctx.lineTo(q[0],q[1]); else ctx.moveTo(q[0],q[1]); });
+    ctx.stroke();
+    ctx.restore();
+
+    /* 流动虚线：表示"张力沿绳传播" */
+    ctx.save();
+    ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+    ctx.setLineDash([2,10]);
+    ctx.lineDashOffset = -t*46;
+    ctx.strokeStyle = 'rgba(255,255,255,.85)'; ctx.lineWidth = 1.6;
+    ctx.beginPath();
+    p.forEach(function(q,i){ if(i) ctx.lineTo(q[0],q[1]); else ctx.moveTo(q[0],q[1]); });
+    ctx.stroke();
+    ctx.restore();
+
+    /* 跨关节两段高亮 */
+    [[4,5],[6,7]].forEach(function(pair){
+      var i = pair[0], j = pair[1];
+      ctx.save();
+      ctx.lineCap = 'round';
+      ctx.strokeStyle = 'rgba(255,255,255,.9)';
+      ctx.lineWidth = 4.2;
+      ctx.globalAlpha = 0.5 + 0.5*Math.sin(t*3 + i);
+      ctx.beginPath();
+      ctx.moveTo(p[i][0], p[i][1]); ctx.lineTo(p[j][0], p[j][1]);
+      ctx.stroke();
+      ctx.restore();
+    });
+
+    /* 导向点 */
+    p.forEach(function(q){
+      ctx.save();
+      ctx.fillStyle = '#fff';
+      ctx.shadowColor = cab.color; ctx.shadowBlur = 10;
+      ctx.beginPath(); ctx.arc(q[0], q[1], 2.4, 0, Math.PI*2); ctx.fill();
+      ctx.restore();
+    });
+  }
+
+  function drawArcs(b){
+    var tr = scene.tr, tp = scene.tp;
+
+    /* roll 角弧：在 y=58 平面上绕 Y 轴 */
+    if(Math.abs(tr) > 0.02){
+      ctx.save();
+      ctx.strokeStyle = 'rgba(34,211,238,.55)'; ctx.lineWidth = 1.4;
+      ctx.beginPath();
+      for(var i = 0; i <= 40; i++){
+        var a = tr * i/40;
+        var q = project([22*Math.cos(a), 44, -22*Math.sin(a)], b);
+        if(i) ctx.lineTo(q[0],q[1]); else ctx.moveTo(q[0],q[1]);
+      }
+      ctx.stroke();
+      ctx.restore();
+      var tip = project([22*Math.cos(tr), 44, -22*Math.sin(tr)], b);
+      ctx.save();
+      ctx.fillStyle = 'rgba(34,211,238,.9)';
+      ctx.font = '600 12px "JetBrains Mono", Consolas, monospace';
+      ctx.fillText('θr', tip[0]+6, tip[1]-4);
+      ctx.restore();
+    }
+
+    /* pitch 角弧：在 x=0 平面上绕 X 轴 */
+    if(Math.abs(tp) > 0.02){
+      ctx.save();
+      ctx.strokeStyle = 'rgba(167,139,250,.55)'; ctx.lineWidth = 1.4;
+      ctx.beginPath();
+      for(var j = 0; j <= 40; j++){
+        var c = tp * j/40;
+        var q2 = project([0, 16*Math.cos(c), 24 + 16*Math.sin(c)], b);
+        if(j) ctx.lineTo(q2[0],q2[1]); else ctx.moveTo(q2[0],q2[1]);
+      }
+      ctx.stroke();
+      ctx.restore();
+      var tip2 = project([0, 16*Math.cos(tp), 24 + 16*Math.sin(tp)], b);
+      ctx.save();
+      ctx.fillStyle = 'rgba(167,139,250,.9)';
+      ctx.font = '600 12px "JetBrains Mono", Consolas, monospace';
+      ctx.fillText('θp', tip2[0]+6, tip2[1]-4);
+      ctx.restore();
+    }
+  }
+
+  function renderScene(){
+    var b = basis();
+    updateOffset(b);
+    ctx.clearRect(0, 0, scene.w, scene.h);
+
+    /* 背景光晕 */
+    var g = ctx.createRadialGradient(scene.w*0.5, scene.h*0.42, 10, scene.w*0.5, scene.h*0.42, Math.max(scene.w,scene.h)*0.7);
+    g.addColorStop(0, 'rgba(34,211,238,.07)');
+    g.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, scene.w, scene.h);
+
+    drawFloor(b);
+    drawAxes(b);
+    drawBodies(b);
+    CABLES.forEach(function(cab){ drawRope(cab, b, scene.t); });
+    drawArcs(b);
+  }
+
+  /* 底部网格：给悬浮的机构一点空间参照 */
+  function drawFloor(b){
+    var z = -44, i;
+    ctx.save();
+    ctx.strokeStyle = 'rgba(120,160,230,.075)';
+    ctx.lineWidth = 1;
+    for(i = -45; i <= 45; i += 15){
+      var a = project([i, -30, z], b), c = project([i, 90, z], b);
+      ctx.beginPath(); ctx.moveTo(a[0],a[1]); ctx.lineTo(c[0],c[1]); ctx.stroke();
+    }
+    for(i = -30; i <= 90; i += 15){
+      var d = project([-45, i, z], b), e = project([45, i, z], b);
+      ctx.beginPath(); ctx.moveTo(d[0],d[1]); ctx.lineTo(e[0],e[1]); ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  /* ================= 读数面板 ================= */
+  var ro = [0,1,2].map(function(i){ return document.getElementById('ro-'+i); });
+  var mat = document.getElementById('mat');
+  var cells = [];
+  for(var r = 0; r < 2; r++){
+    var row = [];
+    /* 行标签 */
+    var lab = document.createElement('div');
+    lab.className = 'h';
+    lab.textContent = r === 0 ? 'roll' : 'pitch';
+    mat.appendChild(lab);
+    for(var c = 0; c < 3; c++){
+      var d = document.createElement('div');
+      d.className = 'cell';
+      d.textContent = '—';
+      mat.appendChild(d);
+      row.push(d);
+    }
+    cells.push(row);
+  }
+  var tauR = document.getElementById('tau-r'), tauP = document.getElementById('tau-p');
+
+  function fmt(x, n){ return (Math.abs(x) < 5e-4 ? 0 : x).toFixed(n); }
+
+  function updateReadout(){
+    var tr = scene.tr, tp = scene.tp, R = [[],[]], i;
+    for(i = 0; i < 3; i++){
+      var cab = CABLES[i];
+      var gl = geoLen(cab, tr, tp);
+      var cl = closedLen(cab, tr, tp);
+      ro[i].querySelector('.g').textContent = gl.toFixed(6);
+      ro[i].querySelector('.c').textContent = cl.toFixed(6);
+      ro[i].querySelector('.d').textContent = Math.abs(gl-cl).toExponential(1);
+      R[0][i] = arm(tr, cab.rl);
+      R[1][i] = arm(tp, cab.pt);
+    }
+    var maxAbs = 1;
+    for(var rr = 0; rr < 2; rr++) for(var cc = 0; cc < 3; cc++) maxAbs = Math.max(maxAbs, Math.abs(R[rr][cc]));
+    for(var r2 = 0; r2 < 2; r2++){
+      for(var c2 = 0; c2 < 3; c2++){
+        var v = R[r2][c2], el = cells[r2][c2];
+        el.textContent = fmt(v, 2);
+        el.className = 'cell ' + (v < 0 ? 'neg' : 'pos');
+        var a = Math.min(0.55, Math.abs(v)/maxAbs*0.5);
+        el.style.background = 'rgba(' + (v<0 ? '251,113,133,' : '34,211,238,') + a.toFixed(3) + ')';
+      }
+    }
+    var f = 10;
+    var tR = R[0][0]*f + R[0][1]*f + R[0][2]*f;
+    var tP = R[1][0]*f + R[1][1]*f + R[1][2]*f;
+    tauR.textContent = fmt(tR, 1) + ' mN·m';
+    tauP.textContent = fmt(tP, 1) + ' mN·m';
+  }
+
+  /* ================= 通用曲线图 ================= */
+  function setupCanvas(cv){
+    var r = cv.getBoundingClientRect();
+    var dpr = Math.min(window.devicePixelRatio || 1, 2);
+    var w = Math.max(1, Math.round(r.width*dpr));
+    var h = Math.max(1, Math.round(r.height*dpr));
+    if(cv.width !== w || cv.height !== h){ cv.width = w; cv.height = h; }
+    var c = cv.getContext('2d');
+    c.setTransform(dpr, 0, 0, dpr, 0, 0);
+    return { ctx:c, w:r.width, h:r.height };
+  }
+
+  function niceTicks(min, max, n){
+    var span = max-min, step = Math.pow(10, Math.floor(Math.log(span/n)/Math.LN10));
+    var err = span/n/step;
+    if(err >= 7.5) step *= 10; else if(err >= 3.5) step *= 5; else if(err >= 1.5) step *= 2;
+    var out = [], v = Math.ceil(min/step)*step;
+    while(v <= max + 1e-9){ out.push(v); v += step; }
+    return out;
+  }
+
+  function drawChart(cv, opt){
+    var c = setupCanvas(cv), x = c.ctx, w = c.w, h = c.h;
+    var pad = {l:46, r:14, t:16, b:30};
+    var x0 = pad.l, x1 = w-pad.r, y0 = pad.t, y1 = h-pad.b;
+    x.clearRect(0,0,w,h);
+
+    var xs = [], i, N = 160;
+    for(i = 0; i <= N; i++) xs.push(opt.xmin + (opt.xmax-opt.xmin)*i/N);
+    var ymin = 1e9, ymax = -1e9;
+    opt.curves.forEach(function(cv2){
+      xs.forEach(function(t){
+        var v = cv2.f(t);
+        if(isFinite(v)){ if(v<ymin)ymin=v; if(v>ymax)ymax=v; }
+      });
+    });
+    if(ymin === 1e9){ ymin = -1; ymax = 1; }
+    if(ymax-ymin < 1e-6){ ymax = ymin + 1; }
+    var padv = (ymax-ymin)*0.12;
+    ymin -= padv; ymax += padv;
+
+    var X = function(t){ return x0 + (t-opt.xmin)/(opt.xmax-opt.xmin)*(x1-x0); };
+    var Y = function(v){ return y1 - (v-ymin)/(ymax-ymin)*(y1-y0); };
+
+    x.strokeStyle = 'rgba(122,152,210,.13)';
+    x.lineWidth = 1;
+    x.font = '10px "JetBrains Mono", Consolas, monospace';
+    x.fillStyle = 'rgba(150,170,210,.55)';
+    var yt = niceTicks(ymin, ymax, 4);
+    yt.forEach(function(v){
+      var yy = Y(v);
+      x.beginPath(); x.moveTo(x0, yy); x.lineTo(x1, yy); x.stroke();
+      x.fillText(String(Math.abs(v) >= 100 ? v.toFixed(0) : v.toFixed(1)), 6, yy+3);
+    });
+    var xt = niceTicks(opt.xmin/DEG, opt.xmax/DEG, 6);
+    xt.forEach(function(vd){
+      var xx = X(vd*DEG);
+      x.strokeStyle = 'rgba(122,152,210,.08)';
+      x.beginPath(); x.moveTo(xx, y0); x.lineTo(xx, y1); x.stroke();
+      x.fillStyle = 'rgba(150,170,210,.55)';
+      x.fillText(vd.toFixed(0) + '°', xx-8, h-10);
+    });
+
+    opt.curves.forEach(function(cv2){
+      x.save();
+      x.strokeStyle = cv2.color;
+      x.lineWidth = cv2.width || 2;
+      if(cv2.dash) x.setLineDash(cv2.dash);
+      x.shadowColor = cv2.color; x.shadowBlur = 10;
+      x.beginPath();
+      var started = false;
+      xs.forEach(function(t){
+        var v = cv2.f(t);
+        if(!isFinite(v)) return;
+        var px = X(t), py = Y(v);
+        if(!started){ x.moveTo(px,py); started = true; } else x.lineTo(px,py);
+      });
+      x.stroke();
+      x.restore();
+    });
+
+    if(typeof opt.markerX === 'number'){
+      var mx = X(opt.markerX);
+      x.save();
+      x.strokeStyle = 'rgba(255,255,255,.28)';
+      x.setLineDash([3,4]);
+      x.beginPath(); x.moveTo(mx, y0); x.lineTo(mx, y1); x.stroke();
+      x.restore();
+      opt.curves.forEach(function(cv2){
+        var v = cv2.f(opt.markerX);
+        if(!isFinite(v)) return;
+        var py = Y(v);
+        x.save();
+        x.fillStyle = '#fff';
+        x.shadowColor = cv2.color; x.shadowBlur = 12;
+        x.beginPath(); x.arc(mx, py, 4, 0, Math.PI*2); x.fill();
+        x.restore();
+        if(cv2.label){
+          x.save();
+          x.fillStyle = cv2.color;
+          x.font = '600 11px "JetBrains Mono", Consolas, monospace';
+          x.fillText(cv2.label(v), mx+8, py-8);
+          x.restore();
+        }
+      });
+    }
+    if(opt.xlabel){
+      x.save();
+      x.fillStyle = 'rgba(150,170,210,.6)';
+      x.font = '10px "JetBrains Mono", Consolas, monospace';
+      x.textAlign = 'right';
+      x.fillText(opt.xlabel, x1-2, y1-7);
+      x.restore();
+    }
+  }
+
+  var chartS = document.getElementById('chart-s');
+  var chartR = document.getElementById('chart-r');
+  var chartD = document.getElementById('chart-decouple');
+
+  var selected = 1; /* 默认 C2 */
+  function drawCharts(){
+    var cab = CABLES[selected];
+    var xmin = -25*DEG, xmax = 45*DEG;
+
+    drawChart(chartS, {
+      xmin: xmin, xmax: xmax, xlabel: 'θ (deg)',
+      curves: [{ f:function(t){ return Math.sqrt(Math.max(cab.pt.a + cab.pt.b*Math.cos(t) + cab.pt.g*Math.sin(t), 0)); }, color:cab.color }],
+      markerX: scene.tp,
+      markers: true
+    });
+
+    drawChart(chartR, {
+      xmin: xmin, xmax: xmax, xlabel: 'θ (deg)',
+      curves: [{ f:function(t){ return arm(t, cab.pt); }, color:'#fbbf24', label:function(v){ return v.toFixed(2)+' mm'; } }],
+      markerX: scene.tp
+    });
+
+    var dec = [-25,-5,0,20,45].map(function(d){ return d*DEG; });
+    drawChart(chartD, {
+      xmin: xmin, xmax: xmax, xlabel: 'θp (deg)',
+      curves: [
+        { f:function(t){ return segLen(cab, 0, t); }, color:'rgba(34,211,238,.95)' },
+        { f:function(t){ return segLen(cab, 10*DEG, t); }, color:'rgba(167,139,250,.9)', dash:[6,5] },
+        { f:function(t){ return segLen(cab, 20*DEG, t); }, color:'rgba(251,191,36,.85)', dash:[2,4] }
+      ],
+      markerX: scene.tp
+    });
+  }
+
+  /* 指定 θr 下 P6-P7 的实际长度（几何法，用来证明与 θr 无关） */
+  function segLen(cab, tr, tp){
+    var w = worldPts(cab, tr, tp);
+    return len(sub(w[6], w[5]));
+  }
+
+  /* ================= 卷筒演示 ================= */
+  var spool = document.getElementById('spool');
+  var spoolT = 0;
+  function drawSpool(){
+    var c = setupCanvas(spool), x = c.ctx, w = c.w, h = c.h;
+    x.clearRect(0,0,w,h);
+    var cx = w*0.40, cy = h*0.52, R = Math.min(w,h)*0.30;
+    var ang = 0.55 + 0.45*Math.sin(spoolT*0.9);
+
+    /* 轴 */
+    x.save();
+    x.strokeStyle = 'rgba(150,180,255,.25)';
+    x.setLineDash([4,6]);
+    x.beginPath(); x.moveTo(cx-R*1.5, cy); x.lineTo(cx+R*1.9, cy); x.stroke();
+    x.restore();
+
+    /* 圆盘 */
+    var g = x.createRadialGradient(cx, cy, R*0.2, cx, cy, R*1.25);
+    g.addColorStop(0, 'rgba(34,211,238,.20)');
+    g.addColorStop(1, 'rgba(34,211,238,0)');
+    x.fillStyle = g;
+    x.beginPath(); x.arc(cx, cy, R*1.25, 0, Math.PI*2); x.fill();
+
+    x.save();
+    x.strokeStyle = 'rgba(180,215,255,.75)';
+    x.lineWidth = 1.6;
+    x.beginPath(); x.arc(cx, cy, R, 0, Math.PI*2); x.stroke();
+    x.strokeStyle = 'rgba(180,215,255,.25)';
+    x.beginPath(); x.moveTo(cx, cy); x.lineTo(cx+R*Math.cos(ang), cy-R*Math.sin(ang)); x.stroke();
+    x.restore();
+
+    /* 半径标注 */
+    x.save();
+    x.fillStyle = 'rgba(34,211,238,.95)';
+    x.font = '600 12px "JetBrains Mono", Consolas, monospace';
+    x.fillText('r', cx+R*0.45, cy-R*0.18);
+    x.restore();
+
+    /* 绳：从切点向下引出 */
+    var tx = cx + R*Math.cos(ang), ty = cy - R*Math.sin(ang);
+    x.save();
+    x.strokeStyle = 'rgba(251,191,36,.9)';
+    x.lineWidth = 3; x.lineCap = 'round';
+    x.shadowColor = 'rgba(251,191,36,.8)'; x.shadowBlur = 12;
+    x.beginPath(); x.moveTo(tx, ty); x.lineTo(tx, h-26); x.stroke();
+    x.restore();
+
+    /* 角度弧 */
+    x.save();
+    x.strokeStyle = 'rgba(255,255,255,.5)';
+    x.lineWidth = 1.2;
+    x.beginPath(); x.arc(cx, cy, R*0.32, 0, -ang, true); x.stroke();
+    x.fillStyle = 'rgba(255,255,255,.8)';
+    x.font = '12px "JetBrains Mono", Consolas, monospace';
+    x.fillText('θ', cx+R*0.36, cy-R*0.10);
+    x.restore();
+
+    /* 拉力箭头 */
+    x.save();
+    x.fillStyle = 'rgba(251,191,36,.95)';
+    x.font = '600 13px "JetBrains Mono", Consolas, monospace';
+    x.fillText('f', tx+9, h-44);
+    x.beginPath();
+    x.moveTo(tx, h-30); x.lineTo(tx, h-58);
+    x.lineTo(tx-5, h-51); x.lineTo(tx, h-58); x.lineTo(tx+5, h-51);
+    x.closePath(); x.fill();
+    x.restore();
+
+    /* 收线量 dl */
+    x.save();
+    x.strokeStyle = 'rgba(34,211,238,.7)';
+    x.lineWidth = 1;
+    x.setLineDash([2,3]);
+    x.beginPath(); x.moveTo(tx-8, cy); x.lineTo(tx-8, h-30); x.stroke();
+    x.setLineDash([]);
+    x.fillStyle = 'rgba(34,211,238,.85)';
+    x.font = '11px "JetBrains Mono", Consolas, monospace';
+    x.fillText('dl = r·dθ', tx-74, h-62);
+    x.restore();
+
+    /* 力矩 */
+    x.save();
+    x.strokeStyle = 'rgba(167,139,250,.45)';
+    x.lineWidth = 1.4;
+    x.beginPath(); x.arc(cx, cy, R*1.16, -1.25, -0.55); x.stroke();
+    x.fillStyle = 'rgba(190,170,255,.9)';
+    x.font = '11px "JetBrains Mono", Consolas, monospace';
+    x.fillText('τ = f · r', cx+R*0.72, cy-R*1.28);
+    x.restore();
+  }
+
+  /* ================= 交互 ================= */
+  var slR = document.getElementById('sl-r'), slP = document.getElementById('sl-p');
+  var outR = document.getElementById('out-r'), outP = document.getElementById('out-p');
+  var btnPlay = document.getElementById('btn-play'), btnZero = document.getElementById('btn-zero');
+
+  slR.addEventListener('input', function(){
+    scene.tr = parseFloat(slR.value)*DEG;
+    outR.textContent = parseFloat(slR.value).toFixed(1) + '°';
+    scene.sweep = false;
+    btnPlay.textContent = '继续扫掠';
+    needsChart = true;
+  });
+  slP.addEventListener('input', function(){
+    scene.tp = parseFloat(slP.value)*DEG;
+    outP.textContent = parseFloat(slP.value).toFixed(1) + '°';
+    scene.sweep = false;
+    btnPlay.textContent = '继续扫掠';
+    needsChart = true;
+  });
+
+  btnPlay.addEventListener('click', function(){
+    scene.sweep = !scene.sweep;
+    btnPlay.textContent = scene.sweep ? '暂停扫掠' : '继续扫掠';
+  });
+  btnZero.addEventListener('click', function(){
+    scene.sweep = false;
+    btnPlay.textContent = '继续扫掠';
+    scene.tr = 0; scene.tp = 0;
+    slR.value = 0; slP.value = 0;
+    outR.textContent = '0.0°'; outP.textContent = '0.0°';
+    needsChart = true;
+  });
+
+  canvas.addEventListener('pointerdown', function(e){
+    scene.dragging = true;
+    scene.lastX = e.clientX; scene.lastY = e.clientY;
+    canvas.classList.add('drag');
+    if(canvas.setPointerCapture) canvas.setPointerCapture(e.pointerId);
+  });
+  canvas.addEventListener('pointermove', function(e){
+    if(!scene.dragging) return;
+    scene.azUser += (e.clientX - scene.lastX)*0.008;
+    scene.elUser += (e.clientY - scene.lastY)*0.005;
+    scene.elUser = Math.max(-0.22, Math.min(0.55, scene.elUser));
+    scene.lastX = e.clientX; scene.lastY = e.clientY;
+    resizeScene();
+  });
+  window.addEventListener('pointerup', function(){
+    scene.dragging = false;
+    canvas.classList.remove('drag');
+  });
+
+  /* ================= 动画主循环 ================= */
+  var last = performance.now(), needsChart = true, chartClock = 0;
+
+  function frame(now){
+    var dt = Math.min(0.05, (now-last)/1000); last = now;
+    scene.t += dt;
+    spoolT += dt;
+
+    if(scene.sweep){
+      scene.tr = (16*Math.sin(scene.t*0.55))*DEG;
+      scene.tp = (14 + 18*Math.sin(scene.t*0.37 + 1.1))*DEG;
+      slR.value = (scene.tr/DEG).toFixed(1);
+      slP.value = (scene.tp/DEG).toFixed(1);
+      outR.textContent = (scene.tr/DEG).toFixed(1) + '°';
+      outP.textContent = (scene.tp/DEG).toFixed(1) + '°';
+      needsChart = true;
+    }
+
+    renderScene();
+    drawSpool();
+    updateReadout();
+
+    chartClock += dt;
+    if(needsChart && chartClock > 1/30){
+      drawCharts();
+      chartClock = 0;
+      needsChart = false;
+    }
+    requestAnimationFrame(frame);
+  }
+
+  /* ================= 入场动画 ================= */
+  var io = new IntersectionObserver(function(entries){
+    entries.forEach(function(en){
+      if(en.isIntersecting){
+        en.target.classList.add('in');
+        if(en.target.id === 'bars') animateBars();
+        io.unobserve(en.target);
+      }
+    });
+  }, { threshold:0.12 });
+
+  document.querySelectorAll('.reveal').forEach(function(el){ io.observe(el); });
+
+  function animateBars(){
+    var fills = Array.prototype.slice.call(document.querySelectorAll('.fill'));
+    fills.forEach(function(el){ el.style.transition = 'none'; el.style.width = '0%'; });
+    void document.body.offsetHeight;
+    fills.forEach(function(el, i){
+      el.style.transition = '';
+      setTimeout(function(){ el.style.width = el.getAttribute('data-w') + '%'; }, 80 + i*90);
+    });
+  }
+
+  /* 数字滚动 */
+  var counters = document.querySelectorAll('.counter b');
+  var cio = new IntersectionObserver(function(entries){
+    entries.forEach(function(en){
+      if(!en.isIntersecting) return;
+      var el = en.target;
+      var target = parseFloat(el.getAttribute('data-count'));
+      var dec = parseInt(el.getAttribute('data-dec') || '0', 10);
+      var sci = el.getAttribute('data-sci');
+      var t0 = performance.now(), dur = 1200;
+      function step(t){
+        var k = Math.max(0, Math.min(1, (t-t0)/dur));
+        var e = 1 - Math.pow(1-k, 3);
+        var v = target*e;
+        if(sci) el.textContent = v.toExponential(1);
+        else if(target >= 100) el.textContent = Math.round(v).toLocaleString('en-US');
+        else el.textContent = v.toFixed(dec);
+        if(k < 1) requestAnimationFrame(step);
+        else{
+          if(sci) el.textContent = target.toExponential(1);
+          else if(target >= 100) el.textContent = Math.round(target).toLocaleString('en-US');
+          else el.textContent = target.toFixed(dec);
+        }
+      }
+      requestAnimationFrame(step);
+      cio.unobserve(el);
+    });
+  }, { threshold:0.4 });
+  counters.forEach(function(el){ cio.observe(el); });
+
+  /* 进度条 */
+  var bar = document.getElementById('progress');
+  window.addEventListener('scroll', function(){
+    var h = document.documentElement.scrollHeight - window.innerHeight;
+    bar.style.width = (h > 0 ? (window.scrollY/h*100) : 0) + '%';
+  }, { passive:true });
+
+  /* ================= 启动 ================= */
+  window.addEventListener('resize', function(){
+    resizeScene();
+    needsChart = true;
+  });
+
+  function boot(){
+    fitScene();
+    resizeScene();
+    updateReadout();
+    drawCharts();
+    requestAnimationFrame(frame);
+  }
+
+  if(document.readyState === 'complete') boot();
+  else window.addEventListener('load', boot);
+})();
+</script>
+</body>
+</html>

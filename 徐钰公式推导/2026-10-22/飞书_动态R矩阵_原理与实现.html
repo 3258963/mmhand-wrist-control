@@ -1,0 +1,798 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>绳驱二轴腕部：为什么要做动态 R，以及怎么做</title>
+<script>
+window.MathJax = {
+  tex: { inlineMath: [['$','$']], displayMath: [['$$','$$']], processEscapes: true },
+  svg: { fontCache: 'global' },
+  options: { skipHtmlTags: ['script','noscript','style','textarea','pre','code'] }
+};
+</script>
+<script async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js"></script>
+<style>
+:root { --ink:#1f2328; --muted:#57606a; --blue:#2F5597; --line:#d0d7de; --bg:#f6f8fa; }
+* { box-sizing: border-box; }
+body {
+  margin: 0 auto; max-width: 980px; padding: 32px 40px 80px;
+  font-family: "Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC", sans-serif;
+  font-size: 15px; line-height: 1.8; color: var(--ink); background: #fff;
+}
+h1 { font-size: 30px; line-height: 1.35; margin: 8px 0 18px; color: #12355b; letter-spacing: .5px; }
+h2 { font-size: 22px; margin: 38px 0 12px; padding-bottom: 6px; border-bottom: 2px solid var(--line); color: #12355b; }
+h3 { font-size: 17.5px; margin: 26px 0 8px; color: #1f3f66; }
+p { margin: 9px 0; }
+blockquote {
+  margin: 14px 0; padding: 10px 16px; background: var(--bg);
+  border-left: 4px solid var(--blue); color: #243b53; border-radius: 0 6px 6px 0;
+}
+blockquote p { margin: 5px 0; }
+table { border-collapse: collapse; width: 100%; margin: 14px 0 18px; font-size: 13px; }
+th, td { border: 1px solid var(--line); padding: 5px 8px; vertical-align: middle; }
+th { background: #eef3f9; font-weight: 600; }
+tr:nth-child(even) td { background: #fbfcfe; }
+code { font-family: Consolas, "Cascadia Mono", "Microsoft YaHei", monospace; font-size: 12.8px; background: #f2f4f7; padding: 1px 4px; border-radius: 4px; }
+pre {
+  background: #f7f9fc; border: 1px solid var(--line); border-left: 4px solid var(--blue);
+  padding: 12px 14px; border-radius: 6px; overflow-x: auto; line-height: 1.7;
+  font-size: 13.2px; margin: 10px 0 14px;
+}
+pre code { background: transparent; padding: 0; font-size: inherit; }
+img { max-width: 100%; height: auto; display: block; margin: 16px auto 6px; border: 1px solid #e5e7eb; border-radius: 6px; }
+em { color: var(--muted); }
+hr { border: 0; border-top: 1px solid var(--line); margin: 28px 0; }
+.toc { background: #fbfcfe; border: 1px solid var(--line); border-radius: 8px; padding: 14px 20px; margin: 18px 0 26px; }
+.toc-title { font-weight: 700; color: #12355b; margin-bottom: 6px; }
+.toc ul { margin: 4px 0; padding-left: 20px; }
+.toc li { margin: 2px 0; }
+.toc a { color: #245b9e; text-decoration: none; }
+.math-inline { white-space: nowrap; }
+.math-display { overflow-x: auto; overflow-y: hidden; margin: 10px 0; text-align: center; }
+.print-btn {
+  position: fixed; right: 22px; bottom: 22px; padding: 9px 14px; border: 0; border-radius: 8px;
+  background: var(--blue); color: #fff; font-size: 14px; cursor: pointer; box-shadow: 0 4px 14px rgba(0,0,0,.18);
+}
+@media print {
+  body { max-width: none; padding: 0; font-size: 10.5pt; line-height: 1.7; }
+  h1 { font-size: 22pt; } h2 { font-size: 15pt; page-break-after: avoid; } h3 { font-size: 12.5pt; page-break-after: avoid; }
+  table { font-size: 8.6pt; } th, td { padding: 3px 4px; }
+  pre { white-space: pre-wrap; }
+  table, img, blockquote, pre { page-break-inside: avoid; }
+  .print-btn { display: none; }
+  a { color: inherit; text-decoration: none; }
+  @page { size: A4; margin: 16mm 14mm 16mm 14mm; }
+}
+</style>
+</head>
+<body>
+<h1 id="r">绳驱二轴腕部：为什么要做动态 R，以及怎么做</h1>
+<blockquote>
+<p><strong>版本</strong> v1.0 · 2026-10-26 · 对应模型 2026-10-21 fixed-center-polyline v1</p>
+<p><strong>目标</strong>：只回答两件事——为什么 R 不能当常数；怎样从几何原理推出一个 1 kHz 能跑的动态 R。</p>
+<p><strong>结论</strong>：R 是 2×3；每个元素是绳的力臂 <code>r = −ds/dθ</code>；当前模型 6 段由 30 个常数解析算出。C2 对 roll 的力臂在 −25°…+25° 内从 <strong>+10.43 mm</strong> 变到 <strong>−27.12 mm</strong>，用零位常数会在 −25° 处把力矩方向算反。</p>
+<p><strong>适用</strong>：2026-10-21 固定中心折线模型，3 绳 / 2 自由度，roll ±25°，pitch −25…45°。本文的“动态”指 R 随关节角变化，不是动力学里的惯性项。</p>
+</blockquote>
+<hr />
+<nav class="toc"><div class="toc-title">目录</div><div class="toc-inner">
+<ul>
+<li><a href="#1-r">1. 为什么需要动态 R</a><ul>
+<li><a href="#11">1.1 先看一个数</a></li>
+<li><a href="#12">1.2 为什么力臂会变</a></li>
+<li><a href="#13">1.3 为什么不用查表或在线差分</a></li>
+</ul>
+</li>
+<li><a href="#2-r">2. 动态 R 到底是什么</a><ul>
+<li><a href="#21">2.1 定义</a></li>
+<li><a href="#22">2.2 符号和单位</a></li>
+<li><a href="#23">2.3 行可分离</a></li>
+</ul>
+</li>
+<li><a href="#3-s">3. 原理一：单段绳长 s(θ) 怎么来的</a><ul>
+<li><a href="#31">3.1 两个点、两个向量、三个不变量</a></li>
+<li><a href="#32">3.2 动端转过去</a></li>
+<li><a href="#33">3.3 点积展开，得到 α β γ</a></li>
+</ul>
+</li>
+<li><a href="#4-s-r-r">4. 原理二：从 s(θ) 到力臂 r(θ) 和 R</a><ul>
+<li><a href="#41">4.1 求导</a></li>
+<li><a href="#42-r">4.2 六段拼成 R</a></li>
+<li><a href="#43-c2-roll-30">4.3 手算一遍 C2 / roll（θ = 30°）</a></li>
+</ul>
+</li>
+<li><a href="#5-5">5. 实现：把公式变成 5 个常数</a><ul>
+<li><a href="#51">5.1 为什么不直接存 α β γ</a></li>
+<li><a href="#52">5.2 每段五步</a></li>
+<li><a href="#53">5.3 一个必须记住的符号</a></li>
+<li><a href="#54-c">5.4 C 语言形态</a></li>
+<li><a href="#55">5.5 计算量</a></li>
+<li><a href="#56">5.6 运行期诊断</a></li>
+</ul>
+</li>
+<li><a href="#6">6. 怎么验证它是对的</a></li>
+<li><a href="#7">7. 怎么在控制里用</a><ul>
+<li><a href="#71">7.1 正解：张力 → 力矩</a></li>
+<li><a href="#72">7.2 反解：力矩 → 张力</a></li>
+<li><a href="#73">7.3 控制律里的位置</a></li>
+</ul>
+</li>
+<li><a href="#8-cad">8. 从 CAD 到代码的落地步骤</a></li>
+<li><a href="#9">9. 常见错误</a></li>
+<li><a href="#a-30-mm">附录 A：当前模型 30 个投影常数（mm）</a></li>
+<li><a href="#b">附录 B：关键数值</a></li>
+</ul>
+</div>
+</nav>
+<h2 id="1-r">1. 为什么需要动态 R</h2>
+<h3 id="11">1.1 先看一个数</h3>
+<p>C2 对 roll 的力臂，零位是 <code>r(0) = −22.05 mm</code>。如果整个行程都用这个常数：</p>
+<table>
+<thead>
+<tr>
+<th>元素</th>
+<th style="text-align: right;">零位常数</th>
+<th style="text-align: right;">行程内实际</th>
+<th>用零位常数的后果</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>C2 / roll</td>
+<td style="text-align: right;">−22.05</td>
+<td style="text-align: right;">+10.43 @ −25°；−27.12 @ +25°</td>
+<td>−25° 处符号反，误差 32.48 mm</td>
+</tr>
+<tr>
+<td>C3 / roll</td>
+<td style="text-align: right;">+17.37</td>
+<td style="text-align: right;">−12.37 @ +25°</td>
+<td>符号反，误差 29.74 mm</td>
+</tr>
+<tr>
+<td>C1 / pitch</td>
+<td style="text-align: right;">−58.10</td>
+<td style="text-align: right;">−9.55 @ −25°</td>
+<td>差 48.55 mm，约 6 倍</td>
+</tr>
+<tr>
+<td>C2 / pitch</td>
+<td style="text-align: right;">+11.80</td>
+<td style="text-align: right;">−5.30 @ +45°</td>
+<td>符号反，误差 17.10 mm</td>
+</tr>
+</tbody>
+</table>
+<p>单位都是 mm。<strong>这不是“差几个百分点”的精度问题，是力矩方向可能反的问题。</strong></p>
+<p><img alt="为什么需要动态 R" src="out/figs/fig_why_dynamic.png" /></p>
+<p><em>图 1：左：C2 对 roll 的力臂穿过零点；右：C1 对 pitch 在 −25° 只剩零位的约 1/6。虚线是零位常数，阴影是常数近似带来的误差。</em></p>
+<h3 id="12">1.2 为什么力臂会变</h3>
+<p>力臂 <code>r</code> 的物理意义是“<strong>转轴到绳所在直线的垂直距离</strong>”。</p>
+<p>关节一转，绳的动端绕轴画圆，绳的方向和它到轴的垂距都在变；当绳的延长线正好穿过轴时，<code>r = 0</code>；再转过去，<code>r</code> 变号。这个变化是几何本身带来的，不是装配误差，也不是绳的弹性。</p>
+<p>所以：</p>
+<ul>
+<li>零位 <code>r(0)</code> 只描述一个姿态；</li>
+<li>真正进控制的是当前姿态的 <code>r(θ)</code>；</li>
+<li>如果控制里用常数 R，等于假设“绳的力臂不随姿态变”，这个假设在当前腕部上不成立。</li>
+</ul>
+<h3 id="13">1.3 为什么不用查表或在线差分</h3>
+<table>
+<thead>
+<tr>
+<th>方案</th>
+<th>问题</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>零位常数 R</td>
+<td>上面那张表：几十毫米误差，甚至反号</td>
+</tr>
+<tr>
+<td>2D 查表 + 插值</td>
+<td>要存整张表；符号翻转和短段附近插值容易错；换几何要重做表</td>
+</tr>
+<tr>
+<td>在线差分</td>
+<td>每段要多次正运动学，计算量大，步长和噪声都影响结果</td>
+</tr>
+<tr>
+<td><strong>解析 5 常数</strong></td>
+<td><strong>精确、每段只有 1 个角度变量，6 次调用就够</strong></td>
+</tr>
+</tbody>
+</table>
+<p>当前几何还有一个关键性质：<strong>每段绳只跨一个关节</strong>，所以绳长可以写成</p>
+<div class="math-display">$$l_i(\theta_r,\theta_p)=c_i+s_{ri}(\theta_r)+s_{pi}(\theta_p)$$</div>
+<p><code>c_i</code> 是常数，<code>s_ri</code> 只随 roll 变，<code>s_pi</code> 只随 pitch 变。于是 R 的 roll 行只是 θr 的 3 个一维函数，pitch 行只是 θp 的 3 个一维函数。<strong>动态 R 不需要二维表，只需要 6 个一维解析式。</strong></p>
+<p>所以 R 本身不需要逐点辨识：几何确定后，R 就被确定；实验只需要标定零位、收放系数和张力阈值。</p>
+<blockquote>
+<p>如果以后加一根从 base 直接到 palm 的绳，这个解耦立刻失效，必须重推通用绳长雅可比。本文所有结论都建立在“每段只跨一个关节”上。</p>
+</blockquote>
+<hr />
+<h2 id="2-r">2. 动态 R 到底是什么</h2>
+<h3 id="21">2.1 定义</h3>
+<p>设第 i 根绳的总长为 <code>l_i</code>，两个关节角为 <code>q = [θr, θp]</code>。定义</p>
+<div class="math-display">$$R_{ji}=-\frac{\partial l_i}{\partial q_j},\qquad \tau=Rf$$</div>
+<p>其中 <span class="math-inline">$j=\mathrm{roll},\mathrm{pitch}$</span>；<span class="math-inline">$i=C1,C2,C3$</span>。</p>
+<ul>
+<li><code>R</code> 是 2 行 3 列：行 = 关节，列 = 绳；</li>
+<li><code>f = [f_C1, f_C2, f_C3]ᵀ</code> 是三根绳的张力；</li>
+<li><code>τ = [τ_roll, τ_pitch]ᵀ</code> 是两个关节的力矩；</li>
+<li><code>R_ji</code> 就是第 i 根绳对第 j 个关节的力臂，带符号。</li>
+</ul>
+<p>写成矩阵：</p>
+<div class="math-display">$$R=\begin{bmatrix} r_{r,C1} & r_{r,C2} & r_{r,C3}\\ r_{p,C1} & r_{p,C2} & r_{p,C3}\end{bmatrix}$$</div>
+<p>零位数值（mm）：</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th style="text-align: right;">C1</th>
+<th style="text-align: right;">C2</th>
+<th style="text-align: right;">C3</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>roll</strong></td>
+<td style="text-align: right;">−0.259</td>
+<td style="text-align: right;">−22.050</td>
+<td style="text-align: right;">+17.372</td>
+</tr>
+<tr>
+<td><strong>pitch</strong></td>
+<td style="text-align: right;">−58.105</td>
+<td style="text-align: right;">+11.805</td>
+<td style="text-align: right;">+10.990</td>
+</tr>
+</tbody>
+</table>
+<h3 id="22">2.2 符号和单位</h3>
+<ul>
+<li><code>r &gt; 0</code>：正转时该段绳变短，张力产生正关节力矩；</li>
+<li><code>r &lt; 0</code>：正转时该段绳变长，张力产生负关节力矩；</li>
+<li>几何表用 mm，则 R 的单位是 mm，<code>τ</code> 用 N·mm；</li>
+<li>若 R 用 m，则 <code>τ</code> 用 N·m。<strong>不要混用 mm 和 m。</strong></li>
+</ul>
+<blockquote>
+<p>常见写法 <code>J = ∂l/∂q</code> 是 3×2；本文的 R 是 <code>−Jᵀ</code>，是 2×3。两者只差转置和负号，但矩阵乘法的顺序不能写反。</p>
+</blockquote>
+<h3 id="23">2.3 行可分离</h3>
+<p>因为 <code>l_i = c_i + s_ri(θr) + s_pi(θp)</code>，所以</p>
+<div class="math-display">$$R=\begin{bmatrix} r_{r,C1}(\theta_r) & r_{r,C2}(\theta_r) & r_{r,C3}(\theta_r)\\ r_{p,C1}(\theta_p) & r_{p,C2}(\theta_p) & r_{p,C3}(\theta_p)\end{bmatrix}$$</div>
+<ul>
+<li>roll 行只依赖 θr；</li>
+<li>pitch 行只依赖 θp；</li>
+<li>6 个元素 = 3 个 θr 的一维函数 + 3 个 θp 的一维函数。</li>
+</ul>
+<p>这就是为什么“动态 R”在 MCU 上可行：它不是一张二维曲面，而是六个一维解析式。</p>
+<hr />
+<h2 id="3-s">3. 原理一：单段绳长 s(θ) 怎么来的</h2>
+<h3 id="31">3.1 两个点、两个向量、三个不变量</h3>
+<p>取一段绳：固定端 A（例如 P4），动端零位 B₀（例如 P5），转轴过 o、方向为单位向量 â。</p>
+<div class="math-display">$$u=A-o,\qquad v=B_0-o$$</div>
+<div class="math-display">$$h_1=u\cdot\hat a,\quad u_\perp=u-h_1\hat a,\quad h_2=v\cdot\hat a,\quad v_\perp=v-h_2\hat a$$</div>
+<div class="math-display">$$a=\Vert u_\perp\Vert,\quad b=\Vert v_\perp\Vert,\quad h=h_2-h_1$$</div>
+<ul>
+<li><code>a</code>：固定端到轴的距离；</li>
+<li><code>b</code>：动端到轴的距离；</li>
+<li><code>h</code>：两端沿轴的错开量，带符号；</li>
+<li><code>u⊥</code>、<code>v⊥</code>：两个垂直于轴的分量。</li>
+</ul>
+<p><code>a、b、h</code> 只与几何有关，与 θ 无关。它们就是“这一段绳的三个不变量”。</p>
+<p><img alt="平面几何" src="out/figs/fig1_geometry.png" /></p>
+<p><em>图 2：C2/roll 段的 a、b、Δ、s(θ)，以及轴向错位 h 只贡献 h²。</em></p>
+<h3 id="32">3.2 动端转过去</h3>
+<p>绕轴转 θ 时，垂直分量旋转：</p>
+<div class="math-display">$$v'_\perp=v_\perp\cos\theta+(\hat a\times v_\perp)\sin\theta,\qquad B(\theta)=o+h_2\hat a+v'_\perp$$</div>
+<p>所以</p>
+<div class="math-display">$$B-A=h\hat a+v'_\perp-u_\perp$$</div>
+<p>轴向 <code>h â</code> 与两个垂直分量都正交，平方时轴向单独分离：</p>
+<div class="math-display">$$s^2=h^2+\Vert v'_\perp-u_\perp\Vert^2=a^2+b^2+h^2-2v'_\perp\cdot u_\perp$$</div>
+<h3 id="33">3.3 点积展开，得到 α β γ</h3>
+<p>把 <code>v′⊥</code> 代进点积：</p>
+<div class="math-display">$$v'_\perp\cdot u_\perp=(v_\perp\cdot u_\perp)\cos\theta+((\hat a\times v_\perp)\cdot u_\perp)\sin\theta$$</div>
+<p>定义有向角 Δ：</p>
+<div class="math-display">$$\cos\Delta=\frac{v_\perp\cdot u_\perp}{ab},\qquad \sin\Delta=-\frac{(\hat a\times v_\perp)\cdot u_\perp}{ab}$$</div>
+<p>于是</p>
+<div class="math-display">$$v'_\perp\cdot u_\perp=ab\cos(\Delta+\theta),\qquad s^2=a^2+b^2+h^2-2ab\cos(\Delta+\theta)$$</div>
+<p>这就是余弦定理。把常数打包：</p>
+<div class="math-display">$$s^2=\alpha+\beta\cos\theta+\gamma\sin\theta,\qquad \alpha=a^2+b^2+h^2,\quad \beta=-2ab\cos\Delta,\quad \gamma=+2ab\sin\Delta$$</div>
+<p><code>α、β、γ</code> 只与几何有关，与 θ 无关。到这一步，单段绳长已经是一个<strong>闭式的一维函数</strong>，不需要迭代，也不需要查表。</p>
+<hr />
+<h2 id="4-s-r-r">4. 原理二：从 s(θ) 到力臂 r(θ) 和 R</h2>
+<h3 id="41">4.1 求导</h3>
+<div class="math-display">$$s=\sqrt{\alpha+\beta\cos\theta+\gamma\sin\theta},\qquad \frac{\mathrm ds}{\mathrm d\theta}=\frac{\gamma\cos\theta-\beta\sin\theta}{2s}$$</div>
+<p>本文约定力臂 <code>r = −ds/dθ</code>，所以</p>
+<div class="math-display">$$r(\theta)=-\frac{\mathrm ds}{\mathrm d\theta}=\frac{\beta\sin\theta-\gamma\cos\theta}{2s},\qquad r(0)=-\frac{\gamma}{2\sqrt{\alpha+\beta}}$$</div>
+<p><code>r(0)</code> 这个式子很有用：算完 α、β、γ 后，先和零位表对一遍，可以立刻发现 Δ 的符号、<code>e₂</code> 的方向或 <code>γ</code> 的正负有没有写反。</p>
+<h3 id="42-r">4.2 六段拼成 R</h3>
+<p>每根绳有两段会变：roll 段（P4–P5）和 pitch 段（P6–P7）。于是</p>
+<div class="math-display">$$R=\begin{bmatrix} r_{r,C1} & r_{r,C2} & r_{r,C3}\\ r_{p,C1} & r_{p,C2} & r_{p,C3}\end{bmatrix},\qquad r_{r,Ci}=r_i(\theta_r),\quad r_{p,Ci}=r_i(\theta_p)$$</div>
+<p>三根绳 × 两段 = 6 次单段求值，得到 R 的 6 个元素。</p>
+<p>当前六段的几何量与零位力臂：</p>
+<table>
+<thead>
+<tr>
+<th>段</th>
+<th style="text-align: right;">a / mm</th>
+<th style="text-align: right;">b / mm</th>
+<th style="text-align: right;">h / mm</th>
+<th style="text-align: right;">Δ / °</th>
+<th style="text-align: right;">r(0) / mm</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>C1 / roll</td>
+<td style="text-align: right;">5.025</td>
+<td style="text-align: right;">18.173</td>
+<td style="text-align: right;">+3.000</td>
+<td style="text-align: right;">+2.197</td>
+<td style="text-align: right;">−0.2594</td>
+</tr>
+<tr>
+<td>C2 / roll</td>
+<td style="text-align: right;">27.459</td>
+<td style="text-align: right;">37.149</td>
+<td style="text-align: right;">+4.000</td>
+<td style="text-align: right;">+18.488</td>
+<td style="text-align: right;">−22.0497</td>
+</tr>
+<tr>
+<td>C3 / roll</td>
+<td style="text-align: right;">27.459</td>
+<td style="text-align: right;">41.594</td>
+<td style="text-align: right;">+4.000</td>
+<td style="text-align: right;">−15.150</td>
+<td style="text-align: right;">+17.3720</td>
+</tr>
+<tr>
+<td>C1 / pitch</td>
+<td style="text-align: right;">58.310</td>
+<td style="text-align: right;">62.160</td>
+<td style="text-align: right;">−0.1785</td>
+<td style="text-align: right;">+25.589</td>
+<td style="text-align: right;">−58.1046</td>
+</tr>
+<tr>
+<td>C2 / pitch</td>
+<td style="text-align: right;">13.416</td>
+<td style="text-align: right;">25.298</td>
+<td style="text-align: right;">+0.2836</td>
+<td style="text-align: right;">−33.830</td>
+<td style="text-align: right;">+11.8049</td>
+</tr>
+<tr>
+<td>C3 / pitch</td>
+<td style="text-align: right;">13.416</td>
+<td style="text-align: right;">25.298</td>
+<td style="text-align: right;">+6.2836</td>
+<td style="text-align: right;">−33.830</td>
+<td style="text-align: right;">+10.9904</td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p>C1/roll 的 <code>r(0)</code> 只有 −0.259 mm：零位时 C1 绳段的延长线离 roll 轴只有 0.259 mm，力矩贡献很小，但对几何误差最敏感。C1/pitch 的 −58.1 mm 则是 pitch 的主力矩臂。</p>
+</blockquote>
+<h3 id="43-c2-roll-30">4.3 手算一遍 C2 / roll（θ = 30°）</h3>
+<p>C2/roll 的平面分量（<code>u₂、v₂</code> 取 <code>e₂ = −Z</code>，所以是负的 z；CAD 的 <code>z = +5</code> 对应 <code>u₂ = −5</code>）：</p>
+<div class="math-display">$$u=(-27,-5),\qquad v=(-32.5,-18)$$</div>
+<p>转 30°：</p>
+<div class="math-display">$$v'_1=v_1\cos30^\circ-v_2\sin30^\circ=-19.146,\qquad v'_2=v_1\sin30^\circ+v_2\cos30^\circ=-31.838$$</div>
+<div class="math-display">$$d=v'-u=(7.854,-26.838),\qquad s=\sqrt{7.854^2+26.838^2+4^2}=28.249\ \mathrm{mm}$$</div>
+<div class="math-display">$$r=\frac{d_1v'_2-d_2v'_1}{s}=\frac{7.854\times(-31.838)-(-26.838)\times(-19.146)}{28.249}=-27.042\ \mathrm{mm}$$</div>
+<p>用 αβγ 复核：<code>β = −1935</code>、<code>γ = +647</code>，</p>
+<div class="math-display">$$r(30^\circ)=\frac{-1935\times0.5-647\times0.8660}{2\times28.249}=-27.042\ \mathrm{mm}$$</div>
+<p>两种算法一致。C2/roll 的完整扫描：</p>
+<table>
+<thead>
+<tr>
+<th>θ / °</th>
+<th style="text-align: right;">0</th>
+<th style="text-align: right;">10</th>
+<th style="text-align: right;">20</th>
+<th style="text-align: right;">25</th>
+<th style="text-align: right;">30</th>
+<th style="text-align: right;">40</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>s / mm</td>
+<td style="text-align: right;">14.671</td>
+<td style="text-align: right;">18.894</td>
+<td style="text-align: right;">23.521</td>
+<td style="text-align: right;">25.884</td>
+<td style="text-align: right;">28.249</td>
+<td style="text-align: right;">32.922</td>
+</tr>
+<tr>
+<td>r / mm</td>
+<td style="text-align: right;">−22.050</td>
+<td style="text-align: right;">−25.753</td>
+<td style="text-align: right;">−26.993</td>
+<td style="text-align: right;">−27.124</td>
+<td style="text-align: right;">−27.042</td>
+<td style="text-align: right;">−26.418</td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p>25° 的 s 是 25.884 mm，但 r(25°) 是 <strong>−27.124 mm</strong>；−26.993 mm 是 20° 的值。s 和 r 不要跨行抄。</p>
+</blockquote>
+<hr />
+<h2 id="5-5">5. 实现：把公式变成 5 个常数</h2>
+<h3 id="51">5.1 为什么不直接存 α β γ</h3>
+<p>C1/pitch 的 <code>α + β</code> 只有约 725.8 mm²，而 α、|β| 都是 7,000 量级；两个大数相加后只剩约 1/10 的量级，float32 下会掉精度。</p>
+<p>所以固件不存 αβγ，而是存每段 5 个<strong>投影常数</strong>：</p>
+<div class="math-display">$$u_1=u\cdot e_1,\quad u_2=u\cdot e_2,\quad v_1=v\cdot e_1,\quad v_2=v\cdot e_2,\quad h=(v-u)\cdot\hat a$$</div>
+<p>其中 <code>e₁ = +X</code>，<code>e₂ = −Z</code>，<code>e₃ = e₁ × e₂ = +Y</code>。这是一个右手平面基；注意 <strong>e₂ = −Z</strong>，所以 CAD 里的 z 要取负才能填进 <code>u₂、v₂</code>。例如 C2/roll 的 P4 是 <code>(−27, −16, +5)</code>，对应 <code>(u₁, u₂) = (−27, −5)</code>。</p>
+<h3 id="52">5.2 每段五步</h3>
+<div class="math-display">$$v'_1=v_1\cos\theta-v_2\sin\theta,\qquad v'_2=v_1\sin\theta+v_2\cos\theta$$</div>
+<div class="math-display">$$d_1=v'_1-u_1,\quad d_2=v'_2-u_2,\quad s=\sqrt{d_1^2+d_2^2+h^2},\quad r=\frac{d_1v'_2-d_2v'_1}{s}$$</div>
+<p>roll 段用 θr，pitch 段用 θp。六个 <code>(s, r)</code> 拼成 R 的两行。</p>
+<h3 id="53">5.3 一个必须记住的符号</h3>
+<div class="math-display">$$r=\frac{d_1v'_2-d_2v'_1}{s},\qquad -r=\frac{u_1d_2-u_2d_1}{s}$$</div>
+<p>第二种写法是常见的符号错误。它在闭环里的表现是“控制方向反、越纠越偏”。写完代码，先用零位 <code>r(0)</code> 对一遍：如果 C2/roll 算出 +22.05 而不是 −22.05，就是这里反了。</p>
+<h3 id="54-c">5.4 C 语言形态</h3>
+<pre><code class="language-c">for (j = 0; j &lt; 2; ++j) {
+    float th = (j == 0) ? roll_rad : pitch_rad;
+    float c = cosf(th), s = sinf(th);
+    for (i = 0; i &lt; 3; ++i) {
+        float v1p = seg[j][i].v1 * c - seg[j][i].v2 * s;
+        float v2p = seg[j][i].v1 * s + seg[j][i].v2 * c;
+        float d1  = v1p - seg[j][i].u1;
+        float d2  = v2p - seg[j][i].u2;
+        float len = sqrtf(d1*d1 + d2*d2 + seg[j][i].h*seg[j][i].h);
+        R[j][i] = (d1*v2p - d2*v1p) / len;
+        seg_len[j][i] = len;
+    }
+}
+</code></pre>
+<h3 id="55">5.5 计算量</h3>
+<ul>
+<li>整帧 <strong>2 次 sin + 2 次 cos</strong>（每轴一对，不是每段一对）；</li>
+<li>6 次 <code>sqrt</code>、6 次除法；</li>
+<li>30 个 float 常数（6 段 × 5），120 字节；</li>
+<li>无堆内存、无查表、无迭代。</li>
+</ul>
+<blockquote>
+<p>这套结构适合 1 kHz 控制；但实际最坏执行时间必须在 H7 目标板、实际编译选项和中断负载下用 DWT 测量，主机时间不能代替。</p>
+</blockquote>
+<p><img alt="从 CAD 到实时 R" src="out/figs/fig_flow.png" /></p>
+<p><em>图 3：离线一次生成 30 个常数，之后每个控制周期只做解析求值。</em></p>
+<h3 id="56">5.6 运行期诊断</h3>
+<table>
+<thead>
+<tr>
+<th>检查</th>
+<th>含义</th>
+<th>处理</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>六段有限、<code>s &gt; 1e-8 m</code></td>
+<td>数值有效</td>
+<td>否则 R 全部置 NaN，不得沿用旧帧</td>
+</tr>
+<tr>
+<td>角度在行程内</td>
+<td>roll ±25°，pitch −25…45°</td>
+<td>越界仍给数学结果，但控制不得使用</td>
+</tr>
+<tr>
+<td>pitch ≤ −24°</td>
+<td>低置信区；C1/pitch 在 −25° 只有 3.9006 mm</td>
+<td>提示，必要时降速/限幅</td>
+</tr>
+<tr>
+<td><code>rank = 2</code></td>
+<td>两行独立</td>
+<td>当前工作空间 3,621/3,621 为真</td>
+</tr>
+<tr>
+<td>条件数</td>
+<td>κ₂(R)</td>
+<td>当前工作空间 1.08–3.16</td>
+</tr>
+<tr>
+<td>全正零空间 n</td>
+<td>是否存在“三绳一起收紧”的方向</td>
+<td>当前工作空间 1,957/3,621 存在</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="6">6. 怎么验证它是对的</h2>
+<p>不需要把整张工作空间都打印出来，按这个顺序做四件事：</p>
+<table>
+<thead>
+<tr>
+<th>步骤</th>
+<th>做法</th>
+<th>当前结果</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1. 零位</td>
+<td>手算/表单对 <code>R(0)</code></td>
+<td>C2/roll = −22.0497 mm</td>
+</tr>
+<tr>
+<td>2. 单段</td>
+<td>与 3D 刚体链式雅可比对拍</td>
+<td>最大差 4.34×10⁻¹² mm（double）</td>
+</tr>
+<tr>
+<td>3. 全工作空间</td>
+<td>3,621 个姿态，roll −25…25°，pitch −25…45°</td>
+<td>满行秩；条件数 1.08–3.16</td>
+</tr>
+<tr>
+<td>4. 数值格式</td>
+<td>float32 vs double（9,224 个姿态）</td>
+<td>最大 6.32×10⁻⁵ mm（官方 4.67×10⁻⁵ mm）</td>
+</tr>
+</tbody>
+</table>
+<p>和第 2 步的“3D 链式雅可比”比，是独立路线：直接用 24 个 CAD 点做刚体正运动学，再逐段投影，不调用 5 常数。两条路线一致，说明 5 常数不是拟合，而是同一几何的等价改写。</p>
+<p>CAD 的 0.2° 差分表也可以对，但要注意：它的最大差 0.032668 mm 出现在 pitch=−25° 边界，是<strong>差分截断</strong>，不是模型误差。做微米级验收要用解析式或更小的差分步长。</p>
+<hr />
+<h2 id="7">7. 怎么在控制里用</h2>
+<h3 id="71">7.1 正解：张力 → 力矩</h3>
+<div class="math-display">$$\tau=Rf$$</div>
+<p>已知三根绳张力，直接乘 R 得到两个关节力矩。<code>R</code> 用当前姿态的，不用零位常数。</p>
+<h3 id="72">7.2 反解：力矩 → 张力</h3>
+<p>R 是 2×3，<code>τ</code> 只有 2 维，所以 <code>f</code> 有 1 维自由度：</p>
+<div class="math-display">$$f=R^{+}\tau+t\,n$$</div>
+<ul>
+<li><code>R⁺ = Rᵀ (R Rᵀ)⁻¹</code>：最小范数特解；</li>
+<li><code>n</code>：R 的单位右零空间方向，满足 <code>R n = 0</code>；</li>
+<li><code>t</code>：标量；在 n 全正时，它让三根绳一起收紧（预紧）。</li>
+</ul>
+<p>加上张力上下限 <code>f_min ≤ f_i ≤ f_max</code> 后，<code>t</code> 变成一个区间；区间为空就说明这个姿态/这个 <code>τ</code> 用三根绳实现不了，需要降低负载、换姿态或改绳路。<strong>不要只靠加大 t 硬顶</strong>，先饱和的那根绳会过载。</p>
+<blockquote>
+<p>当前工作空间里 1,664/3,621 个姿态不存在全正 n。这时“三绳一起收紧”在数学上做不到，必须逐姿态检查；不能按 pitch 一个角度硬编码。</p>
+</blockquote>
+<h3 id="73">7.3 控制律里的位置</h3>
+<p>当前 v2 控制律是：</p>
+<pre><code class="language-text">前馈 = k_i [ l_i(目标) − l_i(基线) ]
+校正 = −k_p k_i ( R_i · e_rad )
+</code></pre>
+<p>前馈用绳长模型，校正用 R。R 的符号/数值错，校正方向就会错；R 用零位常数，在大角度处校正会偏。</p>
+<p><strong>动态 R 是每个控制周期更新一次的，不是上电算一次就缓存。</strong></p>
+<hr />
+<h2 id="8-cad">8. 从 CAD 到代码的落地步骤</h2>
+<table>
+<thead>
+<tr>
+<th>步骤</th>
+<th>做什么</th>
+<th>产物</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>从 CAD 取 24 个导向点和两根轴线；标清每个点属于 base / roll_link / palm</td>
+<td><code>points_zero.csv</code>、轴线</td>
+</tr>
+<tr>
+<td>2</td>
+<td>按“每段只跨一个关节”分段；确认 P4–P5 随 roll、P6–P7 随 pitch</td>
+<td>分段表</td>
+</tr>
+<tr>
+<td>3</td>
+<td>对每段算 <code>u₁,u₂,v₁,v₂,h</code></td>
+<td>30 个常数（120 B）</td>
+</tr>
+<tr>
+<td>4</td>
+<td>实现 6 次单段求值；先对零位 <code>R(0)</code></td>
+<td>单段函数</td>
+</tr>
+<tr>
+<td>5</td>
+<td>用 3D 链式雅可比 + 全工作空间对拍</td>
+<td>误差表</td>
+</tr>
+<tr>
+<td>6</td>
+<td>实机标定零位 δ、每绳收放系数 <code>k_i</code>、<code>f_min/f_max</code>、段长门限</td>
+<td>标定文件</td>
+</tr>
+<tr>
+<td>7</td>
+<td>在 H7 上跑 1 kHz，用 DWT 测最坏执行时间</td>
+<td>周期报告</td>
+</tr>
+</tbody>
+</table>
+<p>前 3 步是离线一次；第 4–5 步是软件验证；第 6–7 步必须上实机。<strong>软件对拍不能替代实机标定。</strong></p>
+<blockquote>
+<p>30 个常数由几何生成，不要手改。换点、换轴或换绳路后，必须重新生成常数并重跑对拍；旧表和旧结论不能自动沿用。</p>
+</blockquote>
+<hr />
+<h2 id="9">9. 常见错误</h2>
+<table>
+<thead>
+<tr>
+<th>错误</th>
+<th>后果</th>
+<th>怎么避免</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>用零位 R 常数</td>
+<td>力臂差几十毫米，甚至反号</td>
+<td>每周期用当前 θ 算</td>
+</tr>
+<tr>
+<td>把 pitch 轴心当原点</td>
+<td>a、b、h 全错，pitch 行整体偏</td>
+<td>pitch 轴心是 (0,0,24)</td>
+</tr>
+<tr>
+<td>用 ‖v‖ 当半径 b</td>
+<td>少减了轴向分量 h</td>
+<td>先算 <code>v⊥ = v − h₂â</code> 再取模</td>
+</tr>
+<tr>
+<td>角度用度直接喂 sin/cos</td>
+<td>结果完全错</td>
+<td>内部统一 rad</td>
+</tr>
+<tr>
+<td>力臂符号取反</td>
+<td>闭环正反馈，越纠越偏</td>
+<td>用 <code>r = −ds/dθ</code>，零位对一遍</td>
+</tr>
+<tr>
+<td>把 CAD 差分表当 0.001 mm 真值</td>
+<td>在 pitch ≤ −24° 会把 0.03 mm 差分误差当模型误差</td>
+<td>先确认差分步长和边界格式</td>
+</tr>
+<tr>
+<td>只看“n 全正”就认为张力可行</td>
+<td>分量比例可能让盒约束为空</td>
+<td>逐姿态算 t 区间</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="a-30-mm">附录 A：当前模型 30 个投影常数（mm）</h2>
+<table>
+<thead>
+<tr>
+<th>轴</th>
+<th>绳</th>
+<th style="text-align: right;">u₁</th>
+<th style="text-align: right;">u₂</th>
+<th style="text-align: right;">v₁</th>
+<th style="text-align: right;">v₂</th>
+<th style="text-align: right;">h</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>roll</td>
+<td>C1</td>
+<td style="text-align: right;">+0.500000</td>
+<td style="text-align: right;">−5.000000</td>
+<td style="text-align: right;">+2.500000</td>
+<td style="text-align: right;">−18.000000</td>
+<td style="text-align: right;">+3.000000</td>
+</tr>
+<tr>
+<td>roll</td>
+<td>C2</td>
+<td style="text-align: right;">−27.000000</td>
+<td style="text-align: right;">−5.000000</td>
+<td style="text-align: right;">−32.500000</td>
+<td style="text-align: right;">−18.000000</td>
+<td style="text-align: right;">+4.000000</td>
+</tr>
+<tr>
+<td>roll</td>
+<td>C3</td>
+<td style="text-align: right;">+27.000000</td>
+<td style="text-align: right;">−5.000000</td>
+<td style="text-align: right;">+37.500000</td>
+<td style="text-align: right;">−18.000000</td>
+<td style="text-align: right;">+4.000000</td>
+</tr>
+<tr>
+<td>pitch</td>
+<td>C1</td>
+<td style="text-align: right;">+6.000000</td>
+<td style="text-align: right;">−58.000000</td>
+<td style="text-align: right;">+32.472169</td>
+<td style="text-align: right;">−53.000000</td>
+<td style="text-align: right;">−0.178543</td>
+</tr>
+<tr>
+<td>pitch</td>
+<td>C2</td>
+<td style="text-align: right;">+6.000000</td>
+<td style="text-align: right;">+12.000000</td>
+<td style="text-align: right;">+22.000000</td>
+<td style="text-align: right;">+12.500000</td>
+<td style="text-align: right;">+0.283587</td>
+</tr>
+<tr>
+<td>pitch</td>
+<td>C3</td>
+<td style="text-align: right;">+6.000000</td>
+<td style="text-align: right;">+12.000000</td>
+<td style="text-align: right;">+22.000000</td>
+<td style="text-align: right;">+12.500000</td>
+<td style="text-align: right;">+6.283587</td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p>再次提醒：<code>u₂、v₂</code> 是 <code>e₂ = −Z</code> 分量；roll 段的 <code>u₂ = −5</code> 对应 CAD 的 <code>z = +5</code>。不要直接把 CAD 的 z 填进来。</p>
+</blockquote>
+<h2 id="b">附录 B：关键数值</h2>
+<table>
+<thead>
+<tr>
+<th>量</th>
+<th>数值</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>R(0) / mm</td>
+<td>roll：−0.2594, −22.0497, +17.3720；pitch：−58.1046, +11.8049, +10.9904</td>
+</tr>
+<tr>
+<td>n(0)</td>
+<td>(0.26444, 0.59491, 0.75905)</td>
+</tr>
+<tr>
+<td>κ₂(0)</td>
+<td>2.1498</td>
+</tr>
+<tr>
+<td>3D 对拍最大差</td>
+<td>4.34×10⁻¹² mm</td>
+</tr>
+<tr>
+<td>float32 最大差</td>
+<td>6.32×10⁻⁵ mm</td>
+</tr>
+<tr>
+<td>CAD 表最大差</td>
+<td>0.032668 mm（差分截断，不是模型误差）</td>
+</tr>
+<tr>
+<td>条件数范围</td>
+<td>1.0836–3.1637</td>
+</tr>
+<tr>
+<td>全正 n 的姿态</td>
+<td>1,957 / 3,621</td>
+</tr>
+<tr>
+<td>C2/roll 力臂变化</td>
+<td>+10.427 → −27.124 mm</td>
+</tr>
+<tr>
+<td>C1/pitch 力臂变化</td>
+<td>−9.551 → −58.307 mm</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<p><em>公式、数值与代码均对应 <code>verify_dynamic_R.py</code>、<code>wrist_model.py</code> 和 H7 包 <code>wrist_r.c</code>；图由 <code>make_figures.py</code> 与 <code>make_intro_figures.py</code> 生成。</em></p>
+<button class="print-btn" onclick="window.print()">打印 / 导出 PDF</button>
+</body>
+</html>

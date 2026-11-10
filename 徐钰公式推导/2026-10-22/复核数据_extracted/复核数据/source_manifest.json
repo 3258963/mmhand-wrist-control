@@ -1,0 +1,9 @@
+{
+  "folder": "C:\\Users\\ASUS\\Documents\\机械臂\\wrist_cad_extraction\\processed\\wrist_workspace_20261021_C23_P03P04_corrected",
+  "sha256": {
+    "config.json": "1f9fb4c2dcef903f2b62bc86d4955060393ba3aaa533b373a978344c6a629ae1",
+    "report.json": "c59a820b41cd0a9063ba5c9675a33144c26a9884e1c22cb12c85180481787860",
+    "R_grid.csv": "32e7111d503728a95ed460259a30bd8fc4c9610dd9039dd6c847736cf63bec09",
+    "raw_poses.jsonl": "1d180ff8988ec1f5312fb8cc0e3cee98db9454f18cceed10c67cbe0ab0d7f9d7"
+  }
+}

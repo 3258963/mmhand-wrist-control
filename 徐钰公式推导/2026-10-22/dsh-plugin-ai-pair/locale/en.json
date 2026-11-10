@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "AI Pair Review",
+    "description": "A sidebar entry for AI collaboration plus the pair_review tool: one model edits the workspace, another model reviews the real files, and failed findings are fed back for rework until the work passes or rounds run out."
+  }
+}

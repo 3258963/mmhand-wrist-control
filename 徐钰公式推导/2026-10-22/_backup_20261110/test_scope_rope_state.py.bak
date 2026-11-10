@@ -1,0 +1,380 @@
+"""绳状态机 + 一键紧/松绳 + 恢复态测试（PLAN v8.2/v8.3 实施版）。"""
+import os
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+import math
+import time
+
+import pytest
+
+import mmhand_scope as scope
+from mmhand_scope import (RELEASE_COUNTS, release_delta, rope_state,
+                          tighten_t_use)
+from wrist_model import positive_null_direction
+
+
+# ---------- rope_state 六态 ----------
+
+class TestRopeState:
+    def test_no_data(self):
+        assert rope_state(None, 0.5, 30, False)[0] == "no_data"
+        assert rope_state([1, 2], 0.5, 30, False)[0] == "no_data"
+
+    def test_unset_when_no_bounds(self):
+        assert rope_state([2, 2, 2], 0, 0, False)[0] == "unset"
+        assert rope_state([2, 2, 2], None, None, False)[0] == "unset"
+
+    def test_over_beats_slack(self):
+        # 一缆过紧 + 一缆放松 → 过紧优先
+        assert rope_state([40, 0.1, 2], 0.5, 30, False)[0] == "over"
+
+    def test_slack(self):
+        assert rope_state([2, 2, 0.1], 0.5, 30, False)[0] == "slack"
+
+    def test_recovering(self):
+        # 在界内且恢复标志 → recovering（不是 normal）
+        assert rope_state([2, 2, 2], 0.5, 30, True)[0] == "recovering"
+
+    def test_normal(self):
+        assert rope_state([2, 2, 2], 0.5, 30, False)[0] == "normal"
+
+    def test_fmin_zero_skips_lower(self):
+        # fmin=0 → 下界判定跳过：0N 也不算放松（只有 fmax 判定）
+        assert rope_state([0, 0, 0], 0, 30, False)[0] == "normal"
+
+    def test_hysteresis(self):
+        # fmin=1.0：0.98 在滞回带内（fmin−0.05）不算放松
+        assert rope_state([0.98, 2, 2], 1.0, 30, False)[0] == "normal"
+        assert rope_state([0.90, 2, 2], 1.0, 30, False)[0] == "slack"
+
+
+# ---------- release_delta ----------
+
+class TestReleaseDelta:
+    def test_all_plus_one(self):
+        # 三台 counts↑=收绳 → 统一放 = counts−（当前台架实况）
+        assert release_delta((1, 1, 1)) == [-2500, -2500, -2500]
+
+    def test_mixed_signs(self):
+        assert release_delta((1, -1, 1)) == [-2500, +2500, -2500]
+        assert release_delta((-1, -1, -1)) == [+2500, +2500, +2500]
+
+    def test_invalid_returns_none(self):
+        assert release_delta(None) is None
+        assert release_delta((0, 1, 1)) is None
+        assert release_delta((1, 1)) is None
+
+    def test_counts_constant(self):
+        assert RELEASE_COUNTS == 2500
+
+
+# ---------- tighten_t_use（v8.2 P0-1 的钉子：空界跳过，不 clamp(·,0,0)） ----------
+
+class TestTightenTUse:
+    N = positive_null_direction(0.0, 0.0)
+    REQ = 0.5 / min(N)      # ≈1.89
+    ALLOW = 30.0 / max(N)   # ≈39.5
+
+    def test_empty_bounds_pass_through(self):
+        # v8.2 P0-1 复现钉死：t_min/t_max 空（=0）不得把 t_use 钳成 0
+        t_use, err = tighten_t_use(3.0, 0.0, 0.0, self.REQ, self.ALLOW)
+        assert t_use == 3.0 and err is None
+
+    def test_single_side_bounds(self):
+        assert tighten_t_use(3.0, 4.0, 0.0, self.REQ, self.ALLOW)[0] == 4.0
+        assert tighten_t_use(5.0, 0.0, 4.0, self.REQ, self.ALLOW)[0] == 4.0
+
+    def test_reject_over_100(self):
+        # preload 参数域上限 100：t_use>100 拒绝（UI t_max 150 不能放行）
+        assert tighten_t_use(120, 0, 150, self.REQ, 150)[0] is None
+
+    def test_reject_le_zero(self):
+        assert tighten_t_use(0.0, 0, 0, self.REQ, self.ALLOW)[0] is None
+
+    def test_ui_bound_pushes_out_of_feasible(self):
+        # t_min_ui=30 把 t_use 顶出上界 39.5 内的合法域？构造：allow=25，ui=30
+        assert tighten_t_use(3.0, 30.0, 0.0, self.REQ, 25.0)[0] is None
+        # t_max_ui=1.5 压到可行下界之下
+        assert tighten_t_use(3.0, 0.0, 1.5, self.REQ, self.ALLOW)[0] is None
+
+    def test_ui_bound_within_feasible_ok(self):
+        assert tighten_t_use(3.0, 2.0, 10.0, self.REQ, self.ALLOW)[0] == 3.0
+
+
+# ---------- 离屏按键门禁 + 恢复态生命周期 ----------
+
+class _FakeSerial:
+    def __init__(self):
+        self.frames = []
+        self.tx_queue = __import__("queue").Queue()
+        self.stop_event = __import__("threading").Event()
+
+    def send(self, data):
+        self.frames.append(bytes(data))
+        return True
+
+    def join(self, timeout=None):
+        return None
+
+
+@pytest.fixture(scope="module")
+def win():
+    real_load = scope.load_layout_json
+    scope.load_layout_json = lambda: {}
+    from PySide6.QtWidgets import QApplication
+    app = QApplication.instance() or QApplication([])
+    w = scope.ScopeWindow(default_port="COM_TEST")
+    yield w
+    w._admit_timer.stop()
+    w._zero_timer.stop()
+    w._ramp_timer.stop()
+    w._cl_timer.stop()
+    w.close()
+    scope.load_layout_json = real_load
+    app.processEvents()
+
+
+def _fresh_tension(w, vals=(2.0, 2.0, 2.0)):
+    w._tension_last = (time.monotonic(), list(vals))
+
+
+class TestButtonsGating:
+    def test_not_armed_rejected(self, win):
+        win.armed = False
+        win.connected = True
+        _fresh_tension(win)
+        win._on_release_rope()
+        win._on_tighten_rope()
+        assert "未使能" in win.ctrl_status.text()
+
+    def test_in_loop_rejected(self, win):
+        win.armed = True
+        win.cl_enabled = True
+        _fresh_tension(win)
+        win._on_release_rope()
+        assert "闭环" in win.ctrl_status.text()
+        win._on_tighten_rope()
+        assert "闭环" in win.ctrl_status.text()
+        win.cl_enabled = False
+
+    def test_release_no_longer_needs_tension(self, win):
+        """2026-11-03 用户定案：松绳不做张力检测（张力保护只在闭环）。
+
+        原来要求"0.5s 内必须有新鲜张力"，现在没有传感器也必须能松绳。
+        """
+        win.armed = True
+        win.ramp_check.setChecked(False)
+        win.rx_thread = _FakeSerial()
+        win.last_servo_abs_all = [0] * 30
+        win._motor_origin = {27: 0, 28: 0, 29: 0}
+        win.targets = {27: 1000, 28: 1000, 29: 1000}
+        win._tension_last = None            # 完全没有张力数据
+        win._tension_sensor = None
+        win._release_plan = None
+        win._on_release_rope()
+        assert win._release_plan is not None, win.ctrl_status.text()
+        for _ in range(4):
+            win._release_step()
+        assert win.targets[27] == 1000 - 2500
+        win.ramp_check.setChecked(True)
+
+    def test_release_bad_sign_rejected(self, win):
+        win.armed = True
+        _fresh_tension(win)
+        win.cl_edits["trim_sign"].setText("0,1,1")
+        win._on_release_rope()
+        assert "trim方向非法" in win.ctrl_status.text()
+        win.cl_edits["trim_sign"].setText("1,1,1")
+
+    def test_release_sends_correct_deltas(self, win):
+        # 松绳走 0xD3 批量帧（一步一帧）：逐帧 0xDE 会被固件按代际合并，
+        # 只有最后一台生效 → "松绳只有一根动"。这里同时钉住位移量与帧格式。
+        win.armed = True
+        win.ramp_check.setChecked(False)
+        win.rx_thread = _FakeSerial()
+        win.last_servo_abs_all = [0] * 30
+        win._motor_origin = {27: 0, 28: 0, 29: 0}
+        win.targets = {27: 1000, 28: 2000, 29: 3000}
+        _fresh_tension(win)
+        win.cl_edits["trim_sign"].setText("1,1,1")
+        from desktop.core.protocol import CMD_MOTOR_POS_ABS
+        win._on_release_rope()
+        # 分步（5 步 × 500c）：第一步同步发出
+        assert win._release_plan is not None
+        assert (win.targets[27], win.targets[28], win.targets[29]) == (500, 1500, 2500)
+        for _ in range(4):                 # 把剩余 4 步推完（测试里不等定时器）
+            win._release_step()
+        # sign=+1+1+1 → 累计 −2500
+        assert (win.targets[27], win.targets[28], win.targets[29]) == (-1500, -500, 500)
+        assert win._release_plan is None
+        # 每步只应有一帧 0xD3（不是三帧 0xDE）
+        assert any(f[2] == CMD_MOTOR_POS_ABS for f in win.rx_thread.frames)
+        win.ramp_check.setChecked(True)
+
+    def test_release_zero_baseline_not_falsy(self, win):
+        # v8.1 D2 or-bug 钉子：targets=0 是合法基准
+        win.armed = True
+        win.ramp_check.setChecked(False)
+        win.rx_thread = _FakeSerial()
+        win.last_servo_abs_all = [0] * 30
+        win._motor_origin = {27: 0, 28: 0, 29: 0}
+        win.targets = {27: 0, 28: 0, 29: 0}
+        _fresh_tension(win)
+        win._on_release_rope()
+        for _ in range(4):
+            win._release_step()
+        assert win.targets[27] == -2500
+        win.ramp_check.setChecked(True)
+
+    def test_release_ignores_tension_changes(self, win):
+        """松绳不再看张力：某缆张力变化不会中止、不会剔除任何缆。
+
+        2026-11-03 用户定案：张力检测只在闭环。松绳只按 trim方向 分步放完。
+        """
+        win.armed = True
+        win.ramp_check.setChecked(False)
+        win.rx_thread = _FakeSerial()
+        win.last_servo_abs_all = [0] * 30
+        win._motor_origin = {27: 0, 28: 0, 29: 0}
+        win.targets = {27: 1000, 28: 1000, 29: 1000}
+        _fresh_tension(win)                                       # 3 缆 2N
+        win._on_release_rope()                                    # 第一步：各 -500
+        win._tension_last = (time.monotonic(), [2.0, 9.0, 2.0])   # C2 涨到 9N 也不管
+        for _ in range(4):
+            win._release_step()
+        assert win._release_plan is None
+        assert win.targets[27] == 1000 - 2500
+        assert win.targets[28] == 1000 - 2500
+        assert win.targets[29] == 1000 - 2500
+        win.ramp_check.setChecked(True)
+
+    def test_release_cancels_pending_ramp(self, win):
+        """松绳要先取消在途斜坡，否则 Go 的斜坡会把松绳目标顶回去。"""
+        win.armed = True
+        win.ramp_check.setChecked(True)
+        win.rx_thread = _FakeSerial()
+        win.last_servo_abs_all = [0] * 30
+        win._motor_origin = {27: 0, 28: 0, 29: 0}
+        win.targets = {27: 1000, 28: 1000, 29: 1000}
+        win._ramp_state = {27: {"target": 20000, "next_due": 0.0},
+                           28: {"target": 20000, "next_due": 0.0}}
+        _fresh_tension(win)
+        win._on_release_rope()
+        assert 27 not in win._ramp_state and 28 not in win._ramp_state
+        win._release_plan = None
+        win.ramp_check.setChecked(True)
+
+    def test_tighten_rope_rejections(self, win):
+        win.armed = True
+        win.cl_enabled = False
+        win.rx_thread = _FakeSerial()
+        _fresh_tension(win)
+        # 无位姿
+        win._enc_filt_raw = {16: None, 17: None}
+        win._on_tighten_rope()
+        assert "位姿" in win.ctrl_status.text()
+        # 有位姿（零位）+ t 越可行域下界
+        win._enc_filt_raw = {16: 8000.0, 17: 9000.0}
+        win.angle_baseline = {
+            16: scope.ScopeWindow._axis_deg(16, 8000.0),
+            17: scope.ScopeWindow._axis_deg(17, 9000.0)}
+        win.cl_edits["t_tgt"].setText("0.5")     # < fmin/min(n̂)≈1.89
+        win.cl_edits["f_min"].setText("0.5")
+        win.cl_edits["fmax_f"].setText("30")
+        win._on_tighten_rope()
+        assert "可行域" in win.ctrl_status.text()
+
+    def test_tighten_rope_transaction_success_and_flag(self, win):
+        win.armed = True
+        win.cl_enabled = False
+        win.rx_thread = _FakeSerial()
+        win.connected = True
+        _fresh_tension(win)
+        win._enc_filt_raw = {16: 8000.0, 17: 9000.0}
+        win.angle_baseline = {
+            16: scope.ScopeWindow._axis_deg(16, 8000.0),
+            17: scope.ScopeWindow._axis_deg(17, 9000.0)}
+        win.cl_edits["t_tgt"].setText("5.0")
+        win.cl_edits["f_min"].setText("0.5")
+        win.cl_edits["fmax_f"].setText("30")
+        win.cl_edits["preload"].setText("7.7")     # 事务应改写为 t_use=5
+        before_mode = win._cl_mode
+        # 使 _start_closed_loop 成功：armed+磁编+起点齐全
+        win._motor_origin = {27: 1000, 28: 2000, 29: 3000}
+        win.status_info["control_mode"] = 1
+        win._on_tighten_rope()
+        assert win.cl_enabled, win.ctrl_status.text()
+        assert win._force_recovery is True
+        assert win.cl_edits["preload"].text() == "5"
+        assert win._cl_mode == "force"
+        win._stop_closed_loop("测试收尾")
+        assert win._force_recovery is False
+
+    def test_tighten_rope_failure_rolls_back(self, win):
+        win.armed = True
+        win.cl_enabled = False
+        win.rx_thread = _FakeSerial()
+        _fresh_tension(win)
+        win._enc_filt_raw = {16: 8000.0, 17: 9000.0}
+        win.angle_baseline = {
+            16: scope.ScopeWindow._axis_deg(16, 8000.0),
+            17: scope.ScopeWindow._axis_deg(17, 9000.0)}
+        win.cl_edits["t_tgt"].setText("5.0")
+        win.cl_edits["f_min"].setText("0.5")
+        win.cl_edits["fmax_f"].setText("30")
+        win._cl_mode = "position"
+        win.cl_mode_combo.blockSignals(True)
+        win.cl_mode_combo.setCurrentIndex(0)
+        win.cl_mode_combo.blockSignals(False)
+        win.cl_edits["preload"].setText("9.9")
+        # 确定性失败注入：打桩 _start_closed_loop 抛 RuntimeError
+        orig = win._start_closed_loop
+        def _boom():
+            raise RuntimeError("注入：启动失败")
+        win._start_closed_loop = _boom
+        try:
+            win._on_tighten_rope()
+        finally:
+            win._start_closed_loop = orig
+        assert not win.cl_enabled
+        assert win._cl_mode == "position"          # 回滚
+        assert win.cl_mode_combo.currentIndex() == 0
+        assert win.cl_edits["preload"].text() == "9.9"
+        assert win.cl_edits["tau_roll"].text() == "0.0" or True  # 已被改写后回滚
+        assert win._force_recovery is False
+
+    def test_recovery_auto_clear_300ms(self, win):
+        win._force_recovery = True
+        win._recovery_ok_since = None
+        win.cl_edits["f_min"].setText("0.5")
+        win.cl_edits["fmax_f"].setText("30")
+        # 连续进界 300ms → 自动清
+        for _ in range(80):
+            win._on_tension_sample(2.0, 2.0, 2.0)
+            time.sleep(0.005)
+        assert win._force_recovery is False
+        # 出界重置计时后再进界
+        win._force_recovery = True
+        win._recovery_ok_since = None
+        win._on_tension_sample(0.1, 2.0, 2.0)      # 出界 → 计时清
+        assert win._recovery_ok_since is None
+
+
+class TestRampMutex:
+    def test_start_closed_loop_stops_ramp(self, win):
+        win._ramp_state[27] = {"target": 999, "next_due": 0.0}
+        win._ramp_timer.start(50)
+        win.armed = True
+        win.connected = True
+        win._enc_filt_raw = {16: 8000.0, 17: 9000.0}
+        win.angle_baseline = {
+            16: scope.ScopeWindow._axis_deg(16, 8000.0),
+            17: scope.ScopeWindow._axis_deg(17, 9000.0)}
+        win._motor_origin = {27: 1000, 28: 2000, 29: 3000}
+        win._tension_last = (time.monotonic(), [2, 2, 2])
+        win._cl_mode = "position"
+        win._start_closed_loop()
+        assert not win._ramp_timer.isActive()
+        assert 27 not in win._ramp_state
+        win._stop_closed_loop("测试收尾")

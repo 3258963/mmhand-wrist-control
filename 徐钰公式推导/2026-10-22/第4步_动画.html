@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 4 步动画：v′ = v⊥cosθ + (â×v⊥)sinθ</title>
+<style>
+  :root{--bg:#070c16;--line:rgba(140,165,210,.18);--txt:#e8eefc;--dim:#93a6c8}
+  *{box-sizing:border-box}
+  body{margin:0;background:radial-gradient(1100px 700px at 20% -10%,#13203a 0%,#070c16 55%,#05080f 100%);
+       color:var(--txt);font-family:"Microsoft YaHei","Segoe UI",system-ui,sans-serif;min-height:100vh}
+  .wrap{max-width:1180px;margin:0 auto;padding:20px 18px 34px}
+  h1{margin:0 0 6px;font-size:21px;font-weight:700;letter-spacing:.2px}
+  h1 b{background:linear-gradient(100deg,#67e8f9,#c4b5fd);-webkit-background-clip:text;background-clip:text;color:transparent}
+  .sub{font-size:12px;color:var(--dim);margin-bottom:14px}
+  .grid{display:grid;grid-template-columns:minmax(0,1.25fr) minmax(0,1fr);gap:14px}
+  .card{background:rgba(12,20,36,.72);border:1px solid var(--line);border-radius:12px;overflow:hidden}
+  #cv{display:block;width:100%;height:520px}
+  .panel{padding:14px 16px}
+  .formula{font-family:Consolas,monospace;font-size:13px;line-height:1.9;color:#cfe0ff}
+  .formula .k{color:#67e8f9}
+  .formula .v{color:#fbbf24}
+  .row{display:flex;justify-content:space-between;font-family:Consolas,monospace;font-size:12.5px;
+       padding:5px 0;border-bottom:1px dashed rgba(140,165,210,.14)}
+  .row b{color:#fbbf24;font-weight:600}
+  .ctl{display:flex;gap:8px;align-items:center;margin-top:12px;flex-wrap:wrap}
+  button{font:inherit;font-size:12px;color:#dbe6fb;background:rgba(255,255,255,.05);
+         border:1px solid var(--line);border-radius:9px;padding:7px 13px;cursor:pointer}
+  button:hover{background:rgba(103,232,249,.16);border-color:rgba(103,232,249,.4)}
+  button.on{background:linear-gradient(110deg,#67e8f9,#c4b5fd);color:#0a1020;border-color:transparent}
+  input[type=range]{flex:1;min-width:140px;accent-color:#67e8f9}
+  .sum{margin-top:14px;padding:16px;border-radius:12px;border:1px solid var(--line);background:rgba(12,20,36,.6)}
+  .sum h3{margin:0 0 8px;font-size:14px}
+  .sum ol{margin:0;padding-left:20px;font-size:12.5px;line-height:1.95;color:#c8d6f0}
+  .sum code{font-family:Consolas,monospace;color:#a5f3fc}
+  @media(max-width:900px){ .grid{grid-template-columns:1fr} #cv{height:420px} }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>第 4 步：<b>v′⊥ = v⊥·cosθ + (â×v⊥)·sinθ</b></h1>
+  <div class="sub">紫色是零位方向，青色是“转 90° 的方向”，两个分量拼起来就是转过的结果。</div>
+
+  <div class="grid">
+    <div class="card"><canvas id="cv"></canvas></div>
+
+    <div class="card panel">
+      <div class="formula">
+        v′<span class="k">⊥</span> = v<span class="k">⊥</span>·<span class="v" id="fcos">cosθ</span>
+        &nbsp;+&nbsp; (â×v<span class="k">⊥</span>)·<span class="v" id="fsin">sinθ</span>
+      </div>
+      <div class="row"><span>半径 r = ‖v⊥‖</span><b>37.15 mm</b></div>
+      <div class="row"><span>θ</span><b id="rth">0.0°</b></div>
+      <div class="row"><span>cosθ</span><b id="rc">1.0000</b></div>
+      <div class="row"><span>sinθ</span><b id="rs">0.0000</b></div>
+      <div class="row"><span>沿 v⊥ 方向：r·cosθ</span><b id="ra">37.15</b></div>
+      <div class="row"><span>沿 â×v⊥ 方向：r·sinθ</span><b id="rb">0.00</b></div>
+      <div class="row"><span>v′⊥ 的 (x, z)</span><b id="rv">(−32.50, 18.00)</b></div>
+      <div class="row" style="border:0"><span>B = (x, −12, z)</span><b id="rB">(−32.50, −12, 18.00)</b></div>
+
+      <div class="ctl">
+        <button id="play" class="on">暂停</button>
+        <button id="b0">0°</button>
+        <button id="b30">30°</button>
+        <button id="b90">90°</button>
+        <input id="sl" type="range" min="0" max="360" step="1" value="0">
+      </div>
+    </div>
+  </div>
+
+  <div class="sum">
+    <h3>这张图在说什么</h3>
+    <ol>
+      <li><b>紫色箭头 v⊥</b>：零位方向，长度 r = 37.15，永远不动。</li>
+      <li><b>青色虚线 â×v⊥</b>：把 v⊥ 在平面内转 90°，长度同样是 37.15。</li>
+      <li>转过 θ 后，沿紫色方向留下 <code>r·cosθ</code>，沿青色方向长出 <code>r·sinθ</code>。</li>
+      <li>两个分量首尾相接（虚线平行四边形），终点就是 <b>v′⊥</b>。</li>
+      <li>所以 <code>v′⊥ = v⊥cosθ + (â×v⊥)sinθ</code>——本质就是圆上的坐标 <code>(r cosθ, r sinθ)</code>。</li>
+      <li>最后加上沿轴的 h = −12，就得到三维的 B。</li>
+    </ol>
+  </div>
+</div>
+
+<script>
+(function(){
+  var cv = document.getElementById('cv'), ctx = cv.getContext('2d');
+  var W = 0, H = 0, DPR = Math.min(window.devicePixelRatio || 1, 2);
+
+  /* 真实几何（C2 / roll） */
+  var R = 37.1517;
+  var vperp = {x:-32.5, z:18.0};            /* v⊥ 的 (x,z) */
+  var e1 = {x:vperp.x/R, z:vperp.z/R};      /* 单位：v⊥ 方向 */
+  var e2 = {x:18.0/R,   z:32.5/R};          /* 单位：â×v⊥ 方向（转 90°） */
+
+  var th = 0, playing = true, last = 0;
+
+  function resize(){
+    var r = cv.getBoundingClientRect();
+    W = r.width; H = r.height;
+    cv.width = Math.round(W*DPR); cv.height = Math.round(H*DPR);
+    ctx.setTransform(DPR,0,0,DPR,0,0);
+  }
+
+  function sc(){ return Math.min(W, H) * 0.36 / R; }   /* mm -> px */
+
+  function toPx(p){
+    var s = sc();
+    return { x: W*0.5 + p.x*s, y: H*0.55 - p.z*s };
+  }
+
+  function arrow(from, to, color, lw, dash){
+    var a = toPx(from), b = toPx(to);
+    var dx = b.x-a.x, dy = b.y-a.y, len = Math.hypot(dx,dy);
+    if(len < 1) return;
+    ctx.save();
+    ctx.strokeStyle = color; ctx.lineWidth = lw;
+    if(dash) ctx.setLineDash(dash);
+    ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.stroke();
+    ctx.setLineDash([]);
+    /* 箭头 */
+    var ux = dx/len, uy = dy/len;
+    var head = Math.min(12, Math.max(7, len*0.16));
+    ctx.beginPath();
+    ctx.moveTo(b.x, b.y);
+    ctx.lineTo(b.x - ux*head - uy*head*0.5, b.y - uy*head + ux*head*0.5);
+    ctx.lineTo(b.x - ux*head + uy*head*0.5, b.y - uy*head - ux*head*0.5);
+    ctx.closePath(); ctx.fillStyle = color; ctx.fill();
+    ctx.restore();
+  }
+
+  function label(pos, text, color, dx, dy, size){
+    var p = toPx(pos);
+    ctx.save();
+    ctx.font = '600 ' + (size||11.5) + 'px Consolas, "Cambria Math", monospace';
+    ctx.fillStyle = color;
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    var tw = ctx.measureText(text).width;
+    var tx = Math.max(6 + tw/2, Math.min(W - tw/2 - 6, p.x + (dx||0)));
+    var ty = Math.max(10, Math.min(H - 8, p.y + (dy||0)));
+    ctx.fillText(text, tx, ty);
+    ctx.restore();
+  }
+
+  function draw(){
+    ctx.clearRect(0,0,W,H);
+
+    /* 坐标轴（x 向右，z 向上） */
+    ctx.save();
+    ctx.strokeStyle = 'rgba(140,165,210,.16)'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(0, H*0.52); ctx.lineTo(W, H*0.52); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(W*0.5, 0); ctx.lineTo(W*0.5, H); ctx.stroke();
+    ctx.restore();
+    label({x:R*0.95, z:0}, 'x', 'rgba(160,180,215,.55)', 14, 12, 11);
+    label({x:0, z:R*0.95}, 'z', 'rgba(160,180,215,.55)', 12, -10, 11);
+
+    /* 半径圆 */
+    var o = toPx({x:0,z:0}), s = sc();
+    ctx.save();
+    ctx.strokeStyle = 'rgba(140,165,210,.32)'; ctx.setLineDash([4,4]); ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.arc(o.x, o.y, R*s, 0, Math.PI*2); ctx.stroke();
+    ctx.restore();
+
+    var c = Math.cos(th), sn = Math.sin(th);
+
+    /* 两个分量方向上的“影子” */
+    var aP = {x:e1.x*R*c, z:e1.z*R*c};      /* r cosθ 沿 e1 */
+    var bP = {x:e2.x*R*sn, z:e2.z*R*sn};    /* r sinθ 沿 e2 */
+    var vp = {x:aP.x+bP.x, z:aP.z+bP.z};    /* 合成 = v′⊥ */
+
+    /* 平行四边形辅助线 */
+    ctx.save();
+    ctx.strokeStyle = 'rgba(148,163,184,.35)'; ctx.setLineDash([4,5]); ctx.lineWidth = 1;
+    var pa = toPx(aP), pb = toPx(bP), pp = toPx(vp);
+    ctx.beginPath(); ctx.moveTo(pa.x,pa.y); ctx.lineTo(pp.x,pp.y); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(pb.x,pb.y); ctx.lineTo(pp.x,pp.y); ctx.stroke();
+    var o0 = toPx({x:0,z:0});
+    ctx.beginPath(); ctx.moveTo(o0.x,o0.y); ctx.lineTo(pb.x,pb.y); ctx.stroke();
+    ctx.restore();
+
+    /* 零位方向与 90° 方向 */
+    arrow({x:0,z:0}, {x:e1.x*R, z:e1.z*R}, 'rgba(167,139,250,.85)', 2.2);
+    arrow({x:0,z:0}, {x:e2.x*R, z:e2.z*R}, 'rgba(34,211,238,.55)', 1.8, [6,5]);
+
+    /* 两个分量（粗） */
+    arrow({x:0,z:0}, aP, '#22c55e', 4.2);
+    arrow(aP, vp, '#06b6d4', 4.2);
+
+    /* 合成结果 */
+    arrow({x:0,z:0}, vp, '#e0f7ff', 2.6);
+
+    /* θ 弧 */
+    var a1 = Math.atan2(e1.z, e1.x);
+    var a2 = Math.atan2(vp.z, vp.x);
+    if(Math.abs(th) > 0.01){
+      ctx.save();
+      ctx.strokeStyle = 'rgba(251,191,36,.9)'; ctx.lineWidth = 1.6;
+      /* 注意：屏幕 y 向下，角度取负 */
+      ctx.beginPath();
+      ctx.arc(o.x, o.y, Math.min(86, R*s*0.45), -a1, -a2, th < 0);
+      ctx.stroke();
+      ctx.restore();
+      var am = (a1 + a2) / 2;
+      label({x:Math.cos(am)*R*0.55, z:Math.sin(am)*R*0.55}, 'θ=' + (th*180/Math.PI).toFixed(0) + '°', '#fbbf24', 10, 18, 11);
+    }
+
+    /* 文案 */
+    label({x:e1.x*R*0.97, z:e1.z*R*0.97}, 'v⃗⊥', '#c4b5fd', -8, -14, 12);
+    label({x:e2.x*R*0.72, z:e2.z*R*0.72}, 'â×v⃗⊥', '#67e8f9', 14, -8, 12);
+    if(Math.abs(c) > 0.08) label({x:aP.x*0.58, z:aP.z*0.58}, 'r·cosθ', '#4ade80', -8, 16, 11.5);
+    if(Math.abs(sn) > 0.08) label({x:(aP.x+vp.x)/2 + e1.x*6, z:(aP.z+vp.z)/2 + e1.z*6}, 'r·sinθ', '#22d3ee', -16, 0, 11.5);
+    label({x:vp.x*0.96, z:vp.z*0.96}, 'v⃗′⊥', '#e0f7ff', 14, -18, 12);
+
+    /* 更新右侧数字 */
+    document.getElementById('rth').textContent = (th*180/Math.PI).toFixed(1) + '°';
+    document.getElementById('rc').textContent = c.toFixed(4);
+    document.getElementById('rs').textContent = sn.toFixed(4);
+    document.getElementById('ra').textContent = (R*c).toFixed(2);
+    document.getElementById('rb').textContent = (R*sn).toFixed(2);
+    document.getElementById('rv').textContent = '(' + vp.x.toFixed(2) + ', ' + vp.z.toFixed(2) + ')';
+    document.getElementById('rB').textContent = '(' + vp.x.toFixed(2) + ', −12, ' + vp.z.toFixed(2) + ')';
+    document.getElementById('sl').value = Math.round(th*180/Math.PI) % 360;
+  }
+
+  function loop(t){
+    if(!last) last = t;
+    var dt = Math.min(0.05, (t - last)/1000); last = t;
+    if(playing){
+      th += dt * 0.7;                 /* 约 9 秒转一圈 */
+    }
+    draw();
+    requestAnimationFrame(loop);
+  }
+
+  document.getElementById('play').addEventListener('click', function(){
+    playing = !playing;
+    this.textContent = playing ? '暂停' : '播放';
+    this.classList.toggle('on', playing);
+  });
+  document.getElementById('sl').addEventListener('input', function(e){
+    playing = false;
+    document.getElementById('play').textContent = '播放';
+    document.getElementById('play').classList.remove('on');
+    th = Number(e.target.value) * Math.PI/180;
+  });
+  function setDeg(d){
+    playing = false;
+    document.getElementById('play').textContent = '播放';
+    document.getElementById('play').classList.remove('on');
+    th = d * Math.PI/180;
+  }
+  document.getElementById('b0').addEventListener('click', function(){ setDeg(0); });
+  document.getElementById('b30').addEventListener('click', function(){ setDeg(30); });
+  document.getElementById('b90').addEventListener('click', function(){ setDeg(90); });
+
+  window.addEventListener('resize', resize);
+
+  var q = new URLSearchParams(location.search);
+  if(q.has('th')){
+    th = Number(q.get('th')) * Math.PI/180;
+    playing = false;
+    document.getElementById('play').textContent = '播放';
+    document.getElementById('play').classList.remove('on');
+  }
+
+  resize(); requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>

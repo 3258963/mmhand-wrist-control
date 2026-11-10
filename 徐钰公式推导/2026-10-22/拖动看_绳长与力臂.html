@@ -1,0 +1,455 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>拖动看：绳长变化率就是力臂</title>
+<style>
+  :root{
+    --bg:#070b14; --panel:rgba(17,24,42,.78); --line:rgba(130,160,220,.20);
+    --ink:#eaf0fb; --muted:#93a4c4;
+    --blue:#3b82f6; --violet:#a78bfa; --amber:#f59e0b; --red:#ef4444; --green:#34d399;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0;min-height:100vh;color:var(--ink);
+    font-family:"Inter","Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+    background:
+      radial-gradient(900px 600px at 15% -10%,rgba(59,130,246,.16),transparent 60%),
+      radial-gradient(800px 600px at 90% 0%,rgba(167,139,250,.14),transparent 60%),
+      linear-gradient(180deg,#070b14,#0a1120 60%,#070b14);
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:1100px;margin:0 auto;padding:26px 20px 40px}
+  header{display:flex;flex-wrap:wrap;align-items:flex-end;justify-content:space-between;gap:14px;margin-bottom:18px}
+  h1{font-size:clamp(20px,3vw,28px);margin:0;letter-spacing:-.01em}
+  h1 span{background:linear-gradient(110deg,#67e8f9,#a78bfa 55%,#fbbf24);-webkit-background-clip:text;background-clip:text;color:transparent}
+  .sub{color:var(--muted);font-size:13px;margin-top:6px}
+  .presets{display:flex;gap:8px;flex-wrap:wrap}
+  button{
+    font:inherit;font-size:12.5px;color:#cfe0ff;background:rgba(255,255,255,.05);
+    border:1px solid var(--line);border-radius:999px;padding:7px 13px;cursor:pointer;transition:.18s;
+  }
+  button:hover{background:rgba(255,255,255,.10);color:#fff}
+  button.on{background:linear-gradient(110deg,#67e8f9,#c4b5fd);color:#0a1020;border-color:transparent;font-weight:600}
+
+  .grid{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(0,1fr);gap:16px;align-items:start}
+  .card{border:1px solid var(--line);border-radius:18px;background:var(--panel);backdrop-filter:blur(10px);overflow:hidden}
+  .stage{position:relative}
+  #c{display:block;width:100%;height:500px;touch-action:none;cursor:grab}
+  #c.drag{cursor:grabbing}
+  .hint{position:absolute;left:14px;bottom:12px;font-size:11.5px;color:#7f90b0}
+  .tag{position:absolute;right:12px;top:12px;font-size:11px;letter-spacing:.12em;color:#8fa2c6;border:1px solid var(--line);border-radius:999px;padding:5px 10px;background:rgba(6,10,20,.55)}
+
+  .panel{padding:16px 16px 14px}
+  .row{display:grid;grid-template-columns:66px 1fr 74px;gap:10px;align-items:center;margin:11px 0}
+  .row label{font-size:12px;color:var(--muted)}
+  .row output{font-family:Consolas,monospace;font-size:12.5px;text-align:right}
+  input[type=range]{-webkit-appearance:none;appearance:none;height:3px;border-radius:3px;background:linear-gradient(90deg,rgba(103,232,249,.85),rgba(167,139,250,.85));outline:none}
+  input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:15px;height:15px;border-radius:50%;background:#fff;box-shadow:0 0 0 4px rgba(103,232,249,.18),0 0 12px rgba(103,232,249,.6);cursor:pointer}
+  .divider{height:1px;background:var(--line);margin:14px 0}
+  .stats{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+  .stat{border:1px solid var(--line);border-radius:12px;padding:10px 12px;background:rgba(255,255,255,.02)}
+  .stat b{display:block;font-family:Consolas,monospace;font-size:19px;letter-spacing:-.02em}
+  .stat span{font-size:11px;color:var(--muted)}
+  .stat.s b{color:#fcd34d}
+  .stat.r b{color:#fca5a5}
+  .check{margin-top:12px;border:1px solid rgba(52,211,153,.35);background:rgba(52,211,153,.08);border-radius:12px;padding:10px 12px;font-size:12px;line-height:1.7;color:#bef3dd}
+  .check b{font-family:Consolas,monospace;color:#6ee7b7}
+  .eq{font-family:Consolas,monospace;font-size:12.5px;color:#cbd9f2}
+
+  .chartbox{margin-top:14px;border-top:1px solid var(--line);padding-top:10px}
+  #chart{display:block;width:100%;height:150px}
+  .cap{font-size:11px;color:#7f90b0;margin-top:4px}
+
+  .why{margin-top:18px;display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
+  .why div{border:1px solid var(--line);border-radius:14px;padding:12px;background:rgba(255,255,255,.02);font-size:12.5px;line-height:1.65;color:#b9c7e0}
+  .why b{display:block;color:#eaf0fb;font-size:13px;margin-bottom:5px}
+  .why i{font-style:normal;color:#67e8f9;font-family:Consolas,monospace;margin-right:6px}
+  footer{margin-top:18px;font-size:11.5px;color:#6f7f9e;line-height:1.7}
+
+  @media (max-width:900px){
+    .grid{grid-template-columns:1fr}
+    .why{grid-template-columns:1fr 1fr}
+    #c{height:360px}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div>
+      <h1>拖动看：<span>绳长变化率就是力臂</span></h1>
+      <div class="sub">转一点点，绳会收进多少？这个“每弧度收多少”就是力臂——和从轴到绳的垂距是同一个数。</div>
+    </div>
+    <div class="presets">
+      <button id="p1" class="on">教学示例 30 / 20 / 60°</button>
+      <button id="p2">接近 C2 真实数据</button>
+    </div>
+  </header>
+
+  <div class="grid">
+    <div class="card stage">
+      <canvas id="c"></canvas>
+      <div class="tag">拖动紫色端点</div>
+      <div class="hint">也可以拖上面的“转角”滑块</div>
+    </div>
+
+    <div class="card panel">
+      <div class="row"><label>固定端 a</label><input id="sa" type="range" min="10" max="50" step="0.5" value="30"><output id="oa">30.0 mm</output></div>
+      <div class="row"><label>动端 b</label><input id="sb" type="range" min="10" max="50" step="0.5" value="20"><output id="ob">20.0 mm</output></div>
+      <div class="row"><label>夹角 Δ</label><input id="sd" type="range" min="5" max="175" step="1" value="60"><output id="od">60°</output></div>
+      <div class="row"><label>转角 θ</label><input id="st" type="range" min="-170" max="170" step="0.5" value="0"><output id="ot">0.0°</output></div>
+      <div class="row"><label>张力 f</label><input id="sf" type="range" min="1" max="30" step="0.5" value="10"><output id="of">10.0 N</output></div>
+
+      <div class="divider"></div>
+
+      <div class="stats">
+        <div class="stat"><b id="vs">26.46</b><span>绳长 s（mm）</span></div>
+        <div class="stat r"><b id="vr">−19.64</b><span>力臂 r（mm）= −ds/dθ</span></div>
+        <div class="stat"><b id="vd">0.343</b><span>每转 1° 绳长变化（mm）</span></div>
+        <div class="stat s"><b id="vt">−196</b><span>力矩 τ = f·r（mN·m）</span></div>
+      </div>
+
+      <div class="check">
+        数值差分实测 ds/dθ = <b id="vn">−19.64</b> mm/rad<br>
+        从图上量到的垂距 r = <b id="vp">19.64</b> mm<br>
+        两者之差 = <b id="ve">0</b> —— 这就是“绳长变化率 = 力臂”。
+      </div>
+
+      <div class="chartbox">
+        <canvas id="chart"></canvas>
+        <div class="cap">橙线 = 绳长 s(θ)，红线 = 力臂 r(θ)（右侧刻度）。红线穿过 0 的位置，就是绳线正好穿过轴心的“死点”。</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="why">
+    <div><b><i>①</i>转一点</b>关节转 dθ，绳上的点走一段 ρ·dθ，方向垂直于半径。</div>
+    <div><b><i>②</i>只算沿绳的</b>垂直于绳的那部分只是把绳“抬起来”，不改变长度。</div>
+    <div><b><i>③</i>结果是 r·dθ</b>沿绳分量 = ρ·dθ·sinβ = 垂距×dθ，所以 ds/dθ = 垂距。</div>
+    <div><b><i>④</i>力臂就出来了</b>力矩 = 力×垂距，所以 τ = f·(ds/dθ)，R 的每一格就是这么来的。</div>
+  </div>
+
+  <footer>
+    单位为 mm；r 为负表示“正转时绳在变长，张力往回拽”。教学示例取 a=30、b=20、Δ=60°；第二组取 C2 的轴投影（a=27.46、b=37.15、Δ=18.5°，略去 4 mm 沿轴偏置，所以零位力臂是 −22.9 而不是 −22.05）。
+  </footer>
+</div>
+
+<script>
+(function(){
+  'use strict';
+  var RAD = Math.PI/180, DEG = 180/Math.PI;
+
+  var S = {a:30, b:20, d:60, th:0, f:10};
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var chart = document.getElementById('chart');
+  var cctx = chart.getContext('2d');
+  var W=0, H=0, dpr=1, CW=0, CH=0;
+
+  function ropeLen(th){ var c = Math.cos((S.d + th)*RAD); return Math.sqrt(Math.max(S.a*S.a + S.b*S.b - 2*S.a*S.b*c, 1e-9)); }
+  function arm(th){ return -(S.a*S.b*Math.sin((S.d + th)*RAD)) / ropeLen(th); }
+
+  function resize(){
+    dpr = Math.min(window.devicePixelRatio || 1, 2);
+    var r = canvas.getBoundingClientRect();
+    W = r.width; H = r.height;
+    canvas.width = Math.round(W*dpr); canvas.height = Math.round(H*dpr);
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+
+    var rc = chart.getBoundingClientRect();
+    CW = rc.width; CH = rc.height;
+    chart.width = Math.round(CW*dpr); chart.height = Math.round(CH*dpr);
+    cctx.setTransform(dpr,0,0,dpr,0,0);
+    draw(); drawChart();
+  }
+
+  /* 世界坐标 → 画布 */
+  function view(){
+    var spanX = S.a + S.b;
+    var spanY = 2*S.b;
+    var sc = Math.min(W*0.84/spanX, H*0.84/spanY);
+    return {sc:sc, cx:W/2, cy:H/2, ox:(S.a - S.b)/2, oy:0};
+  }
+  function px(v, vw){ var V = view(); return [V.cx + (v[0]-V.ox)*V.sc, V.cy - (v[1]-V.oy)*V.sc]; }
+
+  function draw(){
+    var V = view();
+    ctx.clearRect(0,0,W,H);
+
+    var O = [0,0];
+    var A = [S.a, 0];
+    var B = [S.b*Math.cos((S.d+S.th)*RAD), S.b*Math.sin((S.d+S.th)*RAD)];
+
+    /* 背景网格 */
+    ctx.save();
+    ctx.strokeStyle = 'rgba(120,150,210,.07)';
+    ctx.lineWidth = 1;
+    for(var g=-60; g<=60; g+=10){
+      var p1 = px([g,-60]), p2 = px([g,60]);
+      ctx.beginPath(); ctx.moveTo(p1[0],p1[1]); ctx.lineTo(p2[0],p2[1]); ctx.stroke();
+      var p3 = px([-60,g]), p4 = px([60,g]);
+      ctx.beginPath(); ctx.moveTo(p3[0],p3[1]); ctx.lineTo(p4[0],p4[1]); ctx.stroke();
+    }
+    ctx.restore();
+
+    /* b 圆 */
+    ctx.save();
+    ctx.setLineDash([4,5]);
+    ctx.strokeStyle = 'rgba(167,139,250,.28)';
+    var c0 = px(O);
+    ctx.beginPath(); ctx.arc(c0[0], c0[1], S.b*V.sc, 0, Math.PI*2); ctx.stroke();
+    ctx.restore();
+
+    /* 两条半径 */
+    var pO = px(O), pA = px(A), pB = px(B);
+    ctx.save();
+    ctx.lineCap = 'round';
+    ctx.strokeStyle = 'rgba(59,130,246,.95)'; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.moveTo(pO[0],pO[1]); ctx.lineTo(pA[0],pA[1]); ctx.stroke();
+    ctx.strokeStyle = 'rgba(167,139,250,.95)'; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.moveTo(pO[0],pO[1]); ctx.lineTo(pB[0],pB[1]); ctx.stroke();
+    ctx.restore();
+
+    /* 绳 */
+    ctx.save();
+    ctx.lineCap = 'round';
+    ctx.shadowColor = 'rgba(245,158,11,.8)'; ctx.shadowBlur = 14;
+    ctx.strokeStyle = '#f59e0b'; ctx.lineWidth = 6;
+    ctx.beginPath(); ctx.moveTo(pA[0],pA[1]); ctx.lineTo(pB[0],pB[1]); ctx.stroke();
+    ctx.restore();
+
+    /* 垂距 */
+    var ax = A[0], ay = A[1], bx = B[0], by = B[1];
+    var dx = bx-ax, dy = by-ay;
+    var L2 = dx*dx + dy*dy;
+    var t = -(ax*dx + ay*dy)/L2;
+    var F = [ax + t*dx, ay + t*dy];
+    var pF = px(F);
+    ctx.save();
+    ctx.setLineDash([6,5]);
+    ctx.strokeStyle = 'rgba(239,68,68,.95)'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(pO[0],pO[1]); ctx.lineTo(pF[0],pF[1]); ctx.stroke();
+    ctx.restore();
+
+    /* 直角标记 */
+    var ux = (pF[0]-pO[0]), uy = (pF[1]-pO[1]);
+    var ul = Math.hypot(ux,uy) || 1; ux/=ul; uy/=ul;
+    var vx = (pB[0]-pA[0]), vy = (pB[1]-pA[1]);
+    var vl = Math.hypot(vx,vy) || 1; vx/=vl; vy/=vl;
+    if(vl > 1){
+      ctx.save();
+      ctx.strokeStyle = 'rgba(239,68,68,.8)'; ctx.lineWidth = 1.2;
+      ctx.beginPath();
+      ctx.moveTo(pF[0]+ux*9, pF[1]+uy*9);
+      ctx.lineTo(pF[0]+ux*9+vx*9, pF[1]+uy*9+vy*9);
+      ctx.lineTo(pF[0]+vx*9, pF[1]+vy*9);
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    /* 角度弧 */
+    var ang = (S.d + S.th)*RAD;
+    ctx.save();
+    ctx.strokeStyle = 'rgba(160,180,220,.55)'; ctx.lineWidth = 1.4;
+    ctx.beginPath(); ctx.arc(pO[0], pO[1], Math.min(70, S.b*V.sc*0.45), 0, -ang, ang < 0); ctx.stroke();
+    ctx.restore();
+
+    /* 点 */
+    function dot(p, r, fill, stroke){
+      ctx.save();
+      ctx.beginPath(); ctx.arc(p[0],p[1],r,0,Math.PI*2);
+      ctx.fillStyle = fill; ctx.fill();
+      if(stroke){ ctx.strokeStyle = stroke; ctx.lineWidth = 2; ctx.stroke(); }
+      ctx.restore();
+    }
+    dot(pO, 7, '#fff', '#0b1220');
+    dot(pA, 6, '#60a5fa');
+    dot(pB, 11, 'rgba(167,139,250,.28)');
+    dot(pB, 6, '#a78bfa');
+
+    /* 标注 */
+    ctx.save();
+    ctx.font = '600 12px Consolas, monospace';
+    ctx.fillStyle = '#93a4c4';
+    ctx.fillText('轴心 O', pO[0]-52, pO[1]+20);
+    ctx.fillStyle = '#60a5fa'; ctx.fillText('固定端', pA[0]+9, pA[1]+4);
+    ctx.fillStyle = '#c4b5fd'; ctx.fillText('动端', pB[0]+12, pB[1]-6);
+    ctx.fillStyle = '#fbbf24';
+    ctx.font = '600 13px Consolas, monospace';
+    ctx.fillText('绳', (pA[0]+pB[0])/2 + 8, (pA[1]+pB[1])/2 - 10);
+    ctx.fillStyle = '#f87171';
+    ctx.fillText('r = ' + Math.abs(arm(S.th)).toFixed(2), (pO[0]+pF[0])/2 - 62, (pO[1]+pF[1])/2 + 4);
+    ctx.restore();
+  }
+
+  function drawChart(){
+    var pad = {l:38, r:34, t:10, b:22};
+    var x0 = pad.l, x1 = CW-pad.r, y0 = pad.t, y1 = CH-pad.b;
+    cctx.clearRect(0,0,CW,CH);
+
+    var smin=1e9, smax=-1e9, rmin=1e9, rmax=-1e9, i, t, sv, rv;
+    for(i=0;i<=180;i++){
+      t = -180 + i*2;
+      sv = ropeLen(t); rv = arm(t);
+      if(sv<smin)smin=sv; if(sv>smax)smax=sv;
+      if(rv<rmin)rmin=rv; if(rv>rmax)rmax=rv;
+    }
+    smin*=0.95; smax*=1.05;
+    if(rmin>0) rmin = 0; if(rmax<0) rmax = 0;
+    var padR = (Math.max(Math.abs(rmin),Math.abs(rmax)))*1.15;
+    rmin = -padR; rmax = padR;
+
+    var X = function(t){ return x0 + (t+180)/360*(x1-x0); };
+    var Ys = function(v){ return y1 - (v-smin)/(smax-smin)*(y1-y0); };
+    var Yr = function(v){ return y1 - (v-rmin)/(rmax-rmin)*(y1-y0); };
+
+    cctx.save();
+    cctx.strokeStyle = 'rgba(130,160,220,.18)'; cctx.lineWidth = 1;
+    cctx.beginPath(); cctx.moveTo(x0, y1); cctx.lineTo(x1, y1); cctx.stroke();
+    cctx.beginPath(); cctx.moveTo(x0, y0); cctx.lineTo(x0, y1); cctx.stroke();
+    cctx.fillStyle = '#7f90b0'; cctx.font = '10px Consolas, monospace';
+    cctx.fillText('-180°', x0-6, y1+15);
+    cctx.fillText('0', X(0)-3, y1+15);
+    cctx.fillText('180°', x1-22, y1+15);
+
+    /* 零线 */
+    cctx.strokeStyle = 'rgba(239,68,68,.35)'; cctx.setLineDash([3,4]);
+    cctx.beginPath(); cctx.moveTo(x0, Yr(0)); cctx.lineTo(x1, Yr(0)); cctx.stroke();
+    cctx.setLineDash([]);
+
+    /* 曲线 */
+    cctx.lineWidth = 2.2; cctx.strokeStyle = '#f59e0b';
+    cctx.beginPath();
+    for(i=0;i<=180;i++){
+      t=-180+i*2; sv=ropeLen(t);
+      if(i) cctx.lineTo(X(t), Ys(sv)); else cctx.moveTo(X(t), Ys(sv));
+    }
+    cctx.stroke();
+
+    cctx.lineWidth = 1.9; cctx.strokeStyle = '#ef4444';
+    cctx.beginPath();
+    for(i=0;i<=180;i++){
+      t=-180+i*2; rv=arm(t);
+      if(i) cctx.lineTo(X(t), Yr(rv)); else cctx.moveTo(X(t), Yr(rv));
+    }
+    cctx.stroke();
+
+    /* 当前点 */
+    var cur = S.th*DEG;
+    var cx = X(cur), sy = Ys(ropeLen(S.th)), ry = Yr(arm(S.th));
+    cctx.strokeStyle = 'rgba(255,255,255,.25)'; cctx.setLineDash([3,4]);
+    cctx.beginPath(); cctx.moveTo(cx, y0); cctx.lineTo(cx, y1); cctx.stroke();
+    cctx.setLineDash([]);
+    cctx.fillStyle = '#f59e0b'; cctx.beginPath(); cctx.arc(cx, sy, 3.5, 0, Math.PI*2); cctx.fill();
+    cctx.fillStyle = '#ef4444'; cctx.beginPath(); cctx.arc(cx, ry, 3.5, 0, Math.PI*2); cctx.fill();
+    cctx.restore();
+
+    /* 两侧刻度 */
+    cctx.save();
+    cctx.fillStyle = 'rgba(245,158,11,.85)'; cctx.font = '10px Consolas, monospace';
+    cctx.textAlign = 'right';
+    cctx.fillText(smax.toFixed(0), x0-4, y0+8);
+    cctx.fillText(smin.toFixed(0), x0-4, y1);
+    cctx.fillStyle = 'rgba(239,68,68,.85)'; cctx.textAlign = 'left';
+    cctx.fillText(padR.toFixed(0), x1+4, y0+8);
+    cctx.fillText((-padR).toFixed(0), x1+4, y1);
+    cctx.restore();
+  }
+
+  function update(){
+    var th = S.th;
+    var s = ropeLen(th);
+    var r = arm(th);
+    var delta = 1e-4;
+    var numeric = -(ropeLen(th+delta) - ropeLen(th-delta)) / (2*delta*RAD);
+    var perDeg = Math.abs(r)*RAD;
+
+    document.getElementById('vs').textContent = s.toFixed(2);
+    document.getElementById('vr').textContent = (r<0?'−':'') + Math.abs(r).toFixed(2);
+    document.getElementById('vd').textContent = perDeg.toFixed(3);
+    document.getElementById('vt').textContent = (S.f*r).toFixed(0);
+    document.getElementById('vn').textContent = (numeric<0?'−':'') + Math.abs(numeric).toFixed(2);
+    document.getElementById('vp').textContent = Math.abs(r).toFixed(2);
+    document.getElementById('ve').textContent = Math.abs(numeric - r).toExponential(1);
+    document.getElementById('ot').textContent = th.toFixed(1) + '°';
+    document.getElementById('oa').textContent = S.a.toFixed(1) + ' mm';
+    document.getElementById('ob').textContent = S.b.toFixed(1) + ' mm';
+    document.getElementById('od').textContent = S.d.toFixed(0) + '°';
+    document.getElementById('of').textContent = S.f.toFixed(1) + ' N';
+  }
+
+  function redraw(){ draw(); drawChart(); update(); }
+
+  /* ---------- 交互 ---------- */
+  function bindSlider(id, key, fx){
+    var el = document.getElementById(id);
+    el.addEventListener('input', function(){
+      S[key] = fx ? fx(parseFloat(el.value)) : parseFloat(el.value);
+      redraw();
+    });
+  }
+  bindSlider('sa','a');
+  bindSlider('sb','b');
+  bindSlider('sd','d');
+  bindSlider('st','th');
+  bindSlider('sf','f');
+
+  var dragging = false;
+  function angleFromEvent(e){
+    var rect = canvas.getBoundingClientRect();
+    var mx = e.clientX - rect.left, my = e.clientY - rect.top;
+    var V = view();
+    var wx = (mx - V.cx)/V.sc + V.ox;
+    var wy = (V.cy - my)/V.sc + V.oy;
+    var deg = Math.atan2(wy, wx)*DEG - S.d;
+    return deg;
+  }
+  canvas.addEventListener('pointerdown', function(e){
+    dragging = true; canvas.classList.add('drag');
+    if(canvas.setPointerCapture) canvas.setPointerCapture(e.pointerId);
+    setAngle(angleFromEvent(e));
+  });
+  canvas.addEventListener('pointermove', function(e){
+    if(!dragging) return;
+    setAngle(angleFromEvent(e));
+  });
+  window.addEventListener('pointerup', function(){ dragging = false; canvas.classList.remove('drag'); });
+
+  function setAngle(deg){
+    while(deg > 180) deg -= 360;
+    while(deg < -180) deg += 360;
+    if(deg < -170) deg = -170;
+    if(deg > 170) deg = 170;
+    S.th = deg;
+    document.getElementById('st').value = deg;
+    redraw();
+  }
+
+  /* 预设 */
+  document.getElementById('p1').addEventListener('click', function(){
+    S.a=30; S.b=20; S.d=60; S.th=0;
+    syncSliders(); this.classList.add('on'); document.getElementById('p2').classList.remove('on'); redraw();
+  });
+  document.getElementById('p2').addEventListener('click', function(){
+    S.a=27.46; S.b=37.15; S.d=18.5; S.th=0;
+    syncSliders(); this.classList.add('on'); document.getElementById('p1').classList.remove('on'); redraw();
+  });
+  function syncSliders(){
+    document.getElementById('sa').value = S.a;
+    document.getElementById('sb').value = S.b;
+    document.getElementById('sd').value = S.d;
+    document.getElementById('st').value = S.th;
+  }
+
+  window.addEventListener('resize', resize);
+
+  resize();
+  update();
+  drawChart();
+})();
+</script>
+</body>
+</html>

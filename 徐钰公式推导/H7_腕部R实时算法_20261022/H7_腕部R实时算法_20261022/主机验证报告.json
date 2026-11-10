@@ -1,0 +1,121 @@
+{
+  "scope": "Host-compiled C single precision vs independent double geometry. No H7 timing or hardware accuracy tested.",
+  "compiler": [
+    "C:\\Users\\ASUS\\Documents\\机械臂\\tmp\\wrist-cpp-tools\\ziglang\\zig.exe",
+    "cc"
+  ],
+  "compile_commands": [
+    [
+      "C:\\Users\\ASUS\\Documents\\机械臂\\tmp\\wrist-cpp-tools\\ziglang\\zig.exe",
+      "cc",
+      "-std=c99",
+      "-O2",
+      "-UNDEBUG",
+      "-Wall",
+      "-Wextra",
+      "-Werror",
+      "-fno-fast-math",
+      "-ffp-contract=off",
+      "-I",
+      "C:\\Users\\ASUS\\Documents\\机械臂\\outputs\\H7_腕部R实时算法_20261022\\src",
+      "C:\\Users\\ASUS\\Documents\\机械臂\\outputs\\H7_腕部R实时算法_20261022\\src\\wrist_r.c",
+      "C:\\Users\\ASUS\\Documents\\机械臂\\outputs\\H7_腕部R实时算法_20261022\\src\\wrist_default_model.c",
+      "C:\\Users\\ASUS\\Documents\\机械臂\\outputs\\H7_腕部R实时算法_20261022\\examples\\h7_integration.c",
+      "C:\\Users\\ASUS\\Documents\\机械臂\\outputs\\H7_腕部R实时算法_20261022\\tests\\host_driver.c",
+      "-lm",
+      "-o",
+      "C:\\Users\\ASUS\\Documents\\机械臂\\outputs\\H7_腕部R实时算法_20261022\\.build\\host_driver.exe"
+    ],
+    [
+      "C:\\Users\\ASUS\\Documents\\机械臂\\tmp\\wrist-cpp-tools\\ziglang\\zig.exe",
+      "cc",
+      "-std=c99",
+      "-O2",
+      "-UNDEBUG",
+      "-Wall",
+      "-Wextra",
+      "-Werror",
+      "-fno-fast-math",
+      "-ffp-contract=off",
+      "-I",
+      "C:\\Users\\ASUS\\Documents\\机械臂\\outputs\\H7_腕部R实时算法_20261022\\src",
+      "C:\\Users\\ASUS\\Documents\\机械臂\\outputs\\H7_腕部R实时算法_20261022\\src\\wrist_r.c",
+      "C:\\Users\\ASUS\\Documents\\机械臂\\outputs\\H7_腕部R实时算法_20261022\\src\\wrist_default_model.c",
+      "C:\\Users\\ASUS\\Documents\\机械臂\\outputs\\H7_腕部R实时算法_20261022\\examples\\h7_integration.c",
+      "C:\\Users\\ASUS\\Documents\\机械臂\\outputs\\H7_腕部R实时算法_20261022\\tests\\selftest.c",
+      "-lm",
+      "-o",
+      "C:\\Users\\ASUS\\Documents\\机械臂\\outputs\\H7_腕部R实时算法_20261022\\.build\\selftest.exe"
+    ]
+  ],
+  "compile_flags": [
+    "-std=c99",
+    "-O2",
+    "-UNDEBUG",
+    "-Wall",
+    "-Wextra",
+    "-Werror",
+    "-fno-fast-math",
+    "-ffp-contract=off",
+    "-I",
+    "C:\\Users\\ASUS\\Documents\\机械臂\\outputs\\H7_腕部R实时算法_20261022\\src"
+  ],
+  "geometry_sha256": "952e9c40702d5e140a9f2cd77b88f1416bbfe2941dac7699dba0e74b6d87a59f",
+  "grid_cases": 3621,
+  "random_cases": 5000,
+  "near_boundary_cases": 603,
+  "additional_extrema_cases": 25,
+  "total_cases": 9249,
+  "selftest": "selftest: PASS",
+  "passed": true,
+  "max_abs_float_vs_double_mm_by_element": [
+    [
+      1.213993077939235e-06,
+      8.392857429873057e-06,
+      6.743989250726501e-06
+    ],
+    [
+      4.6731775022595956e-05,
+      3.5214640525414384e-06,
+      3.1347359989893075e-06
+    ]
+  ],
+  "rmse_float_vs_double_mm_by_element": [
+    [
+      2.559230896420519e-07,
+      2.179595017485553e-06,
+      2.035830572277643e-06
+    ],
+    [
+      6.174755358356754e-06,
+      8.157534438038132e-07,
+      7.28705613407238e-07
+    ]
+  ],
+  "max_segment_length_error_mm": 1.1026709517691913e-05,
+  "max_including_input_float_rounding_mm": 4.9042371198793067e-05,
+  "worst_case": {
+    "case": 7208,
+    "roll_deg": -18.146233311553146,
+    "pitch_deg": -24.597991579847786,
+    "axis": 1,
+    "cable": 1,
+    "error_mm": 4.6731775022595956e-05
+  },
+  "cad_comparison_skipped": false,
+  "preload_grid_flag_matches": 3621,
+  "grid_without_positive_preload": 1664,
+  "max_C_float_vs_CAD_finite_difference_mm": 0.03266274006928291,
+  "default_geometry_gate_pass_count": 0,
+  "software_acceptance_limits": {
+    "R_max_abs_mm": 0.001,
+    "length_max_abs_mm": 0.0001
+  },
+  "not_validated": [
+    "Actual STM32H7 project build/link",
+    "DWT execution cycles and worst-case ISR latency",
+    "Engineering segment guards",
+    "Mechanical zero offsets and actual geometry",
+    "Real contact/friction/elasticity and bounded tension/torque capacity"
+  ]
+}

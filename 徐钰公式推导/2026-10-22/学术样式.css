@@ -1,0 +1,57 @@
+/* 学术样式：中文正文宋体 + 西文 Times，标题黑体；公式与表格统一 */
+:root{
+  --ink:#1a1a1a; --muted:#5b6472; --line:#d6dae2; --accent:#1f3a8a;
+}
+html{font-size:16px}
+body{
+  font-family:"Source Han Serif SC","Songti SC","SimSun",Georgia,"Times New Roman",serif;
+  color:var(--ink); line-height:1.92; background:#fff;
+  max-width:840px; margin:0 auto; padding:56px 44px 80px;
+  text-rendering:optimizeLegibility;
+}
+h1,h2,h3,h4{font-family:"Source Han Sans SC","Microsoft YaHei","PingFang SC",sans-serif;font-weight:700;color:#111}
+h1{font-size:1.9rem;text-align:center;letter-spacing:.02em;margin:.2em 0 .3em;line-height:1.35}
+h2{font-size:1.16rem;font-weight:600;margin:2.0em 0 .65em;padding-bottom:.25em;border-bottom:1px solid var(--line)}
+h3{font-size:1.02rem;margin:1.5em 0 .5em;color:#1f2937}
+p{margin:.62em 0;text-align:justify;text-indent:2em}
+p[align="center"],li p,blockquote p,td p{text-indent:0}
+p[align="center"]{text-align:center}
+p[align="center"] em{font-size:.88em;color:#5b6472}
+strong{font-weight:700}
+em{font-style:normal;color:var(--muted)}
+blockquote{
+  margin:1.1em 0;padding:.55em 1em;background:#f7f9fc;border-left:3px solid #b9c6e6;
+  color:#333;font-size:.95em;
+}
+blockquote p{text-indent:0;margin:.2em 0}
+hr{border:0;border-top:1px solid var(--line);margin:2.2em 0}
+img{display:block;max-width:92%;margin:14px auto 6px;border-radius:2px}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+code{font-family:"JetBrains Mono",Consolas,"Courier New",monospace;font-size:.88em;
+     background:#f2f4f8;padding:.1em .35em;border-radius:3px}
+table{
+  width:100%;border-collapse:collapse;margin:1em 0;font-size:.88rem;line-height:1.55;
+  font-family:"Source Han Serif SC","SimSun",Georgia,serif;
+}
+th,td{border-bottom:1px solid #e6e9ef;padding:.3em .55em;text-align:center;vertical-align:middle}
+thead th{border-top:1.6px solid #333;border-bottom:1.2px solid #333;background:#f5f7fa;font-weight:700}
+tbody tr:last-child td{border-bottom:1.6px solid #333}
+ul,ol{margin:.6em 0 .6em 1.4em;padding:0}
+li{margin:.25em 0;text-align:justify}
+mjx-container{font-size:1.02em !important}
+/* 打印 */
+@media print{
+  @page{size:A4;margin:18mm 16mm}
+  body{max-width:none;padding:0;font-size:10.5pt;line-height:1.75}
+  h1{font-size:17pt}
+  h2{font-size:12pt;page-break-after:avoid}
+  h3{font-size:10.5pt;page-break-after:avoid}
+  table{page-break-inside:auto}
+  tr{page-break-inside:avoid}
+  thead{display:table-header-group}
+  figure,img{page-break-inside:avoid}
+  img{max-width:13cm;max-height:9.5cm}
+  p[align="center"]{margin:.2em 0 1.1em}
+  a{color:#000;text-decoration:none}
+}

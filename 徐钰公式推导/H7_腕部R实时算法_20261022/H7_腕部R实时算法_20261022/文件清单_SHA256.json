@@ -1,0 +1,21 @@
+{
+  "data/derived_constants.json": "e3b7db24a105c2768ef91176f6d90b0311052982d3caa4fdeeb674b19806bffd",
+  "data/geometry_source.json": "952e9c40702d5e140a9f2cd77b88f1416bbfe2941dac7699dba0e74b6d87a59f",
+  "data/R_grid_corrected.csv": "32e7111d503728a95ed460259a30bd8fc4c9610dd9039dd6c847736cf63bec09",
+  "data/reference_manifest.json": "127f115094c23e41abd4bf19cd089f42df584e111556ca76d25c37e4a0730842",
+  "docs/公式推导与标定误差_最终版.pdf": "ea9f83b0791374a2168cae3b0ca931ab02d0b436881023d01b244e0a4c0e4fcf",
+  "DSH_审查清单.md": "41e5efb5432fe199a702a2577699e003111c4142b7a06f769d0dd2697d0d1bb9",
+  "examples/h7_integration.c": "863f927926d048ad9c0c248254cc22e0d5072b52c929cdb52497e731ef72d991",
+  "README_先读.md": "7434f4a8d15ece1ad358e72a0aa8d9986216e034d91b8f551b413228aa88180a",
+  "src/wrist_default_model.c": "576f3712894c410c3e1a2417c85b6c2668e8e8e9265da45418385f060b6380ed",
+  "src/wrist_r.c": "c233de11849f755d2d04e22317e418b24a9603a0a2dbafd881103b4a8eaf32f5",
+  "src/wrist_r.h": "85ede6547ea700e424d56e811740332d7b2ba9dfbb7fded492a27913c5df4d31",
+  "tests/host_driver.c": "b18e7c89ea065bea047b6337f918046ebee7c1287d026e3bc93407282345eb92",
+  "tests/selftest.c": "f2caa027fbde3dbede3923d2ed61275ed64f7bef6e5360fd4ffe63d66820d7a3",
+  "tools/generate_model.py": "28644cd0718099270bfb1351417aaeb54d229e82ede560f213a9139d034dbdc6",
+  "tools/verify_host.py": "43cc9207ec399f841522e76132047c9233870b6bc399ddc130d6ab4df71024de",
+  "主机验证报告.json": "ba702c60d698fd9c224ec118e3a335462d859fde13aad7317c9a040102dadd49",
+  "算法说明.md": "78e88ee47959a44b790581cab641b3df8bd536c14e5a5b9140ac9a536daaecfe",
+  "给DSH_检查命令.txt": "7ac652170ab736f78a10ff5b1b44c7680f4020d84660da4fdf211937d25730d3",
+  "验证摘要.md": "45a956fa49561451837f66ba101ac6618b5332030570e1e2bad1151bac3eeaf8"
+}

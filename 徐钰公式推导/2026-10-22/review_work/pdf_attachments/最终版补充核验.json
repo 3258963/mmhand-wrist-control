@@ -1,0 +1,703 @@
+{
+  "minima": [
+    {
+      "cable": "C1",
+      "axis": "roll",
+      "segment": "P04-P05",
+      "min_length_mm": 13.48576296559163,
+      "min_D_mm2": 181.86580276412272,
+      "at_angle_deg": -2.1965695654137565
+    },
+    {
+      "cable": "C1",
+      "axis": "pitch",
+      "segment": "P06-P07",
+      "min_length_mm": 3.9006094894185552,
+      "min_D_mm2": 15.214754388942083,
+      "at_angle_deg": -25.0
+    },
+    {
+      "cable": "C2",
+      "axis": "roll",
+      "segment": "P04-P05",
+      "min_length_mm": 10.485588750145313,
+      "min_D_mm2": 109.94757143717396,
+      "at_angle_deg": -18.48823068559331
+    },
+    {
+      "cable": "C2",
+      "axis": "pitch",
+      "segment": "P06-P07",
+      "min_length_mm": 11.890136334589288,
+      "min_D_mm2": 141.3753420551204,
+      "at_angle_deg": 33.83049808615725
+    },
+    {
+      "cable": "C3",
+      "axis": "roll",
+      "segment": "P04-P05",
+      "min_length_mm": 14.692202140503005,
+      "min_D_mm2": 215.86080373740108,
+      "at_angle_deg": 15.149528811978858
+    },
+    {
+      "cable": "C3",
+      "axis": "pitch",
+      "segment": "P06-P07",
+      "min_length_mm": 13.445385335342676,
+      "min_D_mm2": 180.77838681584788,
+      "at_angle_deg": 33.830498093552166
+    }
+  ],
+  "point_sensitivities": [
+    {
+      "cable": "C1",
+      "point": "P04",
+      "axis": "roll",
+      "zero_gradient_F0_mm_per_mm": [
+        1.3313978110468527,
+        -0.004276438363981505,
+        -0.20384356209213195
+      ],
+      "zero_worst_direction_mm_per_mm": 1.3469189348256414,
+      "grid_max_norm_mm_per_mm": 1.3475480284134553,
+      "grid_max_at_deg": -2,
+      "finite_plus1mm_each_F0_axis_delta_R_mm": [
+        1.343218145321519,
+        -0.0036388489695465265,
+        -0.21941486984835268
+      ],
+      "finite_plus1mm_axis_max_abs_delta_R_mm": 1.343218145321519
+    },
+    {
+      "cable": "C1",
+      "point": "P05",
+      "axis": "roll",
+      "zero_gradient_F0_mm_per_mm": [
+        -0.3677736994092684,
+        0.004276438367312174,
+        0.05559369875118847
+      ],
+      "zero_worst_direction_mm_per_mm": 0.37197639877165084,
+      "grid_max_norm_mm_per_mm": 0.3726054858291904,
+      "grid_max_at_deg": -2,
+      "finite_plus1mm_each_F0_axis_delta_R_mm": [
+        -0.36214429967671385,
+        0.004849722222642572,
+        0.051922921671376965
+      ],
+      "finite_plus1mm_axis_max_abs_delta_R_mm": 0.36214429967671385
+    },
+    {
+      "cable": "C1",
+      "point": "P06",
+      "axis": "pitch",
+      "zero_gradient_F0_mm_per_mm": [
+        0.014293250139019165,
+        -0.8050393432768033,
+        -0.15195750425078813
+      ],
+      "zero_worst_direction_mm_per_mm": 0.8193800853823648,
+      "grid_max_norm_mm_per_mm": 15.745866995703619,
+      "grid_max_at_deg": -25,
+      "finite_plus1mm_each_F0_axis_delta_R_mm": [
+        0.054244753369289356,
+        -0.7609231035035791,
+        -0.1562186488867212
+      ],
+      "finite_plus1mm_axis_max_abs_delta_R_mm": 0.7609231035035791
+    },
+    {
+      "cable": "C1",
+      "point": "P07",
+      "axis": "pitch",
+      "zero_gradient_F0_mm_per_mm": [
+        -0.014293250139019165,
+        -0.17756520112044427,
+        -0.033634491813927525
+      ],
+      "zero_worst_direction_mm_per_mm": 0.18128700087999014,
+      "grid_max_norm_mm_per_mm": 14.74694221233301,
+      "grid_max_at_deg": -25,
+      "finite_plus1mm_each_F0_axis_delta_R_mm": [
+        0.02571722586426972,
+        -0.1395291645593275,
+        -0.03116520802326761
+      ],
+      "finite_plus1mm_axis_max_abs_delta_R_mm": 0.1395291645593275
+    },
+    {
+      "cable": "C2",
+      "point": "P04",
+      "axis": "roll",
+      "zero_gradient_F0_mm_per_mm": [
+        1.7902837123173754,
+        -0.40975054151459744,
+        0.8835048143041035
+      ],
+      "zero_worst_direction_mm_per_mm": 2.038036318066711,
+      "grid_max_norm_mm_per_mm": 3.5410473045661868,
+      "grid_max_at_deg": -18,
+      "finite_plus1mm_each_F0_axis_delta_R_mm": [
+        1.7841102387747547,
+        -0.3675203299258243,
+        0.9522174951224827
+      ],
+      "finite_plus1mm_axis_max_abs_delta_R_mm": 1.7841102387747547
+    },
+    {
+      "cable": "C2",
+      "point": "P05",
+      "axis": "roll",
+      "zero_gradient_F0_mm_per_mm": [
+        -0.9042060829855814,
+        0.40975054162117885,
+        -0.5086258170017288
+      ],
+      "zero_worst_direction_mm_per_mm": 1.115430127165146,
+      "grid_max_norm_mm_per_mm": 2.6166685441865667,
+      "grid_max_at_deg": -18,
+      "finite_plus1mm_each_F0_axis_delta_R_mm": [
+        -0.8797570864397777,
+        0.4469997901525673,
+        -0.4696634327054703
+      ],
+      "finite_plus1mm_axis_max_abs_delta_R_mm": 0.8797570864397777
+    },
+    {
+      "cable": "C2",
+      "point": "P06",
+      "axis": "pitch",
+      "zero_gradient_F0_mm_per_mm": [
+        0.013060145054311079,
+        -1.3971401885992663,
+        -0.043892111030174874
+      ],
+      "zero_worst_direction_mm_per_mm": 1.397890479042875,
+      "grid_max_norm_mm_per_mm": 2.1280458268380715,
+      "grid_max_at_deg": 34,
+      "finite_plus1mm_each_F0_axis_delta_R_mm": [
+        -0.00995394445940967,
+        -1.4145695819795847,
+        -0.04684786087911341
+      ],
+      "finite_plus1mm_axis_max_abs_delta_R_mm": 1.4145695819795847
+    },
+    {
+      "cable": "C2",
+      "point": "P07",
+      "axis": "pitch",
+      "zero_gradient_F0_mm_per_mm": [
+        -0.013060145054311079,
+        0.39778491929709503,
+        0.012662259072371285
+      ],
+      "zero_worst_direction_mm_per_mm": 0.3982006306045382,
+      "grid_max_norm_mm_per_mm": 1.128330293261603,
+      "grid_max_at_deg": 34,
+      "finite_plus1mm_each_F0_axis_delta_R_mm": [
+        -0.03592220415160163,
+        0.3747582257734887,
+        0.011892000514585277
+      ],
+      "finite_plus1mm_axis_max_abs_delta_R_mm": 0.3747582257734887
+    },
+    {
+      "cable": "C3",
+      "point": "P04",
+      "axis": "roll",
+      "zero_gradient_F0_mm_per_mm": [
+        1.6653579707615052,
+        0.23535285302855868,
+        -1.4175130850446749
+      ],
+      "zero_worst_direction_mm_per_mm": 2.1995798422608877,
+      "grid_max_norm_mm_per_mm": 2.8310956507010134,
+      "grid_max_at_deg": 15,
+      "finite_plus1mm_each_F0_axis_delta_R_mm": [
+        1.7050162535052742,
+        0.2096694469224154,
+        -1.4953768771306155
+      ],
+      "finite_plus1mm_axis_max_abs_delta_R_mm": 1.7050162535052742
+    },
+    {
+      "cable": "C3",
+      "point": "P05",
+      "axis": "roll",
+      "zero_gradient_F0_mm_per_mm": [
+        -0.9087892202153114,
+        -0.23535285311737653,
+        0.8064383249717366
+      ],
+      "zero_worst_direction_mm_per_mm": 1.2375910407857935,
+      "grid_max_norm_mm_per_mm": 1.8688700224685635,
+      "grid_max_at_deg": 15,
+      "finite_plus1mm_each_F0_axis_delta_R_mm": [
+        -0.8938765428816708,
+        -0.2588685211558932,
+        0.7603857571535855
+      ],
+      "finite_plus1mm_axis_max_abs_delta_R_mm": 0.8938765428816708
+    },
+    {
+      "cable": "C3",
+      "point": "P06",
+      "axis": "pitch",
+      "zero_gradient_F0_mm_per_mm": [
+        0.23351712261643343,
+        -1.2978816433673046,
+        -0.13226662392895605
+      ],
+      "zero_worst_direction_mm_per_mm": 1.3253382460905736,
+      "grid_max_norm_mm_per_mm": 1.8818979933029572,
+      "grid_max_at_deg": 34,
+      "finite_plus1mm_each_F0_axis_delta_R_mm": [
+        0.22145357792859777,
+        -1.3119716808658932,
+        -0.1425856571152977
+      ],
+      "finite_plus1mm_axis_max_abs_delta_R_mm": 1.3119716808658932
+    },
+    {
+      "cable": "C3",
+      "point": "P07",
+      "axis": "pitch",
+      "zero_gradient_F0_mm_per_mm": [
+        -0.23351712261643343,
+        0.3674815490395389,
+        0.10319162140781657
+      ],
+      "zero_worst_direction_mm_per_mm": 0.44746111134749084,
+      "grid_max_norm_mm_per_mm": 0.997821137837605,
+      "grid_max_at_deg": 34,
+      "finite_plus1mm_each_F0_axis_delta_R_mm": [
+        -0.243743437892741,
+        0.3489000350258902,
+        0.09562906539008331
+      ],
+      "finite_plus1mm_axis_max_abs_delta_R_mm": 0.3489000350258902
+    }
+  ],
+  "axis_origin_sensitivities": [
+    {
+      "cable": "C1",
+      "axis": "roll",
+      "origin_gradient_F0_mm_per_mm": [
+        -0.9636241116622868,
+        0.0,
+        0.14824986333067391
+      ]
+    },
+    {
+      "cable": "C1",
+      "axis": "pitch",
+      "origin_gradient_F0_mm_per_mm": [
+        0.0,
+        0.982604544788046,
+        0.1855919958160257
+      ]
+    },
+    {
+      "cable": "C2",
+      "axis": "roll",
+      "origin_gradient_F0_mm_per_mm": [
+        -0.8860776294383754,
+        5.3290705182007514e-11,
+        -0.3748789972668476
+      ]
+    },
+    {
+      "cable": "C2",
+      "axis": "pitch",
+      "origin_gradient_F0_mm_per_mm": [
+        0.0,
+        0.9993552693199348,
+        0.031229851860103963
+      ]
+    },
+    {
+      "cable": "C3",
+      "axis": "roll",
+      "origin_gradient_F0_mm_per_mm": [
+        -0.7565687505639573,
+        0.0,
+        0.6110747600729383
+      ]
+    },
+    {
+      "cable": "C3",
+      "axis": "pitch",
+      "origin_gradient_F0_mm_per_mm": [
+        0.0,
+        0.9304000943011204,
+        0.029075002450085208
+      ]
+    }
+  ],
+  "offset_sensitivities": [
+    {
+      "cable": "C1",
+      "dR_pitch_d_offset_mm_per_mm": 0.151957504215261,
+      "convention": "shift pitch origin and palm B together in F0 +Z; keep roll P06 fixed, palm local coordinates unchanged"
+    },
+    {
+      "cable": "C2",
+      "dR_pitch_d_offset_mm_per_mm": 0.04389211099464774,
+      "convention": "shift pitch origin and palm B together in F0 +Z; keep roll P06 fixed, palm local coordinates unchanged"
+    },
+    {
+      "cable": "C3",
+      "dR_pitch_d_offset_mm_per_mm": 0.13226662384902,
+      "convention": "shift pitch origin and palm B together in F0 +Z; keep roll P06 fixed, palm local coordinates unchanged"
+    }
+  ],
+  "near_C1_pitch_minus25_P06_gradient_F0": [
+    0.1120736823079227,
+    -4.1612675526359055,
+    15.185638586885375
+  ],
+  "near_C1_pitch_minus25_P06_plus1mm_F0Z_delta_R_mm": 16.064268379021783,
+  "frame_correct_max_residual_mm": 0.0,
+  "frame_wrong_transpose_max_error_mm": 183.84776310848318,
+  "boundary_length_rebuild_max_mm": 2.7755575615628914e-14,
+  "boundary_stencil_replay_max_mm": 0.0,
+  "stencil_groups": [
+    [
+      "B1",
+      -25.0,
+      -25.0,
+      "roll",
+      0,
+      [
+        -25.0,
+        -25.0
+      ]
+    ],
+    [
+      "B1",
+      -25.0,
+      -25.0,
+      "roll",
+      1,
+      [
+        -24.8,
+        -25.0
+      ]
+    ],
+    [
+      "B1",
+      -25.0,
+      -25.0,
+      "roll",
+      2,
+      [
+        -24.6,
+        -25.0
+      ]
+    ],
+    [
+      "B1",
+      -25.0,
+      -25.0,
+      "pitch",
+      0,
+      [
+        -25.0,
+        -25.0
+      ]
+    ],
+    [
+      "B1",
+      -25.0,
+      -25.0,
+      "pitch",
+      1,
+      [
+        -25.0,
+        -24.8
+      ]
+    ],
+    [
+      "B1",
+      -25.0,
+      -25.0,
+      "pitch",
+      2,
+      [
+        -25.0,
+        -24.6
+      ]
+    ],
+    [
+      "B2",
+      25.0,
+      -25.0,
+      "roll",
+      0,
+      [
+        24.6,
+        -25.0
+      ]
+    ],
+    [
+      "B2",
+      25.0,
+      -25.0,
+      "roll",
+      1,
+      [
+        24.8,
+        -25.0
+      ]
+    ],
+    [
+      "B2",
+      25.0,
+      -25.0,
+      "roll",
+      2,
+      [
+        25.0,
+        -25.0
+      ]
+    ],
+    [
+      "B2",
+      25.0,
+      -25.0,
+      "pitch",
+      0,
+      [
+        25.0,
+        -25.0
+      ]
+    ],
+    [
+      "B2",
+      25.0,
+      -25.0,
+      "pitch",
+      1,
+      [
+        25.0,
+        -24.8
+      ]
+    ],
+    [
+      "B2",
+      25.0,
+      -25.0,
+      "pitch",
+      2,
+      [
+        25.0,
+        -24.6
+      ]
+    ],
+    [
+      "B3",
+      -25.0,
+      45.0,
+      "roll",
+      0,
+      [
+        -25.0,
+        45.0
+      ]
+    ],
+    [
+      "B3",
+      -25.0,
+      45.0,
+      "roll",
+      1,
+      [
+        -24.8,
+        45.0
+      ]
+    ],
+    [
+      "B3",
+      -25.0,
+      45.0,
+      "roll",
+      2,
+      [
+        -24.6,
+        45.0
+      ]
+    ],
+    [
+      "B3",
+      -25.0,
+      45.0,
+      "pitch",
+      0,
+      [
+        -25.0,
+        44.6
+      ]
+    ],
+    [
+      "B3",
+      -25.0,
+      45.0,
+      "pitch",
+      1,
+      [
+        -25.0,
+        44.8
+      ]
+    ],
+    [
+      "B3",
+      -25.0,
+      45.0,
+      "pitch",
+      2,
+      [
+        -25.0,
+        45.0
+      ]
+    ],
+    [
+      "B4",
+      25.0,
+      45.0,
+      "roll",
+      0,
+      [
+        24.6,
+        45.0
+      ]
+    ],
+    [
+      "B4",
+      25.0,
+      45.0,
+      "roll",
+      1,
+      [
+        24.8,
+        45.0
+      ]
+    ],
+    [
+      "B4",
+      25.0,
+      45.0,
+      "roll",
+      2,
+      [
+        25.0,
+        45.0
+      ]
+    ],
+    [
+      "B4",
+      25.0,
+      45.0,
+      "pitch",
+      0,
+      [
+        25.0,
+        44.6
+      ]
+    ],
+    [
+      "B4",
+      25.0,
+      45.0,
+      "pitch",
+      1,
+      [
+        25.0,
+        44.8
+      ]
+    ],
+    [
+      "B4",
+      25.0,
+      45.0,
+      "pitch",
+      2,
+      [
+        25.0,
+        45.0
+      ]
+    ],
+    [
+      "B5",
+      4.0,
+      -25.0,
+      "roll",
+      0,
+      [
+        3.8,
+        -25.0
+      ]
+    ],
+    [
+      "B5",
+      4.0,
+      -25.0,
+      "roll",
+      1,
+      [
+        4.0,
+        -25.0
+      ]
+    ],
+    [
+      "B5",
+      4.0,
+      -25.0,
+      "roll",
+      2,
+      [
+        4.2,
+        -25.0
+      ]
+    ],
+    [
+      "B5",
+      4.0,
+      -25.0,
+      "pitch",
+      0,
+      [
+        4.0,
+        -25.0
+      ]
+    ],
+    [
+      "B5",
+      4.0,
+      -25.0,
+      "pitch",
+      1,
+      [
+        4.0,
+        -24.8
+      ]
+    ],
+    [
+      "B5",
+      4.0,
+      -25.0,
+      "pitch",
+      2,
+      [
+        4.0,
+        -24.6
+      ]
+    ]
+  ],
+  "unique_capture_count": 25,
+  "sources_sha256": {
+    "outputs\\wrist_cad_corrected_20261021\\geometry_checks\\model_parameters.json": "fb0eff43c747a08da56b7a702aa5c2cde0fbd9f2244f99938affce33d6bf0cd2",
+    "wrist_cad_extraction\\__pycache__\\wrist_workspace_20261021_104344_604568\\raw_poses.jsonl": "5574ea5efdce474881bbf08100e4c4e5f4d80ffd510074ba001b1855e2a90ed6",
+    "wrist_cad_extraction\\processed\\wrist_workspace_20261021_C23_P03P04_corrected\\raw_poses.jsonl": "1d180ff8988ec1f5312fb8cc0e3cee98db9454f18cceed10c67cbe0ab0d7f9d7"
+  }
+}

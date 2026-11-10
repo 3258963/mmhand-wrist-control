@@ -1,0 +1,3 @@
+- insert:
+    - id: ai-pair
+      name: '@local/ai-pair'

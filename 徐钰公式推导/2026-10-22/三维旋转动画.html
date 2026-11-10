@@ -1,0 +1,451 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>三维旋转矩阵动画：绕 Z / X / Y 轴</title>
+<style>
+  :root{
+    --blue:#1f6fd0; --orange:#e07b1a; --purple:#7d3c98;
+    --ink:#222; --muted:#666; --line:#e6e6e6;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; padding:22px 26px 34px;
+    font-family:"Microsoft YaHei","PingFang SC","Hiragino Sans GB",sans-serif;
+    color:var(--ink); background:#fff;
+  }
+  h1{font-size:20px; margin:0 0 6px}
+  .sub{color:var(--muted); font-size:13px; margin:0 0 16px; line-height:1.7}
+  .bar{
+    display:flex; align-items:center; gap:14px; flex-wrap:wrap;
+    padding:12px 14px; border:1px solid var(--line); border-radius:10px;
+    background:#fafafa; margin-bottom:16px;
+  }
+  button{
+    font:inherit; font-size:13px; padding:6px 14px; border-radius:8px;
+    border:1px solid #d0d0d0; background:#fff; cursor:pointer;
+  }
+  button:hover{background:#f2f2f2}
+  button.on{background:var(--purple); color:#fff; border-color:var(--purple)}
+  input[type=range]{width:min(420px,46vw)}
+  .theta{font-family:Consolas,monospace; font-size:15px; min-width:64px; display:inline-block}
+  .hint{color:var(--muted); font-size:12.5px}
+  .grid{display:grid; grid-template-columns:repeat(3,1fr); gap:16px}
+  @media (max-width:920px){ .grid{grid-template-columns:1fr} }
+  figure{margin:0; border:1px solid var(--line); border-radius:12px; padding:8px 8px 4px}
+  canvas{width:100%; height:auto; display:block; cursor:grab; touch-action:none}
+  canvas:active{cursor:grabbing}
+  figcaption{font-size:13px; color:var(--ink); text-align:center; margin:2px 0 6px}
+  pre{
+    font-family:Consolas,"Courier New",monospace; font-size:12.5px; line-height:1.55;
+    margin:0 0 6px; padding:6px 8px; background:#fbfbfb; border-radius:8px;
+    color:#333; overflow-x:auto;
+  }
+  .c{color:#1e8449}      /* cos */
+  .s{color:var(--orange)}/* sin */
+  .z{color:#bbb}         /* 0 */
+  .o{color:#999}         /* 1 */
+  .foot{color:var(--muted); font-size:12.5px; line-height:1.8; margin-top:16px}
+  .k{color:var(--purple); font-family:Consolas,monospace}
+</style>
+</head>
+<body>
+
+<h1>三维旋转矩阵动画：绕 Z / X / Y 轴转一圈</h1>
+<p class="sub">
+  三张图的旋转轴都摆成竖直（相当于相机跟着转了一下），所以同一个 v 在三张图里朝向不同。<br>
+  <b>拖动画面</b>换视角 · <b>Shift + 拖动</b> 平移 · <b>Ctrl + 滚轮</b> 缩放（双击画面复位） · 拖 <b>θ 滑块</b> 定格 · 按 <span class="k">空格</span> 播放/暂停。
+</p>
+
+<div class="bar">
+  <button id="play">▶ 播放</button>
+  <input id="theta" type="range" min="0" max="360" step="0.5" value="55">
+  <span class="theta" id="thetaOut">55.0°</span>
+  <button id="reset">重置视角</button>
+  <label class="hint"><input type="checkbox" id="sectorChk" checked> 显示扫过的扇形</label>
+  <span class="hint" id="camOut"></span>
+</div>
+
+<div class="grid">
+  <figure>
+    <canvas id="c0" width="380" height="300"></canvas>
+    <figcaption>① 绕 Z 轴：xy 平面里转，z 分量不动</figcaption>
+    <pre id="m0"></pre>
+  </figure>
+  <figure>
+    <canvas id="c1" width="380" height="300"></canvas>
+    <figcaption>② 绕 X 轴：yz 平面里转，x 分量不动</figcaption>
+    <pre id="m1"></pre>
+  </figure>
+  <figure>
+    <canvas id="c2" width="380" height="300"></canvas>
+    <figcaption>③ 绕 Y 轴：zx 平面里转，y 分量不动</figcaption>
+    <pre id="m2"></pre>
+  </figure>
+</div>
+
+<p class="foot">
+  <span style="color:var(--blue)">■</span> 旋转前的 v &nbsp;
+  <span style="color:var(--orange)">■</span> 旋转后的 v′ &nbsp;
+  <span style="color:var(--purple)">■</span> 旋转轴 + 沿轴分量（这一段<b>一动不动</b>）<br>
+  虚线圆弧 = 顶点轨迹（圆面垂直于轴）；灰色虚线 = v、v′ 到轴上的垂足，两段等长 ⇒ 垂直分量长度不变，只转了角度。
+</p>
+
+<script>
+(function () {
+  "use strict";
+
+  // ---------- 常数 ----------
+  var D2R = Math.PI / 180;
+  var BLUE = "#1f6fd0", ORANGE = "#e07b1a", PURPLE = "#7d3c98",
+      GREY = "#b8b8b8", DARK = "#333", LIGHT = "#d2d2d2";
+
+  // 三张图共用的初始向量（作图坐标：第 3 个分量沿轴）
+  var V0 = norm([0.60, 0.34, 0.72]);
+  var PIVOT_Z = 0.42;          // 画面上下居中用的平移
+  var AXIS_LEN = 1.16;
+
+  var PANELS = [
+    { id: "c0", pre: "m0", up: "z", right: "x", back: "y",
+      title: "① 绕 Z 轴", mat: function (c, s) { return [[c,-s,0],[s,c,0],[0,0,1]]; } },
+    { id: "c1", pre: "m1", up: "x", right: "y", back: "z",
+      title: "② 绕 X 轴", mat: function (c, s) { return [[1,0,0],[0,c,-s],[0,s,c]]; } },
+    { id: "c2", pre: "m2", up: "y", right: "z", back: "x",
+      title: "③ 绕 Y 轴", mat: function (c, s) { return [[c,0,s],[0,1,0],[-s,0,c]]; } }
+  ];
+
+  // ---------- 小工具 ----------
+  function norm(v) {
+    var n = Math.hypot(v[0], v[1], v[2]);
+    return [v[0] / n, v[1] / n, v[2] / n];
+  }
+  function cross(a, b) {
+    return [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]];
+  }
+  function sub(a, b) { return [a[0]-b[0], a[1]-b[1], a[2]-b[2]]; }
+  function add(a, b) { return [a[0]+b[0], a[1]+b[1], a[2]+b[2]]; }
+  function mul(a, k) { return [a[0]*k, a[1]*k, a[2]*k]; }
+  function dot(a, b) { return a[0]*b[0] + a[1]*b[1] + a[2]*b[2]; }
+  function len(a) { return Math.hypot(a[0], a[1], a[2]); }
+
+  // ---------- 相机 ----------
+  var cam = { a: -58 * D2R, e: 18 * D2R, zoom: 1, px: 0, py: 0 };   // 方位角、仰角、缩放、平移(px)
+
+  // 作图坐标 → 屏幕坐标
+  function makeProjector(canvas) {
+    var w = canvas.clientWidth, h = canvas.clientHeight;
+    var scale = Math.min(w, h) * 0.40 * cam.zoom;
+    var cx = w / 2 + cam.px, cy = h * 0.52 + cam.py;
+    var ca = Math.cos(cam.a), sa = Math.sin(cam.a);
+    var ce = Math.cos(cam.e), se = Math.sin(cam.e);
+    return function (p) {
+      var x = p[0], y = p[1], z = p[2] - PIVOT_Z;
+      var sx = -sa * x + ca * y;
+      var sy = -se * (ca * x + sa * y) + ce * z;
+      return { X: cx + scale * sx, Y: cy - scale * sy };
+    };
+  }
+
+  // ---------- 画面元件 ----------
+  function line(ctx, P, a, b, color, width, dash) {
+    var A = P(a), B = P(b);
+    ctx.save();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = width;
+    ctx.lineCap = "round";
+    ctx.setLineDash(dash || []);
+    ctx.beginPath(); ctx.moveTo(A.X, A.Y); ctx.lineTo(B.X, B.Y); ctx.stroke();
+    ctx.restore();
+  }
+
+  function arrow(ctx, P, a, b, color, width, head) {
+    var A = P(a), B = P(b);
+    ctx.save();
+    ctx.strokeStyle = color; ctx.fillStyle = color;
+    ctx.lineWidth = width; ctx.lineCap = "round";
+    ctx.beginPath(); ctx.moveTo(A.X, A.Y); ctx.lineTo(B.X, B.Y); ctx.stroke();
+    var ang = Math.atan2(B.Y - A.Y, B.X - A.X), L = head || 11;
+    ctx.beginPath();
+    ctx.moveTo(B.X, B.Y);
+    ctx.lineTo(B.X - L * Math.cos(ang - 0.42), B.Y - L * Math.sin(ang - 0.42));
+    ctx.lineTo(B.X - L * Math.cos(ang + 0.42), B.Y - L * Math.sin(ang + 0.42));
+    ctx.closePath(); ctx.fill();
+    ctx.restore();
+  }
+
+  function label(ctx, P, p, text, color, size, dx, dy, align) {
+    var Q = P(p);
+    ctx.save();
+    ctx.fillStyle = color;
+    ctx.font = (size || 13) + "px 'Microsoft YaHei',sans-serif";
+    ctx.textAlign = align || "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(text, Q.X + (dx || 0), Q.Y + (dy || 0));
+    ctx.restore();
+  }
+
+  function poly(ctx, P, pts, fill, alpha) {
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = fill;
+    ctx.beginPath();
+    pts.forEach(function (p, i) {
+      var Q = P(p);
+      if (i === 0) ctx.moveTo(Q.X, Q.Y); else ctx.lineTo(Q.X, Q.Y);
+    });
+    ctx.closePath(); ctx.fill();
+    ctx.restore();
+  }
+
+  function polyline(ctx, P, pts, color, width, dash) {
+    ctx.save();
+    ctx.strokeStyle = color; ctx.lineWidth = width;
+    ctx.setLineDash(dash || []);
+    ctx.beginPath();
+    pts.forEach(function (p, i) {
+      var Q = P(p);
+      if (i === 0) ctx.moveTo(Q.X, Q.Y); else ctx.lineTo(Q.X, Q.Y);
+    });
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  // ---------- 主绘制 ----------
+  function drawPanel(canvas, panel, thDeg, showSector) {
+    var ctx = canvas.getContext("2d");
+    var dpr = window.devicePixelRatio || 1;
+    var cw = canvas.clientWidth, ch = canvas.clientHeight;
+    if (canvas.width !== Math.round(cw * dpr) || canvas.height !== Math.round(ch * dpr)) {
+      canvas.width = Math.round(cw * dpr);
+      canvas.height = Math.round(ch * dpr);
+    }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, cw, ch);
+
+    var P = makeProjector(canvas);
+    var th = thDeg * D2R;
+    var c = Math.cos(th), s = Math.sin(th);
+
+    // 作图坐标里的量
+    var axis = [0, 0, 1];
+    var par = mul(axis, dot(V0, axis));        // 沿轴分量
+    var rad0 = sub(V0, par);
+    var r = len(rad0);
+    var e1 = mul(rad0, 1 / r);
+    var e2 = cross(axis, e1);
+    // v′ = R_z(θ) · V0
+    var v1 = [
+      c * V0[0] - s * V0[1],
+      s * V0[0] + c * V0[1],
+      V0[2]
+    ];
+
+    // 1) 扫过的扇形
+    if (showSector && thDeg > 0.5) {
+      var pts = [par];
+      for (var i = 0; i <= 48; i++) {
+        var t = th * i / 48;
+        pts.push(add(par, add(mul(e1, r * Math.cos(t)), mul(e2, r * Math.sin(t)))));
+      }
+      poly(ctx, P, pts, ORANGE, 0.10);
+    }
+
+    // 2) 顶点轨迹圆
+    var circ = [];
+    for (var k = 0; k <= 96; k++) {
+      var t2 = 2 * Math.PI * k / 96;
+      circ.push(add(par, add(mul(e1, r * Math.cos(t2)), mul(e2, r * Math.sin(t2)))));
+    }
+    polyline(ctx, P, circ, LIGHT, 1, [4, 4]);
+
+    // 3) 三根坐标轴
+    arrow(ctx, P, [0, 0, 0], [1.02, 0, 0], GREY, 1.2, 8);
+    label(ctx, P, [1.16, 0, 0], panel.right, DARK, 13);
+    arrow(ctx, P, [0, 0, 0], [0, 1.02, 0], GREY, 1.2, 8);
+    label(ctx, P, [0, 1.16, 0], panel.back, DARK, 13);
+
+    // 4) 旋转轴（细）+ 沿轴分量（粗）
+    line(ctx, P, [0, 0, 0], [0, 0, AXIS_LEN], PURPLE, 1.6);
+    arrow(ctx, P, [0, 0, 1.02], [0, 0, AXIS_LEN], PURPLE, 1.6, 8);
+    ctx.save();
+    ctx.globalAlpha = 0.33;
+    line(ctx, P, [0, 0, 0], par, PURPLE, 7);
+    ctx.restore();
+
+    // 5) 垂足虚线
+    line(ctx, P, par, V0, "#b5b5b5", 1, [2, 3]);
+    line(ctx, P, par, v1, "#b5b5b5", 1, [2, 3]);
+
+    // 6) 转角弧
+    if (thDeg > 0.5) {
+      var arc = [];
+      for (var j = 0; j <= 40; j++) {
+        var ta = th * j / 40;
+        arc.push(add(par, add(mul(e1, r * Math.cos(ta)), mul(e2, r * Math.sin(ta)))));
+      }
+      polyline(ctx, P, arc, ORANGE, 2.4);
+      var A1 = P(arc[Math.max(0, arc.length - 4)]), A2 = P(arc[arc.length - 1]);
+      var ang = Math.atan2(A2.Y - A1.Y, A2.X - A1.X);
+      ctx.save();
+      ctx.fillStyle = ORANGE;
+      ctx.beginPath();
+      ctx.moveTo(A2.X, A2.Y);
+      ctx.lineTo(A2.X - 10 * Math.cos(ang - 0.45), A2.Y - 10 * Math.sin(ang - 0.45));
+      ctx.lineTo(A2.X - 10 * Math.cos(ang + 0.45), A2.Y - 10 * Math.sin(ang + 0.45));
+      ctx.closePath(); ctx.fill();
+      ctx.restore();
+    }
+
+    // 7) 两个向量
+    arrow(ctx, P, [0, 0, 0], V0, BLUE, 3.2, 12);
+    arrow(ctx, P, [0, 0, 0], v1, ORANGE, 3.2, 12);
+
+    // 8) 文字
+    var tip = add(V0, mul(mul(rad0, 1 / r), 0.16));
+    label(ctx, P, add(tip, [0, 0, 0.05]), "v", BLUE, 14);
+    var rad1 = mul(sub(v1, par), 1 / len(sub(v1, par)));
+    label(ctx, P, add(add(v1, mul(rad1, 0.16)), [0, 0, 0.05]), "v′", ORANGE, 14);
+
+    if (thDeg > 10) {
+      var bis = add(sub(V0, par), sub(v1, par));
+      bis = mul(bis, 1 / len(bis));
+      label(ctx, P, add(par, mul(bis, r * 0.5)), "θ", ORANGE, 13);
+    }
+
+    // 9) 矩阵
+    var m = panel.mat(c, s);
+    var pre = document.getElementById(panel.pre);
+    var rows = m.map(function (row) {
+      return row.map(function (x) {
+        var v = Math.abs(x) < 1e-9 ? 0 : x;
+        var str = (v >= 0 ? " " : "") + v.toFixed(2);
+        var cls = Math.abs(v) < 1e-9 ? "z" : (Math.abs(Math.abs(v) - 1) < 1e-9 ? "o" : "s");
+        return '<span class="' + cls + '">' + str + "</span>";
+      }).join(" ");
+    });
+    pre.innerHTML = rows.map(function (r, i) {
+      return (i === 0 ? "R" + panel.up + "(θ) = [ " : "        [ ") + r + " ]";
+    }).join("\n");
+  }
+
+  // ---------- 状态与循环 ----------
+  var state = { theta: 55, playing: false, sector: true, last: 0 };
+  var speed = 42;  // 度/秒
+
+  var canvases = PANELS.map(function (p) { return document.getElementById(p.id); });
+
+  function render() {
+    for (var i = 0; i < PANELS.length; i++) {
+      drawPanel(canvases[i], PANELS[i], state.theta, state.sector);
+    }
+    document.getElementById("thetaOut").textContent = state.theta.toFixed(1) + "°";
+    document.getElementById("theta").value = state.theta;
+    document.getElementById("camOut").textContent =
+      "视角 " + Math.round(-cam.a / D2R) + "° / " + Math.round(cam.e / D2R) + "°" +
+      "  ·  缩放 " + Math.round(cam.zoom * 100) + "%";
+  }
+
+  function tick(now) {
+    if (!state.playing) return;
+    if (!state.last) state.last = now;
+    var dt = Math.min((now - state.last) / 1000, 0.05);
+    state.last = now;
+    state.theta = (state.theta + speed * dt) % 360;
+    render();
+    requestAnimationFrame(tick);
+  }
+
+  function setPlaying(on) {
+    state.playing = on;
+    state.last = 0;
+    var btn = document.getElementById("play");
+    btn.textContent = on ? "❚❚ 暂停" : "▶ 播放";
+    btn.classList.toggle("on", on);
+    if (on) requestAnimationFrame(tick);
+  }
+
+  // ---------- 交互 ----------
+  document.getElementById("play").addEventListener("click", function () {
+    setPlaying(!state.playing);
+  });
+
+  document.getElementById("theta").addEventListener("input", function (e) {
+    if (state.playing) setPlaying(false);
+    state.theta = parseFloat(e.target.value);
+    render();
+  });
+
+  document.getElementById("reset").addEventListener("click", function () {
+    cam.a = -58 * D2R; cam.e = 18 * D2R;
+    cam.zoom = 1; cam.px = 0; cam.py = 0;
+    render();
+  });
+
+  document.getElementById("sectorChk").addEventListener("change", function (e) {
+    state.sector = e.target.checked;
+    render();
+  });
+
+  // 拖动换视角 / Shift+拖动 平移（三张图联动）
+  var drag = null;
+  canvases.forEach(function (cv) {
+    cv.addEventListener("pointerdown", function (e) {
+      drag = { x: e.clientX, y: e.clientY, a: cam.a, e: cam.e,
+               px: cam.px, py: cam.py, pan: e.shiftKey };
+      cv.setPointerCapture(e.pointerId);
+      e.preventDefault();
+    });
+    cv.addEventListener("pointermove", function (e) {
+      if (!drag) return;
+      if (drag.pan) {
+        cam.px = drag.px + (e.clientX - drag.x);
+        cam.py = drag.py + (e.clientY - drag.y);
+      } else {
+        cam.a = drag.a + (e.clientX - drag.x) * 0.008;
+        cam.e = Math.max(-1.35, Math.min(1.35, drag.e - (e.clientY - drag.y) * 0.006));
+      }
+      render();
+    });
+    cv.addEventListener("pointerup", function (e) {
+      drag = null;
+      try { cv.releasePointerCapture(e.pointerId); } catch (err) {}
+    });
+    cv.addEventListener("pointercancel", function () { drag = null; });
+
+    // Ctrl + 滚轮 缩放；页面本身能滚动时，不按 Ctrl 就正常翻页
+    cv.addEventListener("wheel", function (e) {
+      var scrollable = document.documentElement.scrollHeight > window.innerHeight + 4;
+      if (!e.ctrlKey && scrollable) return;
+      e.preventDefault();
+      var dy = e.deltaY * (e.deltaMode === 1 ? 16 : (e.deltaMode === 2 ? 100 : 1));
+      cam.zoom = Math.min(4, Math.max(0.35, cam.zoom * Math.exp(-dy * 0.0015)));
+      render();
+    }, { passive: false });
+
+    // 双击复位缩放与平移
+    cv.addEventListener("dblclick", function (e) {
+      e.preventDefault();
+      cam.zoom = 1; cam.px = 0; cam.py = 0;
+      render();
+    });
+  });
+
+  // 空格播放/暂停
+  window.addEventListener("keydown", function (e) {
+    if (e.code === "Space") { e.preventDefault(); setPlaying(!state.playing); }
+  });
+
+  // 尺寸变化重画
+  var rt = null;
+  window.addEventListener("resize", function () {
+    clearTimeout(rt);
+    rt = setTimeout(render, 120);
+  });
+
+  render();
+  setPlaying(true);
+})();
+</script>
+</body>
+</html>

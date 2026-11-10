@@ -1,0 +1,3 @@
+- insert:
+    - id: sidebar-notes
+      name: '@local/sidebar-notes'

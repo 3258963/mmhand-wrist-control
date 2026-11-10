@@ -1,0 +1,302 @@
+"""腕部两轴负反馈控制律 —— 纯函数模块，专为移植设计。
+
+无任何 Qt / 串口 / 全局状态依赖；每个函数与 C 实现一一对应，
+迁移到 STM32 时按函数逐行翻译即可（float 运算，无动态分配）。
+
+对应 C 结构建议：
+    typedef struct {
+        int32_t origin[3];        /* M27/M28/M29 使能起点（counts） */
+        float   gain_roll[3];     /* ROLL 通道系数，counts/deg，带符号 */
+        float   gain_pitch[3];    /* PITCH 通道系数，counts/deg，带符号 */
+        float   kp;               /* 误差比例增益（无量纲） */
+        float   deadband_deg;     /* 死区（deg），抑制编码器噪声 */
+        float   target_limit_deg; /* 目标角限幅（deg） */
+        int32_t soft_limit;       /* 相对起点的输出限幅（counts） */
+    } wrist_control_params_t;
+
+    void wrist_control_step(const wrist_control_params_t *p,
+                            float roll_deg, float pitch_deg,
+                            float roll_target_deg, float pitch_target_deg,
+                            int32_t out[3]);
+
+坐标约定：
+    roll/pitch 为相对"基准零点"的角度（deg，正负号由安装方向决定）；
+    out[i] 为 M27+i 的绝对 logical ABS 目标（counts）。
+
+v2 模型前馈模式（wrist_control_step_model，2026-10-25）：
+    前馈 = k_i · [l_i(目标位姿) − l_i(基线位姿)]，l 由 wrist_model 六段几何求值；
+    校正 = −kp · k_i · (R_i · e_rad)，R_i 为反馈位姿的 2×3 力臂矩阵行向量。
+    前馈参考位姿取 δ（基线零位对应的模型角），因此 δ 不引起零位漂移。
+    θ_model = θ_rel + δ 全链只校正一次；角度接口一律 deg，rad 转换仅在入口。
+    k_i 符号约定：counts 增大 ⟺ 绳放长（符号由台架点动确认后写入标定）。
+
+    对应 C 结构（追加到 v1 结构体之后）：
+        typedef struct {
+            float k_counts_per_m[3];   /* M27+i 收放系数，counts/m，带符号 */
+            float zero_offset_deg[2];  /* δr, δp：基线零位对应的模型角偏移，deg */
+        } wrist_calib_t;
+
+        /* 返回 status 标志位（FLAG_*）；有硬错误标志时 out 不可用且不发送 */
+        int wrist_control_step_model_c(const wrist_control_params_t *p,
+                                       const wrist_calib_t *calib,
+                                       float roll_deg, float pitch_deg,
+                                       float roll_tgt_deg, float pitch_tgt_deg,
+                                       int32_t out[3]);
+"""
+
+from __future__ import annotations
+
+import math
+
+from wrist_model import (
+    LOW_PITCH_LIMIT_DEG,
+    PITCH,
+    RANGE_DEG,
+    ROLL,
+    wrist_eval,
+)
+
+MOTOR_COUNT = 3  # M27, M28, M29
+
+
+class WristControlParams:
+    """控制参数快照。每周期由调用方从 UI/配置读出并填充。"""
+
+    __slots__ = (
+        "origin", "gain_roll", "gain_pitch", "kp",
+        "deadband_deg", "target_limit_deg", "soft_limit",
+    )
+
+    def __init__(self):
+        self.origin = [0] * MOTOR_COUNT
+        self.gain_roll = [0.0] * MOTOR_COUNT
+        self.gain_pitch = [0.0] * MOTOR_COUNT
+        self.kp = 0.0
+        self.deadband_deg = 0.0
+        self.target_limit_deg = 90.0
+        self.soft_limit = 5000
+
+
+def clampf(v: float, lo: float, hi: float) -> float:
+    return lo if v < lo else (hi if v > hi else v)
+
+
+def clampi(v: int, lo: int, hi: int) -> int:
+    return lo if v < lo else (hi if v > hi else v)
+
+
+def shortest_angle_delta(cur_deg: float, base_deg: float) -> float:
+    """最短角差，结果落在 (-180, 180]。"""
+    return (cur_deg - base_deg + 180.0) % 360.0 - 180.0
+
+
+# ---------------------------------------------------------------------------
+# v2：解析模型前馈 + R 矩阵 P 校正（2026-10-25，追加实现，v1 保持原样）
+# ---------------------------------------------------------------------------
+
+# 状态标志（位掩码）。硬错误 = FLAG_NONFINITE / FLAG_GEOM_INVALID：
+# 返回 out=None，调用方必须保持上一目标，不得发送 origin（会引起运动）。
+FLAG_OK = 0
+FLAG_TARGET_CLAMPED = 1 << 0    # 目标角被限幅/模型行程/低置信区钳制
+FLAG_LOW_PITCH = 1 << 1         # 最终 pitch 目标 ≤ −24°（低置信区，进区即提示）
+FLAG_FEEDBACK_CLAMPED = 1 << 2  # 反馈角被钳入模型行程
+FLAG_GEOM_INVALID = 1 << 3      # 模型求值失败（段长退化/非有限）
+FLAG_NONFINITE = 1 << 4         # 输入非有限
+
+
+class WristCalib:
+    """腕部标定快照：每电机收放系数 k（counts/m，带符号）+ 模型零偏 δ（deg）。
+
+    δ 语义：基线零位（PC angle_baseline）对应的模型角。θ_model = θ_rel + δ
+    是全链唯一校正点；δ 只能来自机械基准，不得与几何系数一起拟合。
+    """
+
+    __slots__ = ("k_counts_per_m", "zero_offset_deg")
+
+    def __init__(self, k_counts_per_m, zero_offset_deg):
+        self.k_counts_per_m = [float(v) for v in k_counts_per_m]
+        self.zero_offset_deg = [float(v) for v in zero_offset_deg]
+
+
+def parse_wrist_calib(data):
+    """解析 wrist_calib.json 内容 -> (WristCalib, None) | (None, 原因)。
+
+    格式：{"version":1,"k_counts_per_m":[3 带符号],"zero_offset_deg":[2]（可缺省=0）}。
+    校验：version==1、k 长度 3 且全部有限非零、δ 长度 2 且有限。
+    不静默吞错：任何字段缺失/类型错/值非法都返回明确原因。
+    """
+    if not isinstance(data, dict):
+        return None, "标定文件内容不是 JSON 对象"
+
+    version = data.get("version")
+    if version != 1:
+        return None, f"version 不支持：{version!r}（需要 1）"
+
+    def _finite_list(key, n):
+        """取 key 字段 -> (list[float] | None, 原因 | None)。"""
+        if key not in data:
+            return None, f"缺少字段 {key}"
+        vals = data[key]
+        if not isinstance(vals, (list, tuple)) or len(vals) != n:
+            return None, f"{key} 需为长度 {n} 的数组"
+        try:
+            out = [float(v) for v in vals]
+        except (TypeError, ValueError):
+            return None, f"{key} 含非数值"
+        if not all(math.isfinite(v) for v in out):
+            return None, f"{key} 含 NaN/Inf"
+        return out, None
+
+    k, err = _finite_list("k_counts_per_m", 3)
+    if err:
+        return None, err
+    if any(v == 0.0 for v in k):
+        return None, "k_counts_per_m 含 0：未标定或文件损坏"
+
+    if "zero_offset_deg" in data:
+        d, err = _finite_list("zero_offset_deg", 2)
+        if err:
+            return None, err
+    else:
+        d = [0.0, 0.0]
+    return WristCalib(k, d), None
+
+
+def wrist_control_step_model(p: WristControlParams,
+                             calib: WristCalib,
+                             roll_deg: float,
+                             pitch_deg: float,
+                             roll_tgt_deg: float,
+                             pitch_tgt_deg: float) -> tuple:
+    """v2 一拍控制律：模型绳长前馈 + R·e 比例校正 + 双重限幅。
+
+    返回 (out[3] | None, flags)。硬错误时 out=None：调用方保持上一目标。
+    钳制类标志不阻止输出，由调用方决定提示方式。
+    """
+    ins = (roll_deg, pitch_deg, roll_tgt_deg, pitch_tgt_deg)
+    if not all(math.isfinite(v) for v in ins):
+        return None, FLAG_NONFINITE
+    if (not all(math.isfinite(v) for v in calib.k_counts_per_m)
+            or not all(math.isfinite(v) for v in calib.zero_offset_deg)):
+        return None, FLAG_NONFINITE
+
+    flags = FLAG_OK
+    dr, dp = calib.zero_offset_deg
+
+    # 目标钳制：UI 限幅 ∩ 模型行程；pitch 抬底到低置信区边界 −24°。
+    lim = p.target_limit_deg
+    lo_r = max(-lim, RANGE_DEG[ROLL][0])
+    hi_r = min(lim, RANGE_DEG[ROLL][1])
+    lo_p = max(-lim, RANGE_DEG[PITCH][0])
+    hi_p = min(lim, RANGE_DEG[PITCH][1])
+    rt = clampf(roll_tgt_deg, lo_r, hi_r)
+    pt = clampf(pitch_tgt_deg, lo_p, hi_p)
+    if rt != roll_tgt_deg or pt != pitch_tgt_deg:
+        flags |= FLAG_TARGET_CLAMPED
+    if pt <= LOW_PITCH_LIMIT_DEG:
+        pt = max(pt, LOW_PITCH_LIMIT_DEG)
+        flags |= FLAG_LOW_PITCH
+
+    # 反馈角钳入模型行程（不钳入目标域：限幅是目标的安全约束，不是反馈的）。
+    rf = clampf(roll_deg, RANGE_DEG[ROLL][0], RANGE_DEG[ROLL][1])
+    pf = clampf(pitch_deg, RANGE_DEG[PITCH][0], RANGE_DEG[PITCH][1])
+    if rf != roll_deg or pf != pitch_deg:
+        flags |= FLAG_FEEDBACK_CLAMPED
+
+    # deg → rad 仅此一处（目标/反馈/参考一并转换，θ_model = θ_rel + δ）。
+    t_r = math.radians(rt + dr)
+    t_p = math.radians(pt + dp)
+    fb_r = math.radians(rf + dr)
+    fb_p = math.radians(pf + dp)
+    ref_r = math.radians(dr)
+    ref_p = math.radians(dp)
+
+    out_t = wrist_eval(t_r, t_p)
+    out_ref = wrist_eval(ref_r, ref_p)
+    out_fb = wrist_eval(fb_r, fb_p)
+    if not (out_t.math_valid and out_ref.math_valid and out_fb.math_valid):
+        return None, flags | FLAG_GEOM_INVALID
+
+    e_roll = rt - rf
+    e_pitch = pt - pf
+    if -p.deadband_deg <= e_roll <= p.deadband_deg:
+        e_roll = 0.0
+    if -p.deadband_deg <= e_pitch <= p.deadband_deg:
+        e_pitch = 0.0
+    e_r_rad = math.radians(e_roll)
+    e_p_rad = math.radians(e_pitch)
+
+    out = [0] * MOTOR_COUNT
+    for i in range(MOTOR_COUNT):
+        dl = ((out_t.s_m[ROLL][i] + out_t.s_m[PITCH][i])
+              - (out_ref.s_m[ROLL][i] + out_ref.s_m[PITCH][i]))
+        ff = calib.k_counts_per_m[i] * dl
+        corr = (-p.kp * calib.k_counts_per_m[i]
+                * (out_fb.r_m[ROLL][i] * e_r_rad
+                   + out_fb.r_m[PITCH][i] * e_p_rad))
+        value = p.origin[i] + ff + corr
+        out[i] = clampi(int(round(value)),
+                        p.origin[i] - p.soft_limit,
+                        p.origin[i] + p.soft_limit)
+    return out, flags
+
+
+def wrist_control_step(p: WristControlParams,
+                       roll_deg: float,
+                       pitch_deg: float,
+                       roll_target_deg: float,
+                       pitch_target_deg: float) -> list:
+    """一拍控制律：前馈 + 误差 P 校正 + 双重限幅。
+
+    out[i] = origin[i]
+           + gain_roll[i] * roll_tgt_clamped
+           + gain_pitch[i] * pitch_tgt_clamped
+           + kp * (gain_roll[i] * err_roll + gain_pitch[i] * err_pitch)
+    误差先过死区；目标角先过 ±target_limit；输出钳到 origin±soft_limit。
+    """
+    lim = p.target_limit_deg
+    r_tgt = clampf(roll_target_deg, -lim, lim)
+    p_tgt = clampf(pitch_target_deg, -lim, lim)
+
+    e_roll = r_tgt - roll_deg
+    e_pitch = p_tgt - pitch_deg
+    if -p.deadband_deg <= e_roll <= p.deadband_deg:
+        e_roll = 0.0
+    if -p.deadband_deg <= e_pitch <= p.deadband_deg:
+        e_pitch = 0.0
+
+    out = [0] * MOTOR_COUNT
+    for i in range(MOTOR_COUNT):
+        value = (p.origin[i]
+                 + p.gain_roll[i] * r_tgt
+                 + p.gain_pitch[i] * p_tgt
+                 + p.kp * (p.gain_roll[i] * e_roll
+                           + p.gain_pitch[i] * e_pitch))
+        out[i] = clampi(int(round(value)),
+                        p.origin[i] - p.soft_limit,
+                        p.origin[i] + p.soft_limit)
+    return out
+
+
+if __name__ == "__main__":
+    # 自测：与实机验证过的四组用例一致。
+    p = WristControlParams()
+    p.origin = [1000, 2000, 3000]
+    p.gain_roll = [50.0, 0.0, 30.0]
+    p.gain_pitch = [0.0, -40.0, 30.0]
+    p.kp = 0.6
+    p.deadband_deg = 0.3
+    p.target_limit_deg = 25.0
+    p.soft_limit = 5000
+
+    # 1) 前馈+P：实际 ROLL=1 目标 2 -> [1130, 2000, 3078]
+    assert wrist_control_step(p, 1.0, 0.0, 2.0, 0.0) == [1130, 2000, 3078]
+    # 2) 负系数 PITCH：实际 +1 目标 -1 -> M28 = 2088
+    assert wrist_control_step(p, 1.0, 1.0, 2.0, -1.0)[1] == 2088
+    # 3) 目标限幅：100° 被压到 25° -> M27 = 1000+1250+720 = 2970
+    assert wrist_control_step(p, 1.0, 0.0, 100.0, 0.0)[0] == 2970
+    # 4) 死区：误差 0.2°<0.3° -> 误差项为 0，M27 = 1100
+    assert wrist_control_step(p, 1.8, 0.0, 2.0, 0.0)[0] == 1100
+    # 5) 最短角差跨绕回点
+    assert abs(shortest_angle_delta(-179.0, 179.0) - 2.0) < 1e-9
+    print("wrist_control_law 自测全部通过")
