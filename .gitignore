@@ -54,3 +54,4 @@ ROSexample/**/log/
 .idea/
 *.tlog
 *.bak-*
+docs/ai/build/
