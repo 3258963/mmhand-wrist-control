@@ -1,0 +1,21 @@
+{
+  "port": "COM23",
+  "baud": "115200",
+  "address": 1,
+  "hz": 20.0,
+  "decimals": 0,
+  "unit": "N",
+  "factor": -0.00980665,
+  "auto_connect": false,
+  "window_s": 30.0,
+  "channels": [
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true
+  ]
+}
