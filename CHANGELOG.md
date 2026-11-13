@@ -1,0 +1,104 @@
+# 更新日志
+
+本文件记录项目所有值得注意的变更。
+格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，日期为 `YYYY-MM-DD`。
+版本号用**日期**代替：本项目的"发布"= 一次台架验证通过的基线。
+
+分类约定：
+- **新增** 新功能、新文件、新参数
+- **变更** 已有行为/默认值的调整
+- **修复** 缺陷修正
+- **文档** 文档增删改
+- **注意** 升级/换硬件时必须知道的事
+
+---
+
+## [2026-11-11] 卷筒半径实测化 · 张力环参数定版
+
+> 概要：把"卷筒半径"从假设（全 5 mm）改成实测（**6.0 / 5.5 / 5.5 mm**），
+> 于是所有 `k`、counts/度、counts/mm 全部变了；在此基础上把张力环四个参数一次定下来，
+> 并修复积分钳制的一个 bug。6 份零散文档合并为 2 份。
+
+### 新增
+
+- **`wrist_control_law.py`**：新增卷筒几何常量，一处改半径、全局跟着变
+  - `COUNTS_PER_REV = 4096.0`
+  - `SPOOL_RADIUS_M = (0.006, 0.0055, 0.0055)`（C1 / C2 / C3，单位米）
+  - `K_NOMINAL_ABS`：由 `k_i = COUNTS_PER_REV / (2π·r_i)` 推导，只给幅值（符号属方向约定）
+- **`wrist_force_law.py`**：新增张力环"力单位"常数与换算函数
+  - `ROPE_STIFFNESS_N_PER_MM = 5.5`（电机走 1 mm 的等效刚度）
+  - `TENSION_I_TERM_LIM_COUNTS = 5.0`（积分贡献上限，counts 口径）
+  - `tension_counts_per_n(k_i)`：该路 1 N 对应多少 counts（仅报数用）
+  - `tension_i_term_lim_counts()`：直接返回 counts 钳制值
+- **`WristTensionParams`** 新增 `i_term_lim` 字段（缺省 = `max_trim`，保持旧行为）
+- **`mmhand_scope.py`**：新增 `_tension_i_term_lim()`；UI 张力参数说明补上整定依据
+- **`tools/wrist_tension_sim.py`**：张力环离线仿真脚本
+- 应用图标 `mmhand_scope.ico` / `mmhand_scope_v3.ico`
+- 说明图 `wrist_control_block_diagram.png`、`wrist_freq_overview.png`、`控制框图.png`
+
+### 变更
+
+- **标定 `k` 由单一值改为逐路**：`130380` → `[-108649.8, +118527.0, +118527.0] counts/m`
+  （C1 电机反向安装取负；半径 6.0/5.5/5.5 mm）
+- **张力环参数默认值定版**：
+
+  | 参数 | 旧值 | 新值 | 依据 |
+  |---|---|---|---|
+  | 每拍限幅 `max_step_f` | 5 counts/拍 | **20 counts/拍** | 配舵机 2000 steps/s × 100 Hz |
+  | 张力 `Kp_f` | 10 | **15** | 让 20 counts/拍真正用上；偏置 5/Kp 反而更小 |
+  | 张力 `Ki_f` | 10 | **20** | Ti = Kp/Ki = 0.75 s，属常规 |
+  | 积分钳制 | 1 N 力当量 | **5 counts** | ≈0.23 N 力当量，能顶偏 0.33 N |
+
+- **舵机速度寄存器**：1000 → **2000 steps/s**（量程 0–3400，需重新烧写才生效）
+- **UI 标称 k 判定**：从"固定 5 mm"改为显示实际卷筒半径，避免把正确值误判为"已标定"
+- **`tools/gen_position_loop_figure.py`**：`K` 改为逐路列表，对拉量改用 **mm** 计量（γ 是长度量，与 k 无关）
+- **`tools/wrist_position_loop_probe.py`**：改为按逐路 k 读标定文件
+
+### 修复
+
+- **积分钳制只卡贡献、不卡状态**（`wrist_force_law._incr_step`）
+  - 现象：钳住 `K_i·∫e` 后闸门条件 `raw < max_step` 永远成立，状态 `∫e` 无限增长；
+    反向时需要按状态的绝对值慢慢退，等于把"反向滞后"变成无界
+  - 修法：`∫e` 状态同步钳到 `i_term_lim / ki`，状态与贡献一起封顶
+- **`tests/test_scope_position_loop.py`** 注释澄清：合成标定（三路同号）只验证接线与方向跟随，
+  与真实标定的逐路 k 无关
+
+### 文档
+
+- 新增 **`docs/腕部控制_原理与实现.md`**：四模式合一（几何基座、位置环推导、三套力控、参数速查、安全门禁、台架操作）
+- 新增 **`docs/今日总结_20261111.md`**：当日改动与四个参数的取舍推导
+- 删除 5 份已被上述文档覆盖的旧文档：
+  `今日总结_位置环_20261110.md`、`位置环_数学原理与耦合机理_详解.md`、
+  `腕部四模式_代码复核_20261110.md`、`腕部四模式控制详解.md`、
+  `腕部四模式控制详解与数学推导（合并版）.md`
+
+### 注意
+
+- **换卷筒或换线径**：只改 `wrist_control_law.py` 里的 `SPOOL_RADIUS_M`，
+  `K_NOMINAL_ABS`、UI 提示、出图工具会自动跟着变；标定 json 需重新生成
+- **符号不属于 k 的幅值**：`k > 0` 表示"counts 增大 = 放绳"，由台架点动确定，与半径无关
+- **若台架出现抖动**，第一件事是把 `Kp_f` 从 15 退回 10
+- **单位口径**：以后统一用 **counts** 描述积分钳制，并明确"这是积分贡献还是它产生的偏置"。
+  同一个"0.1 N"在三种口径下相差 10 倍，这是本次最大的教训
+
+---
+
+## [2026-11-10] 首次导入
+
+首次把上位机与下位机代码纳入版本库。
+
+### 新增
+
+- **上位机**：`desktop/`（GUI）、`znsv_app/`（传感器上位机）、`tools/`、`tests/`，
+  根目录腕部控制算法 `mmhand_scope.py` / `wrist_control_law.py` / `wrist_tension.py` /
+  `wrist_force_law.py` / `wrist_model.py` / `wrist_filter.py` / `wrist_tda.py`
+- **下位机**：`ESP32-P4/`（ServoBoardMain 舵机板固件 + FTServo 驱动库）、
+  `ESP32-S3/`（编码器/触觉/传感器板固件）、`playground/`（实验 sketch）
+- **第三方**：`manus/`（Manus 数据手套 SDK 与桥接客户端）
+- **文档**：`docs/` 全套设计文档、通信协议、交接材料
+- **公式推导**：`徐钰公式推导/`（推导手册、图示、校验脚本、H7 实时算法）
+
+### 注意
+
+- `.venv/`、`__pycache__/`、`run_data/`、`*.tlog`、`.mimosa/`、`docs/ai/build/` 均在 `.gitignore` 中，
+  不纳入版本库
