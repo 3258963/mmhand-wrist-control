@@ -3,23 +3,24 @@
 用法（在 code/mmhand-main 下）：
     .venv\\Scripts\\python.exe -m tools.wrist_position_loop_probe
     .venv\\Scripts\\python.exe -m tools.wrist_position_loop_probe --full
+    .venv\\Scripts\\python.exe -m tools.wrist_position_loop_probe --k -108649.77,118527.03,118527.03
 
-输出（第 1 段 = 文档 §10 的全部常数，第 2 段 = §5.4 的对照表）：
-    标定 k / R(0,0) / 每度 counts / n̂ / l(0,0) / 二阶导 H
-    对每个误差 e：现律指令长度、精确位姿长度、两者之差（counts / mm）、
-    法向对拉、以及"新律（先算位姿再取绳长）"的残差（应恒为 0）
+k 默认读 run_data/scope_exports/wrist_calib.json（逐路不同，见 wrist_control_law.SPOOL_RADIUS_M）；
+文件缺失时退回名义值 K_NOMINAL_ABS。
 
---full 追加：工作区每根绳的长度行程、n̂ 有效区边界、任意两缆的列夹角。
+输出（第 1 段 = 文档 §10 的常数，第 2 段 = §5.4 的对照表）：
+    k / R(0,0) / 每度 counts（逐路）/ n̂ / l(0,0) / 二阶导 H
+    对每个误差 e：现律指令与该位姿真实绳长之差（逐路 counts + 法向 mm）、
+    以及"新律（先算位姿再取绳长）"的残差（应恒为 0）
 
-判据（本文件自检会在末尾打印 PASS/FAIL）：
-    新律的法向残差 |n̂·(Λ − l(θ_des))| < 1e-9 mm
-    现律的法向残差随 e 二次增长（|γ| / e² 近似常数）
+--full 追加：每根绳的行程、n̂ 有效区边界、任意两缆的列夹角。
 
 只依赖 wrist_model + wrist_control_law（无 Qt / 无串口）。
 """
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import sys
 from pathlib import Path
@@ -28,15 +29,29 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from wrist_control_law import K_NOMINAL_ABS, SPOOL_RADIUS_M, parse_wrist_calib  # noqa: E402
 from wrist_model import PITCH, ROLL, positive_null_direction, wrist_eval  # noqa: E402
 
-DEFAULT_K = 130380.0     # counts/m（结构常数；符号不影响下述幅值）
 KP_DEFAULT = 0.6         # 与 UI 默认一致
+CALIB_PATH = _REPO_ROOT / "run_data" / "scope_exports" / "wrist_calib.json"
 
 
 # --------------------------------------------------------------------------
 # 小工具
 # --------------------------------------------------------------------------
+def load_k(sign_nominal: bool = True) -> list:
+    """逐路 k（counts/m）。优先读标定文件，否则用名义值（C1 取负，与现场一致）。"""
+    try:
+        data = json.loads(CALIB_PATH.read_text(encoding="utf-8"))
+        calib, err = parse_wrist_calib(data)
+        if calib is not None:
+            return list(calib.k_counts_per_m)
+    except (OSError, ValueError):
+        pass
+    return [-K_NOMINAL_ABS[0], K_NOMINAL_ABS[1], K_NOMINAL_ABS[2]] if sign_nominal \
+        else list(K_NOMINAL_ABS)
+
+
 def l_m(rd: float, pd: float) -> list:
     """三缆总长（m）：ROLL 段 + PITCH 段。"""
     out = wrist_eval(math.radians(rd), math.radians(pd))
@@ -52,7 +67,7 @@ def n_hat(rd: float, pd: float):
 
 
 def hessian(rd: float, pd: float, h: float = 1e-5) -> tuple:
-    """数值二阶导 H[i] = 2x2（m/rad²）：rr, rp, pp 三个方向各回一个 3 向量。"""
+    """数值二阶导：rr / rp / pp 三个方向，各回一个 3 向量（m/rad²）。"""
     rd, pd = math.radians(rd), math.radians(pd)
 
     def L(a, b):
@@ -66,7 +81,7 @@ def hessian(rd: float, pd: float, h: float = 1e-5) -> tuple:
     return rr, rp, pp
 
 
-def law_lengths(rd_fb, pd_fb, er, ep, kp, k=1.0):
+def law_lengths(rd_fb, pd_fb, er, ep, kp):
     """现律在"长度域"的指令：Λ = l(θ*) − Kp·R(θ_fb)·e（e 为弧度）。"""
     rt, pt = rd_fb + er, pd_fb + ep
     R = r_mat(rd_fb, pd_fb)
@@ -75,30 +90,35 @@ def law_lengths(rd_fb, pd_fb, er, ep, kp, k=1.0):
             for i in range(3)]
 
 
-def normal_proj(vec, rd, pd, k=1.0):
-    """把长度差（m）投影到 n̂ 上，返回 counts（k<0 时也按幅值给出）。"""
+def normal_mm(vec, rd, pd):
+    """把长度差（m）投影到 n̂ 上 → 法向对拉（mm，带符号）。"""
     n = n_hat(rd, pd)
     if n is None:
         return float("nan")
-    return abs(sum(vec[i] * n[i] for i in range(3))) * abs(k)
+    return sum(vec[i] * n[i] for i in range(3)) * 1000.0
 
 
 # --------------------------------------------------------------------------
 # 第 1 段：常数
 # --------------------------------------------------------------------------
-def print_constants(k: float) -> None:
+def print_constants(k: list) -> None:
     o = wrist_eval(0.0, 0.0)
-    print("=" * 78)
+    print("=" * 84)
     print("一、常数（θ=(0,0)）")
-    print("=" * 78)
-    print(f"  k = {k:+.6g} counts/m   (k>0 ⇒ counts↑=放绳；k<0 ⇒ counts↑=收绳)")
+    print("=" * 84)
+    print("  k（counts/m，逐路；4096 c/圈 ÷ 2π·r）：")
+    for i in range(3):
+        r = SPOOL_RADIUS_M[i] * 1000.0
+        print(f"    C{i + 1}(M{27 + i}): r={r:.1f}mm → k={k[i]:+.4f}"
+              f"   （counts/mm={abs(k[i]) / 1000:.3f}，1 count={1000 / abs(k[i]):.5f}mm）")
     print("  R(0,0)  m/rad         （R_ji = −∂l_i/∂θ_j）")
     for j, nm in ((ROLL, "ROLL "), (PITCH, "PITCH")):
         print(f"    {nm}: " + "  ".join(f"{-o.r_m[j][i]:+.8f}" for i in range(3)))
-    print("  每度 counts = −k·R·π/180")
+    print("  每度 counts = −k_i·R_ji·π/180（逐路，符号随 k）")
     for j, nm in ((ROLL, "ROLL "), (PITCH, "PITCH")):
-        vals = [-k * o.r_m[j][i] * math.pi / 180.0 for i in range(3)]
-        print(f"    {nm}: " + "  ".join(f"{v:+.4f}" for v in vals))
+        vals = [-k[i] * o.r_m[j][i] * math.pi / 180.0 for i in range(3)]
+        print(f"    {nm}: " + "  ".join(f"{v:+9.4f}" for v in vals)
+              + "    |幅值| " + "  ".join(f"{abs(v):7.3f}" for v in vals))
     n = n_hat(0.0, 0.0)
     print("  n̂(0,0) = " + ", ".join(f"{v:+.6f}" for v in n)
           + "   |n̂| = %.9f" % math.hypot(*n)
@@ -106,23 +126,25 @@ def print_constants(k: float) -> None:
                                      for j in (ROLL, PITCH)) + ")")
     print("  l(0,0) = " + ", ".join(f"{v*1000:.4f}" for v in l_m(0.0, 0.0)) + "  mm")
     rr, rp, pp = hessian(0.0, 0.0)
-    print("  H (counts/rad²):")
-    print("    d²l/dθr²     = " + ", ".join(f"{v*abs(k):+9.1f}" for v in rr))
-    print("    d²l/dθr∂θp  = " + ", ".join(f"{v*abs(k):+9.1f}" for v in rp))
-    print("    d²l/dθp²     = " + ", ".join(f"{v*abs(k):+9.1f}" for v in pp))
+    print("  H (counts/rad²，逐路乘 |k_i|)：")
+    print("    d²l/dθr²     = " + ", ".join(f"{v*abs(k[i]):+9.1f}" for i, v in enumerate(rr)))
+    print("    d²l/dθr∂θp  = " + ", ".join(f"{v*abs(k[i]):+9.1f}" for i, v in enumerate(rp)))
+    print("    d²l/dθp²     = " + ", ".join(f"{v*abs(k[i]):+9.1f}" for i, v in enumerate(pp)))
     print()
 
 
 # --------------------------------------------------------------------------
 # 第 2 段：现律 vs 精确位姿
 # --------------------------------------------------------------------------
-def print_residuals(k: float, kp: float) -> list:
-    print("=" * 78)
+def print_residuals(k: list, kp: float) -> list:
+    print("=" * 84)
     print(f"二、现律（切线）vs 精确位姿（弦）    Kp = {kp}")
-    print("=" * 78)
-    print("  ΔL = 现律指令长度 − 该位姿的真实绳长；n̂ 分量 = 纯对拉（不产生运动）")
+    print("=" * 84)
+    print("  ΔL = 现律指令长度 − 该位姿真实绳长（每缆自己的 counts）；")
+    print("  γ = 该差值在 n̂ 上的投影（mm）= 纯对拉，不产生运动")
     print()
-    hdr = f"  {'e (deg)':>10} | {'ΔL (counts)  C1/C2/C3':>34} | {'法向对拉':>9} | {'折合':>7} | {'新律残差':>9}"
+    hdr = (f"  {'e (deg)':>10} | {'ΔL counts  C1/C2/C3':>30} | "
+           f"{'γ (mm)':>8} | {'γ/e²':>6} | {'新律残差':>9}")
     print(hdr)
     print("  " + "-" * (len(hdr) - 2))
     rows = []
@@ -130,37 +152,30 @@ def print_residuals(k: float, kp: float) -> list:
         rt, pt = er, ep                      # 目标在 (er, ep)，反馈在 (0,0)
         cur = law_lengths(0.0, 0.0, er, ep, kp)
         exact = [l_m(rt + kp * er, pt + kp * ep)[i] for i in range(3)]
-        d = [(cur[i] - exact[i]) * k for i in range(3)]
-        fight = normal_proj([cur[i] - exact[i] for i in range(3)], rt, pt, k)
-        mm = fight / abs(k) * 1000.0
+        d_m = [cur[i] - exact[i] for i in range(3)]
+        d_ct = [d_m[i] * k[i] for i in range(3)]
+        g_mm = normal_mm(d_m, rt, pt)
+        step2 = max(er * er + ep * ep, 1e-9)
         # 新律：Λ = l(θ_des)，与自身比 → 恒 0
-        new = [l_m(rt + kp * er, pt + kp * ep)[i] for i in range(3)]
-        new_res = normal_proj([new[i] - l_m(rt + kp * er, pt + kp * ep)[i] for i in range(3)],
-                              rt + kp * er, pt + kp * ep, k)
-        rows.append((er, ep, d, fight))
+        nd = [l_m(rt + kp * er, pt + kp * ep)[i] for i in range(3)]
+        new_res = normal_mm([nd[i] - exact[i] for i in range(3)],
+                            rt + kp * er, pt + kp * ep)
+        rows.append((er, ep, d_ct, g_mm))
         print(f"  ({er:+3d},{ep:+3d}) | "
-              + " / ".join(f"{v:+6.1f}" for v in d)
-              + f" | {fight:9.1f} | {mm:6.3f}mm | {new_res:9.1e}")
+              + " / ".join(f"{v:+7.1f}" for v in d_ct)
+              + f" | {g_mm:+8.3f} | {abs(g_mm) / step2:6.2f} | {new_res:9.1e}")
     print()
-
-    # 二阶标度自检
-    print("  二次标度自检（|对拉| / e²，应近似常数 ≈ 2 counts/deg²）：")
-    for er, ep, d, fight in rows:
-        if er and ep:
-            continue
-        step = er or ep
-        if step:
-            print(f"    e=({er:+d},{ep:+d})° → {abs(fight)/step**2:6.2f} counts/deg²")
+    print("  γ/e² 应近似常数（二阶标度）；新律残差应恒为 0（浮点 ~1e-16）")
     return rows
 
 
 # --------------------------------------------------------------------------
 # 第 3 段（--full）：工作区 / 窗口 / 两缆夹角
 # --------------------------------------------------------------------------
-def print_full(k: float) -> None:
-    print("=" * 78)
+def print_full(k: list) -> None:
+    print("=" * 84)
     print("三、工作区（roll ±25°，pitch −25~+45°）")
-    print("=" * 78)
+    print("=" * 84)
     lo, hi = [1e9] * 3, [-1e9] * 3
     for rd in range(-25, 26):
         for pd in range(-25, 46):
@@ -168,12 +183,14 @@ def print_full(k: float) -> None:
             for i in range(3):
                 lo[i] = min(lo[i], L[i])
                 hi[i] = max(hi[i], L[i])
-    print("  每根绳的长度行程：")
+    print("  每根绳的长度行程（圈数按本路半径算）：")
     for i in range(3):
         span = hi[i] - lo[i]
-        print(f"    C{i+1}: {span*1000:6.2f} mm = {span*abs(k):6.0f} counts = "
-              f"{span*abs(k)/4096.0:4.2f} 圈   (绝对 {lo[i]*1000:5.1f}~{hi[i]*1000:5.1f} mm)")
-    print("    参考：1 圈 = 2π·5mm = 31.4 mm = 4096 counts；1 count = 0.0077 mm")
+        rev_mm = 2.0 * math.pi * SPOOL_RADIUS_M[i] * 1000.0
+        print(f"    C{i + 1}: {span*1000:6.2f} mm = {span*abs(k[i]):6.0f} counts = "
+              f"{span*1000/rev_mm:4.2f} 圈   (绝对 {lo[i]*1000:5.1f}~{hi[i]*1000:5.1f} mm)")
+    print(f"    参考：1 圈 = {2*math.pi*SPOOL_RADIUS_M[1]*1000:.2f}mm(C2/C3) /"
+          f" {2*math.pi*SPOOL_RADIUS_M[0]*1000:.2f}mm(C1) = 4096 counts")
     print()
 
     print("  n̂（三缆可同时正预紧）存在区边界（0.5° 扫描）：")
@@ -206,25 +223,29 @@ def print_full(k: float) -> None:
 # --------------------------------------------------------------------------
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="位置环几何自检（常数 + 对拉残差）")
-    ap.add_argument("--k", type=float, default=DEFAULT_K, help="counts/m（默认 130380）")
+    ap.add_argument("--k", default=None,
+                    help="逐路 k，逗号分隔 3 个（默认读标定文件/名义值）")
     ap.add_argument("--kp", type=float, default=KP_DEFAULT, help="位置环 Kp（默认 0.6）")
     ap.add_argument("--full", action="store_true", help="追加工作区/窗口/夹角")
     args = ap.parse_args(argv)
 
-    print_constants(args.k)
-    rows = print_residuals(args.k, args.kp)
-    if args.full:
-        print_full(args.k)
+    if args.k:
+        k = [float(v) for v in args.k.split(",")]
+        if len(k) != 3:
+            print("--k 需要 3 个数，用逗号分隔", file=sys.stderr)
+            return 2
+    else:
+        k = load_k()
 
-    # 自检
-    ok = True
-    for er, ep, d, fight in rows:
-        step2 = max(er * er + ep * ep, 1e-9)
-        if abs(fight) / step2 > 4.0:      # 二阶项不应超过 ~4 counts/deg²
-            ok = False
-    print("=" * 78)
+    print_constants(k)
+    rows = print_residuals(k, args.kp)
+    if args.full:
+        print_full(k)
+
+    ok = all(abs(g) / max(er * er + ep * ep, 1e-9) < 4.0 for er, ep, _, g in rows)
+    print("=" * 84)
     print("自检：" + ("PASS —— 法向对拉符合二阶标度；新律残差 0" if ok else "FAIL —— 见上表"))
-    print("=" * 78)
+    print("=" * 84)
     return 0 if ok else 1
 
 

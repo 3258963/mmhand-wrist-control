@@ -179,6 +179,16 @@ class WristCalib:
         self.zero_offset_deg = [float(v) for v in zero_offset_deg]
 
 
+# ---------- 卷筒几何（k 的来源，逐路） ----------
+# k_i = COUNTS_PER_REV / (2π·r_i)   [counts/m]
+# 2026-11-11 用户实测：M27(C1) r=6.0mm；M28(C2)/M29(C3) r=5.5mm。
+# 只给**幅值**：符号是方向约定（k>0 ⇒ counts 增大=放绳），由台架点动定，
+# 与半径无关。换卷筒/换线径后改这里 → 标定 json 与 UI 的"标称"提示跟着变。
+COUNTS_PER_REV = 4096.0
+SPOOL_RADIUS_M = (0.006, 0.0055, 0.0055)          # C1 / C2 / C3，米
+K_NOMINAL_ABS = tuple(COUNTS_PER_REV / (2.0 * math.pi * r) for r in SPOOL_RADIUS_M)
+
+
 def parse_wrist_calib(data):
     """解析 wrist_calib.json 内容 -> (WristCalib, None) | (None, 原因)。
 

@@ -318,6 +318,7 @@ from wrist_force_law import (FORCE_OK, FORCE_NO_NULL, FORCE_OVERLOAD,
                               WristForceV2Params, WristForceV2State,
                               WristTensionParams, WristTensionState,
                               WristTightParams, WristTightState,
+                              tension_i_term_lim_counts,
                               wrist_force_v2_step, wrist_tension_step,
                               wrist_tight_step)
 from wrist_tda import tda_solve
@@ -329,7 +330,8 @@ from mmhand_scope_export import (EXPORT_DIR, dump_csv, load_layout_json,
                                  load_named_json, save_layout_json, save_named_json)
 from wrist_control_law import (FLAG_FEEDBACK_CLAMPED, FLAG_GEOM_INVALID,
                                FLAG_I_CLAMPED, FLAG_LOW_PITCH, FLAG_NONFINITE,
-                               FLAG_TARGET_CLAMPED, WristControlParams,
+                               FLAG_TARGET_CLAMPED, K_NOMINAL_ABS,
+                               SPOOL_RADIUS_M, WristControlParams,
                                WristPidState,
                                parse_wrist_calib,
                                wrist_control_step_pid)
@@ -2532,8 +2534,9 @@ class ScopeWindow(QMainWindow):
         speed_row.addStretch(1)
         lay.addLayout(speed_row)
         servo_speed_note = QLabel(
-            "舵机速度：寄存器已烧录 1000 steps/s（2026-11-03 由 600 升档；量程 0-3400）\n"
-            "（协议直控命令不含速度字段；实测值看底部舵机表『速度』列）")
+            "舵机速度：寄存器已烧录 2000 steps/s（2026-11-11 由 1000 升档；量程 0-3400）\n"
+            "（协议直控命令不含速度字段；实测值看底部舵机表『速度』列。\n"
+            " 与「每拍限幅 20 counts/拍 × 100Hz = 2000 c/s」正好配套）")
         servo_speed_note.setStyleSheet(
             f"color: {AT.T('muted')}; font-size: 11px; padding: 2px;")
         servo_speed_note.setWordWrap(True)
@@ -2709,7 +2712,9 @@ class ScopeWindow(QMainWindow):
             "每拍最大位置增量 counts，**位置模式与力控三模式共用同一个值**：\n"
             "· 位置模式：绝对目标换算成每拍变化 ≤ 此值\n"
             "· 力控/张紧/张力：增量式限速（每拍最多走这么多）\n"
-            "100Hz 下 5 counts/拍 = 500 counts/s。", text="5")
+            "100Hz 下 5 counts/拍 = 500 counts/s。\n"
+            "2026-11-11：默认升到 20（=2000 counts/s，配舵机寄存器 2000 steps/s）。",
+            text="20")
         step_row.addWidget(self.cl_edits["max_step_f"])
         step_hint = QLabel("counts/拍（100Hz）")
         step_hint.setObjectName("muted")
@@ -2792,11 +2797,14 @@ class ScopeWindow(QMainWindow):
         tens_row.addWidget(self.cl_edits["f3_tgt"])
         tens_row.addWidget(QLabel("Kp_f"))
         self.cl_edits["kp_f"] = self._cl_edit(
-            "张力P增益 counts/N", text="10")
+            "张力P增益 counts/N。整定依据：Kp ≈ (0.2~0.5)/S，S 由标定 k 与绳刚度 K 换算；"
+            "1 N 误差 → Kp counts/拍", text="15")
         tens_row.addWidget(self.cl_edits["kp_f"])
         tens_row.addWidget(QLabel("Ki_f"))
         self.cl_edits["ki_f"] = self._cl_edit(
-            "张力I增益 counts/(N·s)。0=纯P", text="10")
+            "张力I增益 counts/(N·s)。**本律 P 已在做积分**，I 只补静摩擦："
+            "积分贡献钳死在 5 counts（≈0.23 N），所以 Ki 只决定攒多快——"
+            "Ti=Kp/Ki=0.75 s 属常规；给小了反而反向回不来", text="20")
         tens_row.addWidget(self.cl_edits["ki_f"])
         tens_row.addStretch(1)
         self._cl_tension_row_w.setVisible(False)
@@ -4324,10 +4332,12 @@ class ScopeWindow(QMainWindow):
         self.wrist_calib = calib
         k = calib.k_counts_per_m
         d = calib.zero_offset_deg
-        # k 是**结构常数**（绕线半径 5 mm、4096 counts/圈 → 4096/(2π·0.005)=130380 c/m），
-        # 不是拟合结果；2026-11-10 用户确认"K 就是那个值、固定"。旧文案一律标"草稿：
-        # 预估/未识别"，把正确值说成没标定，已改正。符号另属方向约定，用 ±|k| 判定。
-        nominal = all(abs(abs(v) - 130380.0) < 1.0 for v in k)
+        # k 是**结构常数** = 4096 counts/圈 ÷ (2π·绕线半径)，**逐路不同**
+        # （2026-11-11 用户实测：M27 r=6.0mm、M28/M29 r=5.5mm → 见 K_NOMINAL_ABS）。
+        # 不是拟合结果；旧文案一律标"草稿/未识别"，把正确值说成没标定，已改正。
+        # 符号另属方向约定（k>0 ⇒ counts↑=放绳），用 ±|k| 判定。
+        nominal = all(abs(abs(v) - n) <= max(1.0, n * 1e-4)
+                      for v, n in zip(k, K_NOMINAL_ABS))
         # 符号只做"翻译"，不下结论（k 的定义是 Δcounts = k·Δl ⇒ k>0 该路 counts↑=放绳）。
         # 符号是**逐路**的：同一台架也可能某一路电机反向安装，所以不搞"三路必须同号"。
         dirs = ["收绳" if v < 0 else "放绳" for v in k]
@@ -4339,7 +4349,9 @@ class ScopeWindow(QMainWindow):
         warn = self._sign_invariant_note()
         self.cl_calib_label.setText(
             f"标定 k=[{k[0]:+.6g},{k[1]:+.6g},{k[2]:+.6g}] c/m  δ=[{d[0]:+.2f},{d[1]:+.2f}]°"
-            + ("（标称 k：绕线半径 5mm + 4096 c/圈，固定值）" if nominal
+            + (f"（标称 k：绕线半径 {SPOOL_RADIUS_M[0]*1000:.1f}/"
+               f"{SPOOL_RADIUS_M[1]*1000:.1f}/{SPOOL_RADIUS_M[2]*1000:.1f}mm"
+               f" + 4096 c/圈，固定值）" if nominal
                else "（已识别）") + f"  {sign_txt}"
             + (f"<br><b style='color:#f87171'>{warn}</b>" if warn else ""))
         if warn and not quiet:
@@ -4538,7 +4550,7 @@ class ScopeWindow(QMainWindow):
             # 启动时把生效值写回框里，所见即所算。
             for key, default in (("kp", 0.6), ("ki", 0.0), ("kd", 0.0),
                                  ("deadband", 0.3), ("limit", 25.0),
-                                 ("max_step_f", 5.0)):
+                                 ("max_step_f", 20.0)):
                 e = self.cl_edits.get(key)
                 if e is not None and not e.text().strip():
                     e.setText(f"{default:g}")
@@ -4899,7 +4911,7 @@ class ScopeWindow(QMainWindow):
                 f_min=self._effective_flimits()[0],
                 deadband=0.01,
                 r_m=out.r_m, null_dir=nd,
-                max_step=self._cl_fval("max_step_f", 5.0, 0.1, 2000.0))
+                max_step=self._cl_fval("max_step_f", 20.0, 0.1, 2000.0))
         except (ValueError, KeyError):
             return None
 
@@ -4912,12 +4924,21 @@ class ScopeWindow(QMainWindow):
         """
         if not outs or not self._safety_on():
             return outs
-        slew = int(self._cl_fval("max_step_f", 5.0, 0.1, 2000.0))
+        slew = int(self._cl_fval("max_step_f", 20.0, 0.1, 2000.0))
         limited = {}
         for m, out in outs.items():
             prev = self.targets.get(m)
             limited[m] = out if prev is None else max(prev - slew, min(prev + slew, int(out)))
         return {m: v for m, v in limited.items() if v != self.targets.get(m)}
+
+    def _tension_i_term_lim(self) -> float:
+        """积分贡献的钳制 [counts]：按 counts 直接给（2026-11-11 用户改口径）。
+
+        `TENSION_I_TERM_LIM_COUNTS = 5` ⇒ 力当量 ≈0.23 N、能顶偏 `5/Kp` N
+        （Kp=15 → 0.33 N、Kp=10 → 0.50 N）。
+        """
+        lim = tension_i_term_lim_counts()
+        return lim if lim > 0.0 else 1.0
 
     def _tension_params(self):
         """读力控 UI → WristTensionParams | None（张力模式，每缆独立）。"""
@@ -4926,13 +4947,14 @@ class ScopeWindow(QMainWindow):
                 f_target=(self._cl_fval("f1_tgt", 2.0, 0.0, 50.0),
                           self._cl_fval("f2_tgt", 2.0, 0.0, 50.0),
                           self._cl_fval("f3_tgt", 2.0, 0.0, 50.0)),
-                kp=self._cl_fval("kp_f", 10.0, 0.0, 10000.0),
-                ki=self._cl_fval("ki_f", 10.0, 0.0, 10000.0),
-                max_step=self._cl_fval("max_step_f", 5.0, 0.1, 2000.0),
+                kp=self._cl_fval("kp_f", 15.0, 0.0, 10000.0),
+                ki=self._cl_fval("ki_f", 20.0, 0.0, 10000.0),
+                max_step=self._cl_fval("max_step_f", 20.0, 0.1, 2000.0),
                 trim_sign=self._force_trim_sign(),
                 max_trim=self._cl_fval("max_trim", 3000.0, 1.0, 50000.0),
                 f_max=self._force_fmax(),
-                deadband=0.05)
+                deadband=0.05,
+                i_term_lim=self._tension_i_term_lim())
         except (ValueError, KeyError):
             return None
 
@@ -4986,7 +5008,7 @@ class ScopeWindow(QMainWindow):
                 f_max=fmax_eff,
                 deadband=0.05,
                 null_dir=nd,
-                max_step=self._cl_fval("max_step_f", 5.0, 0.1, 2000.0),
+                max_step=self._cl_fval("max_step_f", 20.0, 0.1, 2000.0),
                 f_min=fmin_eff)
         except (ValueError, KeyError):
             return None

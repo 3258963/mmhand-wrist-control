@@ -32,9 +32,11 @@ import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 from matplotlib.patches import Rectangle  # noqa: E402
 
+from wrist_control_law import K_NOMINAL_ABS  # noqa: E402
 from wrist_model import PITCH, ROLL, positive_null_direction, wrist_eval  # noqa: E402
 
-K = 130380.0          # counts/m
+# counts/m，逐路（C1 电机反向安装，取负；半径 6/5.5/5.5mm，见 wrist_control_law）
+K = [-K_NOMINAL_ABS[0], K_NOMINAL_ABS[1], K_NOMINAL_ABS[2]]
 KP = 0.6
 
 # 与仓里其它绘图脚本一致的中文/负号设置
@@ -69,8 +71,10 @@ def n_hat(rd, pd):
     return positive_null_direction(math.radians(rd), math.radians(pd))
 
 
-def fight_counts(rd_fb, pd_fb, er, ep, kp=KP):
-    """现律指令长度与该位姿真实绳长之差在 n̂ 上的投影（counts 绝对值）。"""
+def fight_mm(rd_fb, pd_fb, er, ep, kp=KP):
+    """现律指令长度与该位姿真实绳长之差在 n̂ 上的投影（mm，绝对值）。
+
+    注意：γ 是**长度量**，与 k 无关（k 只把长度换成各路的 counts）。"""
     rt, pt = rd_fb + er, pd_fb + ep
     R = r_mat(rd_fb, pd_fb)
     e_r, e_p = math.radians(er), math.radians(ep)
@@ -80,7 +84,7 @@ def fight_counts(rd_fb, pd_fb, er, ep, kp=KP):
     n = n_hat(rt, pt)
     if n is None:
         return float("nan")
-    return abs(sum(d[i] * n[i] for i in range(3))) * K
+    return abs(sum(d[i] * n[i] for i in range(3))) * 1000.0
 
 
 # ---------------------------------------------------------------------------
@@ -146,7 +150,7 @@ def fig_concept(path: Path) -> None:
     ax.annotate("", xy=lam2, xytext=ex2, zorder=7,
                 arrowprops=dict(arrowstyle="<->", color=RED, lw=1.5, ls=":"))
     off_mm = abs(float(np.dot(lam2 - ex2, n2)))
-    ax.annotate(f"偏离曲面 ≈ {off_mm:.2f} mm\n= 纯对拉 {off_mm/1000*K:.0f} counts",
+    ax.annotate(f"偏离曲面 ≈ {off_mm:.2f} mm（= 纯对拉，不产生运动）",
                 xy=(lam2 + ex2) / 2, xytext=(16, -30), textcoords="offset points",
                 color=RED, fontsize=9.5, zorder=8,
                 arrowprops=dict(arrowstyle="->", color=RED, lw=1.0))
@@ -181,8 +185,8 @@ def fig_numbers(path: Path) -> None:
     ax = axs[0]
     labels = ["C1 (M27)", "C2 (M28)", "C3 (M29)"]
     Rd = r_mat(0, 0)
-    roll = [-K * Rd[ROLL][i] * math.pi / 180 for i in range(3)]
-    pitch = [-K * Rd[PITCH][i] * math.pi / 180 for i in range(3)]
+    roll = [-K[i] * Rd[ROLL][i] * math.pi / 180 for i in range(3)]
+    pitch = [-K[i] * Rd[PITCH][i] * math.pi / 180 for i in range(3)]
     x = np.arange(3)
     w = 0.36
     b1 = ax.bar(x - w / 2, roll, w, color=BLUE, label="ROLL 每度", zorder=3)
@@ -196,7 +200,7 @@ def fig_numbers(path: Path) -> None:
     ax.set_xticks(x)
     ax.set_xticklabels(labels, fontsize=9.5)
     ax.set_ylabel("counts / 度", color=INK)
-    ax.set_title("(a) 每 1° 需要的 counts：两个轴差 2.6 倍",
+    ax.set_title("(a) 每 1° 需要的 counts：两个轴差 2.4 倍",
                  color=INK, fontsize=11.5)
     ax.grid(axis="y", color=GRID, lw=0.8)
     ax.legend(fontsize=9, framealpha=0.95)
@@ -206,9 +210,9 @@ def fig_numbers(path: Path) -> None:
     # (b) 对拉 vs 步长
     ax = axs[1]
     step = np.arange(1.0, 10.01, 0.5)
-    roll_only = [fight_counts(0, 0, s, 0) for s in step]
-    pitch_only = [fight_counts(0, 0, 0, s) for s in step]
-    dual = [fight_counts(0, 0, s, s) for s in step]
+    roll_only = [fight_mm(0, 0, s, 0) for s in step]
+    pitch_only = [fight_mm(0, 0, 0, s) for s in step]
+    dual = [fight_mm(0, 0, s, s) for s in step]
     ax.plot(step, roll_only, "o-", color=BLUE, ms=4.5, lw=1.8, label="单轴 ROLL")
     ax.plot(step, pitch_only, "s-", color=AMBER, ms=4.2, lw=1.8, label="单轴 PITCH")
     ax.plot(step, dual, "^-", color=RED, ms=5, lw=2.0, label="双轴 (+s, +s)")
@@ -216,16 +220,16 @@ def fig_numbers(path: Path) -> None:
     i4 = int(np.argmin(np.abs(step - 4.0)))
     c = roll_only[i4] / step[i4] ** 2
     ax.plot(step, c * step ** 2, "k--", lw=1.2,
-            label=f"二次参考 $c\\,e^2$，c = {c:.2f} counts/deg²（e≤4° 拟合）")
+            label=f"二次参考 $c\\,e^2$，c = {c:.4f} mm/deg²（e≤4° 拟合）")
     ax.set_xlabel("单轴/双轴步长 e (°)", color=INK)
-    ax.set_ylabel("法向对拉 (counts)", color=INK)
+    ax.set_ylabel("法向对拉 (mm)", color=INK)
     ax.set_title("(b) 对拉随步长二次增长：小步测不出来，8° 就 >1 mm",
                  color=INK, fontsize=11.5)
     ax.grid(color=GRID, lw=0.8)
     ax.legend(fontsize=8.8, framealpha=0.95, loc="upper left")
     i8 = int(np.argmin(np.abs(step - 8.0)))
-    ax.annotate(f"{dual[i8]:.0f} counts\n≈ {dual[i8]/K*1000:.2f} mm",
-                xy=(step[i8], dual[i8]), xytext=(step[i8] - 4.2, dual[i8] + 20),
+    ax.annotate(f"{dual[i8]:.2f} mm（8°双轴）",
+                xy=(step[i8], dual[i8]), xytext=(step[i8] - 4.2, dual[i8] + 0.08),
                 fontsize=9, color=RED,
                 arrowprops=dict(arrowstyle="->", color=RED, lw=1.1))
     for s in ax.spines.values():

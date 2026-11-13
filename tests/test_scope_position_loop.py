@@ -58,8 +58,9 @@ def _prep(w, variant: int, measured=(1100, 2100, 3100), roll_tgt="0.0",
     w.rx_thread = _FakeSerial()
     w.last_servo_abs_all = [0] * 30
     w._cl_mode = "position"
-    # 与 run_data/scope_exports/wrist_calib.json 一致：k=+130380（counts↑=放绳）。
-    # 位置环方向由 J=−k·R 自动跟随，所以这里用出厂符号来测。
+    # 合成标定：三路同号（k=+130380，counts↑=放绳），只验证接线与方向跟随，
+    # 与 run_data/scope_exports/wrist_calib.json 的真实逐路 k 无关。
+    # 位置环方向由 J=−k·R 自动跟随，所以这里用"全正"符号来测。
     w.wrist_calib = WristCalib([130380.0] * 3, [0.0, 0.0])
     w.pos_loop_combo.blockSignals(True)
     w.pos_loop_combo.setCurrentIndex(variant)

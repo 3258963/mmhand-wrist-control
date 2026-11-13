@@ -51,6 +51,29 @@ FORCE_NO_NULL = 1 << 4      # 该位姿无全正零空间方向（张紧模式�
 
 STALE_MS = 300.0
 
+# ---------- 张力环的"力单位"常数（2026-11-11 用户实测 / 定案） ----------
+# 单位换换算链：k[counts/m] ÷ 1000 = counts/mm；1 count 的力变化 = K/counts_per_mm。
+# 用户给的等效刚度（电机走 1mm 读 Δf）：K = 5.5 N/mm。
+# 卷筒 r = 6/5.5/5.5 mm → k = 108650/118527/118527 counts/m（见 wrist_control_law）。
+ROPE_STIFFNESS_N_PER_MM = 5.5
+# 积分贡献的钳制（counts，2026-11-11 用户改为 counts 口径）：|K_i·∫e| ≤ 5 counts。
+# 换算参考：1 count = 0.0464 N(C2/C3) / 0.0506 N(C1) → 5 counts ≈ 0.23 N 力当量；
+# 它能顶偏的静差 = 5/Kp（Kp=15 时 0.33 N、Kp=10 时 0.5 N）。
+TENSION_I_TERM_LIM_COUNTS = 5.0
+
+
+def tension_counts_per_n(k_i: float) -> float:
+    """该路 1 N 对应多少 counts（k_i 单位 counts/m）＝ k/(K·1000)。仅报数用。"""
+    return abs(k_i) / (ROPE_STIFFNESS_N_PER_MM * 1000.0)
+
+
+def tension_i_term_lim_counts(*_ignored) -> float:
+    """积分贡献的钳制值（counts）——直接按 counts 给，不再经牛顿换算。
+
+    保留 `*_ignored` 只为兼容旧调用点（曾传 k_list / kp）。
+    """
+    return TENSION_I_TERM_LIM_COUNTS
+
 
 def _finite(v) -> bool:
     return isinstance(v, (int, float)) and math.isfinite(v)
@@ -78,16 +101,23 @@ def _incr_step(e_i: float, integ_i: float, resid_i: float,
                max_step: float, i_term_lim: float) -> tuple:
     """增量式 PI 基元（三力控模式统一执行器，2026-11-02 用户定案）。
 
-        du   = sat_{±max_step}( kp·e + sat_{±i_term_lim}( ki·∫e ) )
+        I    = clamp(∫e·dt, ±i_term_lim/ki)          # 状态本身钳住（2026-11-11）
+        du   = sat_{±max_step}( kp·e + ki·I )
         step = round(resid + du)；resid -= step        # 小数残差进位
     返回 (新integ, 新resid, 本拍整数步长)。
     条件积分：未饱和（|raw|<max_step）或误差已反向（raw·e<0）才累加 ∫e。
+
+    2026-11-11 变更：`i_term_lim` 改成"积分贡献"的硬上限（counts），
+    **状态 ∫e 也被钳到 i_term_lim/ki**——否则钳制只卡住贡献、状态仍在涨，
+    反向时要按状态的绝对值慢慢退，等于把"反向滞后"变成无界。
     P 直接作用在 e 上（非 Δe）：ki=0 时恒速 kp·e 逼近目标，进死区才停。"""
     i_term = max(-i_term_lim, min(i_term_lim, ki * integ_i))
     raw = kp * e_i + i_term
     du = max(-max_step, min(max_step, raw))
     if ki > 0.0 and (abs(raw) < max_step or raw * e_i < 0.0):
         integ_i += e_i * dt
+        lim_state = i_term_lim / ki            # 状态与贡献同步封顶（防"假钳制"）
+        integ_i = max(-lim_state, min(lim_state, integ_i))
     resid_i += du
     step = int(round(resid_i))
     resid_i -= step
@@ -246,14 +276,16 @@ class WristTensionParams:
     trim_sign 语义同 v2：+1 = counts 增 ⇒ 该缆张力增；错填 = 正反馈飞车。
     max_step 是每拍最大位置增量 [counts]（相对增量输出，限制速度）。
     max_trim 是相对进入点允许的最大累计行程 [counts]（调用方做绝对夹紧）。
+    i_term_lim 是积分贡献 `K_i·∫e` 的钳制 [counts]，按"1 N 对应多少 counts"折算
+    （见 tension_i_term_lim_counts）；缺省 = max_trim（旧行为）。
     """
 
     __slots__ = ("f_target", "kp", "ki", "trim_sign",
-                 "max_trim", "max_step", "f_max", "deadband")
+                 "max_trim", "max_step", "f_max", "deadband", "i_term_lim")
 
     def __init__(self, f_target, kp: float, ki: float, trim_sign,
                  max_trim: float, f_max: float, deadband: float,
-                 max_step: float = 5.0):
+                 max_step: float = 5.0, i_term_lim: float = None):
         if (not isinstance(f_target, (list, tuple)) or len(f_target) != 3
                 or not all(_finite(v) and v >= 0.0 for v in f_target)):
             raise ValueError("f_target 需为长度 3 的非负有限数组 [N]")
@@ -271,12 +303,15 @@ class WristTensionParams:
             raise ValueError("f_max 需为正数")
         if not _finite(deadband) or deadband < 0.0:
             raise ValueError("deadband 需为非负有限数")
+        if i_term_lim is not None and (not _finite(i_term_lim) or i_term_lim <= 0.0):
+            raise ValueError("i_term_lim 需为正数")
         self.f_target = [float(v) for v in f_target]
         self.kp, self.ki = float(kp), float(ki)
         self.trim_sign = [float(v) for v in trim_sign]
         self.max_trim, self.f_max = float(max_trim), float(f_max)
         self.max_step = float(max_step)
         self.deadband = float(deadband)
+        self.i_term_lim = float(i_term_lim) if i_term_lim is not None else float(max_trim)
 
 
 class WristTensionState:
@@ -322,7 +357,7 @@ def wrist_tension_step(p: WristTensionParams,
             e = 0.0
         state.integ[i], state.resid[i], step = _incr_step(
             e, state.integ[i], state.resid[i],
-            p.kp, p.ki, dt, p.max_step, p.max_trim)
+            p.kp, p.ki, dt, p.max_step, p.i_term_lim)
         trim[i] = p.trim_sign[i] * step
     return trim, FORCE_OK
 
