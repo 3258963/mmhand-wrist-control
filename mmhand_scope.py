@@ -2651,7 +2651,7 @@ class ScopeWindow(QMainWindow):
             "三角波：线性往返（录标定数据用，配合慢速）。\n"
             "正弦波：跟随/带宽测试——目标= 限幅×sin(2π·频率×t)，\n"
             "看实际曲线的幅度衰减与相位滞后。峰值速度需求=限幅×2πf，\n"
-            "超过每拍限幅速度（5c/拍×100Hz）会削顶=带宽已到。")
+            "超过每拍限幅速度（20c/拍×100Hz = 2000 c/s）会削顶=带宽已到。")
         sweep_row.addWidget(self.sweep_wave_combo)
         self.sweep_freq = QDoubleSpinBox()
         self.sweep_freq.setRange(0.05, 2.0)
@@ -2712,8 +2712,10 @@ class ScopeWindow(QMainWindow):
             "每拍最大位置增量 counts，**位置模式与力控三模式共用同一个值**：\n"
             "· 位置模式：绝对目标换算成每拍变化 ≤ 此值\n"
             "· 力控/张紧/张力：增量式限速（每拍最多走这么多）\n"
-            "100Hz 下 5 counts/拍 = 500 counts/s。\n"
-            "2026-11-11：默认升到 20（=2000 counts/s，配舵机寄存器 2000 steps/s）。",
+            "100Hz 下 20 counts/拍 = 2000 counts/s。\n"
+            "**限幅×频率 = 舵机 c/s**：20×100 = 2000（配舵机 2000 steps/s）。\n"
+            "改频率必须同步改这里，否则速度翻倍/减半\n"
+            "（2026-11-14 曾试 200Hz/10c，因舵机总线 10ms 时序做不到，已退回）。",
             text="20")
         step_row.addWidget(self.cl_edits["max_step_f"])
         step_hint = QLabel("counts/拍（100Hz）")
@@ -2820,11 +2822,13 @@ class ScopeWindow(QMainWindow):
         tight_row.addWidget(self.cl_edits["t_tgt"])
         tight_row.addWidget(QLabel("Kp_t"))
         self.cl_edits["kp_t"] = self._cl_edit(
-            "张紧P增益 counts/N", text="50")
+            "张紧P增益 counts/N。**同样受 S·Kp<2 约束**：Kp<2/S≈43；"
+            "默认 10（S·Kp=0.46）—— 50 会以 50Hz 抖 1.4N", text="10")
         tight_row.addWidget(self.cl_edits["kp_t"])
         tight_row.addWidget(QLabel("Ki_t"))
         self.cl_edits["ki_t"] = self._cl_edit(
-            "张紧I增益 counts/(N·s)。0=纯P", text="10")
+            "张紧I增益 counts/(N·s)。积分钳制 5 counts（同张力），"
+            "Ti=Kp/Ki=0.5s", text="20")
         tight_row.addWidget(self.cl_edits["ki_t"])
         tight_row.addStretch(1)
         self._cl_tight_row_w.setVisible(False)
@@ -4577,9 +4581,9 @@ class ScopeWindow(QMainWindow):
         # 起点可能刚被刷新 → 参数缓存（含 origin）必须立刻失效，否则首拍仍用旧起点，
         # 会先朝旧位置走几拍（≤5 拍 × max_step）再被拉回来。
         self._cl_param_cache = None
-        self._cl_timer.start(10)  # 100Hz（与 P4 内环 100Hz、队列排空 100Hz 对齐）
+        self._cl_timer.start(10)  # 100Hz（与 P4 内环 100Hz、队列排空对齐；200Hz 受舵机总线 10ms 限制做不到）
         self._apply_run_prio()    # 跑环即降档：主图 3:1、表格/观测台 15Hz
-        self._cl_tick_ts = None  # 首拍 dt 用默认 0.01
+        self._cl_tick_ts = None   # 首拍 dt 用默认 0.01
         if self._cl_mode == "force":
             mode = "力矩控制"
         elif self._cl_mode == "tension":
@@ -4920,7 +4924,7 @@ class ScopeWindow(QMainWindow):
 
         力控模式每拍增量由 `_incr_step(..., max_step)` 限幅；位置模式的输出是
         绝对目标，所以这里换算成"每拍变化 ≤ max_step_f"，两种模式对舵机的
-        实际限制才一致（100Hz 下 5 counts/拍 = 500 counts/s）。
+        实际限制才一致（100Hz 下 20 counts/拍 = 2000 counts/s）。
         """
         if not outs or not self._safety_on():
             return outs
@@ -4931,18 +4935,20 @@ class ScopeWindow(QMainWindow):
             limited[m] = out if prev is None else max(prev - slew, min(prev + slew, int(out)))
         return {m: v for m, v in limited.items() if v != self.targets.get(m)}
 
-    def _tension_i_term_lim(self) -> float:
-        """积分贡献的钳制 [counts]：按 counts 直接给（2026-11-11 用户改口径）。
+    def _tension_i_term_lim(self, max_trim: float) -> float:
+        """积分贡献的钳制 [counts]。
 
-        `TENSION_I_TERM_LIM_COUNTS = 5` ⇒ 力当量 ≈0.23 N、能顶偏 `5/Kp` N
-        （Kp=15 → 0.33 N、Kp=10 → 0.50 N）。
+        2026-11-14：用户要求先关闭（绳子有松绳/紧绳状态，counts 口径的钳制先不启用）
+        → `tension_i_term_lim_counts()` 返回 0 时退回 `max_trim`（≈不限）；
+        此时积分仍被条件积分兜底（`|kp·e+ki·I| ≥ max_step` 就停，实际 ~20 counts）。
         """
         lim = tension_i_term_lim_counts()
-        return lim if lim > 0.0 else 1.0
+        return lim if lim > 0.0 else float(max_trim)
 
     def _tension_params(self):
         """读力控 UI → WristTensionParams | None（张力模式，每缆独立）。"""
         try:
+            mt = self._cl_fval("max_trim", 3000.0, 1.0, 50000.0)
             return WristTensionParams(
                 f_target=(self._cl_fval("f1_tgt", 2.0, 0.0, 50.0),
                           self._cl_fval("f2_tgt", 2.0, 0.0, 50.0),
@@ -4951,10 +4957,10 @@ class ScopeWindow(QMainWindow):
                 ki=self._cl_fval("ki_f", 20.0, 0.0, 10000.0),
                 max_step=self._cl_fval("max_step_f", 20.0, 0.1, 2000.0),
                 trim_sign=self._force_trim_sign(),
-                max_trim=self._cl_fval("max_trim", 3000.0, 1.0, 50000.0),
+                max_trim=mt,
                 f_max=self._force_fmax(),
                 deadband=0.05,
-                i_term_lim=self._tension_i_term_lim())
+                i_term_lim=self._tension_i_term_lim(mt))
         except (ValueError, KeyError):
             return None
 
@@ -4999,17 +5005,19 @@ class ScopeWindow(QMainWindow):
                     "（fmax/max(n̂)，再高会有缆超 fmax）", log=False)
             return None
         try:
+            mt = self._cl_fval("max_trim", 3000.0, 1.0, 50000.0)
             return WristTightParams(
                 t_target=t_tgt,
-                kp=self._cl_fval("kp_t", 50.0, 0.0, 10000.0),
-                ki=self._cl_fval("ki_t", 10.0, 0.0, 10000.0),
+                kp=self._cl_fval("kp_t", 10.0, 0.0, 10000.0),
+                ki=self._cl_fval("ki_t", 20.0, 0.0, 10000.0),
                 trim_sign=self._force_trim_sign(),
-                max_trim=self._cl_fval("max_trim", 3000.0, 1.0, 50000.0),
+                max_trim=mt,
                 f_max=fmax_eff,
                 deadband=0.05,
                 null_dir=nd,
                 max_step=self._cl_fval("max_step_f", 20.0, 0.1, 2000.0),
-                f_min=fmin_eff)
+                f_min=fmin_eff,
+                i_term_lim=self._tension_i_term_lim(mt))
         except (ValueError, KeyError):
             return None
 

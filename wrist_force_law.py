@@ -56,9 +56,12 @@ STALE_MS = 300.0
 # 用户给的等效刚度（电机走 1mm 读 Δf）：K = 5.5 N/mm。
 # 卷筒 r = 6/5.5/5.5 mm → k = 108650/118527/118527 counts/m（见 wrist_control_law）。
 ROPE_STIFFNESS_N_PER_MM = 5.5
-# 积分贡献的钳制（counts，2026-11-11 用户改为 counts 口径）：|K_i·∫e| ≤ 5 counts。
-# 换算参考：1 count = 0.0464 N(C2/C3) / 0.0506 N(C1) → 5 counts ≈ 0.23 N 力当量；
-# 它能顶偏的静差 = 5/Kp（Kp=15 时 0.33 N、Kp=10 时 0.5 N）。
+# 积分贡献的钳制（counts）。
+# 2026-11-14：用户要求**先关闭**——绳子有"松绳/紧绳"两种状态，同一个 count 在两种状态下
+# 含义不同，counts 口径的钳制先不启用；后面按需要再打开（改 ENABLED 即可）。
+# 关闭时调用方退回 `max_trim`（≈不限），此时积分仍被**条件积分**兜底：
+# `|kp·e + ki·I| ≥ max_step` 就不再累加 ⇒ 实际仍封顶在 ~max_step（20 counts ≈0.93 N）。
+TENSION_I_TERM_LIM_ENABLED = False
 TENSION_I_TERM_LIM_COUNTS = 5.0
 
 
@@ -68,11 +71,12 @@ def tension_counts_per_n(k_i: float) -> float:
 
 
 def tension_i_term_lim_counts(*_ignored) -> float:
-    """积分贡献的钳制值（counts）——直接按 counts 给，不再经牛顿换算。
+    """积分贡献的钳制值（counts）。
 
+    `ENABLED=False` 时返回 0 → 调用方退回 `max_trim`（等于不钳，靠条件积分兜底）。
     保留 `*_ignored` 只为兼容旧调用点（曾传 k_list / kp）。
     """
-    return TENSION_I_TERM_LIM_COUNTS
+    return TENSION_I_TERM_LIM_COUNTS if TENSION_I_TERM_LIM_ENABLED else 0.0
 
 
 def _finite(v) -> bool:
@@ -381,11 +385,13 @@ class WristTightParams:
     """
 
     __slots__ = ("t_target", "kp", "ki", "trim_sign",
-                 "max_trim", "max_step", "f_max", "f_min", "deadband", "null_dir")
+                 "max_trim", "max_step", "f_max", "f_min", "deadband", "null_dir",
+                 "i_term_lim")
 
     def __init__(self, t_target: float, kp: float, ki: float, trim_sign,
                  max_trim: float, f_max: float, deadband: float, null_dir,
-                 max_step: float = 5.0, f_min: float = 0.0):
+                 max_step: float = 5.0, f_min: float = 0.0,
+                 i_term_lim: float = None):
         if not _finite(t_target) or t_target < 0.0:
             raise ValueError("t_target 需为非负有限数 [N]")
         for name, v in (("kp", kp), ("ki", ki)):
@@ -407,6 +413,8 @@ class WristTightParams:
         if null_dir is not None and (not isinstance(null_dir, (list, tuple))
                                      or len(null_dir) != 3):
             raise ValueError("null_dir 需为长度 3 数组或 None")
+        if i_term_lim is not None and (not _finite(i_term_lim) or i_term_lim <= 0.0):
+            raise ValueError("i_term_lim 需为正数")
         self.t_target = float(t_target)
         self.kp, self.ki = float(kp), float(ki)
         self.trim_sign = [float(v) for v in trim_sign]
@@ -415,6 +423,9 @@ class WristTightParams:
         self.f_min = float(f_min)
         self.deadband = float(deadband)
         self.null_dir = null_dir
+        # 积分贡献钳制 [counts]：缺省 = max_trim（旧行为）；2026-11-14 起由调用方传 5
+        self.i_term_lim = (float(i_term_lim) if i_term_lim is not None
+                           else float(max_trim))
 
 
 class WristTightState:
@@ -453,7 +464,7 @@ def wrist_tight_step(p: WristTightParams,
         e_i = err * n[i]                    # 预紧误差沿零空间分到各缆
         state.integ[i], state.resid[i], step = _incr_step(
             e_i, state.integ[i], state.resid[i],
-            p.kp, p.ki, dt, p.max_step, p.max_trim)
+            p.kp, p.ki, dt, p.max_step, p.i_term_lim)
         if p.f_min > 0.0 and f_n[i] <= p.f_min and step < 0:
             # 方向地板（v8.3）：贴地禁放——step<0=物理放（Δ张力=sign(step)），
             # 与 trim_sign 无关；清三态防积分/残差继续泄。
