@@ -280,3 +280,42 @@ class TestTightFloor:
             WristTightParams(3.0, f_min=30.0, **base)     # ≥f_max 非法
         with pytest.raises(ValueError):
             WristTightParams(3.0, f_min=-0.1, **base)     # 负值非法
+
+
+class TestTightAsPerCableTargets:
+    """2026-11-17 新结构：张紧 = f_d = t*·n̂ + 三缆各自 PID（复用张力环）。
+
+    旧结构（合成 1 个标量 t 再按 n̂ 分配）反馈秩只有 1，n̂_i 小的绳看不见；
+    新结构每缆有绝对目标 → 误差 3 维 → 可观测。
+    """
+
+    def test_fd_preload_and_zero_torque(self):
+        n = _N
+        fd = [5.0 * v for v in n]
+        # 预紧仍为 t*：n̂·f_d = 5
+        assert sum(fd[i] * n[i] for i in range(3)) == pytest.approx(5.0, abs=1e-9)
+        # 目标分布零力矩：R·f_d = 0
+        for row in (_R[0], _R[1]):
+            assert abs(sum(row[i] * fd[i] for i in range(3))) < 1e-12
+
+    def test_c3_error_is_seen(self):
+        """(−18,0)：n̂₃=0.017，C3 比目标紧 2.8 N。
+
+        旧结构：被 n̂₃ 压成 0.045 N < 死区 → 一动不动（盲区）。
+        新结构：这就是 C3 自己的 2.8 N 误差 → 50 拍内纠回 0.1 N 以内。
+        """
+        n = positive_null_direction(math.radians(-18.0), 0.0)
+        assert n is not None
+        assert n[2] < 0.05                       # 该位姿 C3 权重极小
+        fd = [5.0 * v for v in n]
+        p = WristTensionParams(f_target=tuple(fd), kp=10.0, ki=20.0,
+                               trim_sign=(1.0, 1.0, 1.0), max_trim=5000.0,
+                               max_step=20.0, f_max=25.0, deadband=0.05)
+        st = WristTensionState()
+        f = [fd[0], fd[1], fd[2] + 2.8]
+        for _ in range(50):
+            trim, fl = wrist_tension_step(p, st, tuple(f), 0.0, 0.01)
+            assert trim is not None and fl == FORCE_OK
+            f = [max(0.0, f[i] + 0.0464029 * trim[i]) for i in range(3)]
+        assert f[2] == pytest.approx(fd[2], abs=0.1)
+

@@ -5215,8 +5215,22 @@ class ScopeWindow(QMainWindow):
                    "/".join(f"{v:+.0f}" for v in self._force_trim),
                    f"  {tb}" if tb else ""))
 
+    def _tight_f_target(self, p) -> list:
+        """张紧的三缆目标张力 f_d = f_tau0 + t*·n̂（2026-11-17 改结构）。
+
+        为什么改：原来把误差合成 1 个标量 `t` 再按 n̂ 分配，反馈秩只有 1 ——
+        n̂_i 小的那根绳"看不见"（(−18,0) 时 C3 错 2.89 N 才让 t 动 0.05 N）。
+        现在每缆有绝对目标，误差 3 维、秩 3，三根绳各自闭环。
+
+        `f_tau0` 是"力矩偏移"（重力/外载补偿）：
+        **暂缓**（用户 2026-11-17 定），现恒为 0 ⇒ f_d 是"零力矩分布"。
+        后果：腕带载时会被这条分布带得下垂/漂移（物理必然）。
+        以后要接：起环静止时锁 `f_tau0 = P⁻¹[R·f, 0]`（不是模型，只锁一次）。
+        """
+        return [p.t_target * p.null_dir[i] for i in range(3)]
+
     def _cl_tick_tight(self, roll: float, pitch: float) -> None:
-        """100Hz 张紧控制：预紧 f·n̂ 单 PI → Δf=e·n̂ 分配（τ 守恒）→ trim。"""
+        """100Hz 张紧控制（新结构）：t* → f_d = t*·n̂ → 三缆各自 PID（复用张力环）。"""
         p = self._tight_params(roll, pitch)
         if p is None:
             self._stop_closed_loop("张紧控制：参数非法或该位姿 R(q) 无效")
@@ -5225,11 +5239,21 @@ class ScopeWindow(QMainWindow):
         if last is None:
             return
         age_ms = (time.monotonic() - last[0]) * 1000.0
-        trim, flags = wrist_tight_step(p, self._tight_state, last[1],
-                                       age_ms, self._cl_dt)
-        if flags & FORCE_NO_NULL:
-            self._stop_closed_loop("张紧控制：该位姿无全正预紧方向（不可张紧）")
+        f_d = self._tight_f_target(p)
+        # 目标必须先过三缆阈值（可行域检查已保证 t* 区间，这里再兜一道）
+        bad = [i for i in range(3) if not (p.f_min <= f_d[i] <= p.f_max)]
+        if bad:
+            self._stop_closed_loop(
+                "张紧控制：目标越界 "
+                + " ".join(f"C{i + 1}={f_d[i]:.2f}N" for i in bad)
+                + f"（需在 [{p.f_min:g},{p.f_max:g}]）")
             return
+        tp = WristTensionParams(
+            f_target=f_d, kp=p.kp, ki=p.ki, max_step=p.max_step,
+            trim_sign=p.trim_sign, max_trim=p.max_trim, f_max=p.f_max,
+            deadband=p.deadband, i_term_lim=p.i_term_lim)
+        trim, flags = wrist_tension_step(tp, self._tension_state, last[1],
+                                         age_ms, self._cl_dt)
         if flags & FORCE_OVERLOAD:
             self._stop_closed_loop(
                 "张紧控制：张力过载 [" + "/".join(f"{v:.1f}" for v in last[1])
@@ -5245,8 +5269,10 @@ class ScopeWindow(QMainWindow):
             t_meas = sum(last[1][j] * p.null_dir[j] for j in range(3))
             tb = self._t_bound_note()
             self.cl_status.setText(
-                "张紧控  t=%.2f→%.1fN  τ=R·f=[%+.4f,%+.4f]N·m（守恒监视）  trim=[%s]c%s"
-                % (t_meas, p.t_target,
+                "张紧控  f=[%s]→[%s]N  t=%.2f→%.1fN  τ=[%+.4f,%+.4f]N·m  trim=[%s]c%s"
+                % ("/".join(f"{v:.2f}" for v in last[1]),
+                   "/".join(f"{v:.1f}" for v in f_d),
+                   t_meas, p.t_target,
                    tau[0] if tau else 0.0, tau[1] if tau else 0.0,
                    "/".join(f"{v:+.0f}" for v in self._force_trim),
                    f"  {tb}" if tb else ""))
