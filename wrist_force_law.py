@@ -65,11 +65,6 @@ TENSION_I_TERM_LIM_ENABLED = False
 TENSION_I_TERM_LIM_COUNTS = 5.0
 
 
-def tension_counts_per_n(k_i: float) -> float:
-    """该路 1 N 对应多少 counts（k_i 单位 counts/m）＝ k/(K·1000)。仅报数用。"""
-    return abs(k_i) / (ROPE_STIFFNESS_N_PER_MM * 1000.0)
-
-
 def tension_i_term_lim_counts(*_ignored) -> float:
     """积分贡献的钳制值（counts）。
 
@@ -98,6 +93,35 @@ def _sample_prelude(f_n, age_ms: float, dt: float, f_max: float):
     if any(f > f_max for f in f_n):
         return None, FORCE_OVERLOAD
     return f_n, FORCE_OK
+
+
+def _check_common(kp, ki, trim_sign, max_trim, max_step, f_max, deadband,
+                  i_term_lim):
+    """三个 params 类共用的字段校验 + 归一化（2026-11-19 抽出，原来三份逐字重复）。
+
+    返回归一化后的
+    `(kp, ki, trim_sign, max_trim, max_step, f_max, deadband, i_term_lim)`；
+    `i_term_lim=None` 时回退到 `max_trim`（= 不钳制）。
+    各 params 类各自特有的字段（f_target / t_target / f_min / null_dir / tau_d…）
+    仍由各自的 `__init__` 检查。
+    """
+    for name, v in (("kp", kp), ("ki", ki)):
+        if not _finite(v) or v < 0.0:
+            raise ValueError(f"{name} 需为非负有限数")
+    if (not isinstance(trim_sign, (list, tuple)) or len(trim_sign) != 3
+            or any(v not in (-1, 1) for v in trim_sign)):
+        raise ValueError("trim_sign 需为长度 3 的 ±1 数组")
+    for name, v in (("max_trim", max_trim), ("max_step", max_step),
+                    ("f_max", f_max)):
+        if not _finite(v) or v <= 0.0:
+            raise ValueError(f"{name} 需为正数")
+    if not _finite(deadband) or deadband < 0.0:
+        raise ValueError("deadband 需为非负有限数")
+    if i_term_lim is not None and (not _finite(i_term_lim) or i_term_lim <= 0.0):
+        raise ValueError("i_term_lim 需为正数")
+    return (float(kp), float(ki), [float(v) for v in trim_sign],
+            float(max_trim), float(max_step), float(f_max), float(deadband),
+            float(i_term_lim) if i_term_lim is not None else float(max_trim))
 
 
 def _incr_step(e_i: float, integ_i: float, resid_i: float,
@@ -139,62 +163,69 @@ class WristForceV2Params:
     错符号 = 正反馈飞车，必须由台架点动判向后显式给定。
     """
 
-    __slots__ = ("tau_d", "preload_n", "kp", "ki", "trim_gain", "trim_sign",
+    __slots__ = ("tau_d", "preload_n", "kp", "ki",
+                 "kp_inner", "ki_inner", "trim_sign",
                  "max_trim", "max_step", "f_max", "f_min", "deadband",
                  "r_m", "null_dir")
 
     def __init__(self, tau_d, preload_n: float,
-                 kp: float, ki: float, trim_gain: float, trim_sign,
+                 kp: float, ki: float, trim_sign,
                  max_trim: float, f_max: float, f_min: float,
-                 deadband: float, r_m, null_dir, max_step: float = 5.0):
+                 deadband: float, r_m, null_dir, max_step: float = 5.0,
+                 kp_inner: float = None, ki_inner: float = None):
         if (not isinstance(tau_d, (list, tuple)) or len(tau_d) != 2
                 or not all(_finite(v) for v in tau_d)):
             raise ValueError("tau_d 需为长度 2 的有限数组 [N·m]")
-        for name, v in (("kp", kp), ("ki", ki), ("trim_gain", trim_gain)):
+        # 内环增益：P/I 分离（2026-11-17）。旧的 `trim_gain`（P=I 单旋钮，
+        # S·50=2.32 越界）已于 2026-11-19 删除，现在必须显式给 kp_inner/ki_inner。
+        if kp_inner is None or ki_inner is None:
+            raise ValueError("内环增益：kp_inner/ki_inner 必须同时给出")
+        for name, v in (("kp_inner", kp_inner), ("ki_inner", ki_inner)):
             if not _finite(v) or v < 0.0:
                 raise ValueError(f"{name} 需为非负有限数")
-        if (not isinstance(trim_sign, (list, tuple)) or len(trim_sign) != 3
-                or any(v not in (-1, 1) for v in trim_sign)):
-            raise ValueError("trim_sign 需为长度 3 的 ±1 数组"
-                             "（+1=counts增⇒张力增，−1=反向）")
-        if not _finite(max_trim) or max_trim <= 0.0:
-            raise ValueError("max_trim 需为正数")
-        if not _finite(f_max) or f_max <= 0.0:
-            raise ValueError("f_max 需为正数")
+        # 公共字段（trim_sign/max_trim/max_step/f_max/deadband/i_term_lim/kp/ki）
+        (kp, ki, trim_sign, max_trim, max_step, f_max, deadband,
+         i_term_lim) = _check_common(kp, ki, trim_sign, max_trim, max_step,
+                                     f_max, deadband, None)
         if not _finite(f_min) or f_min < 0.0:
             raise ValueError("f_min 需为非负有限数")
-        if not _finite(deadband) or deadband < 0.0:
-            raise ValueError("deadband 需为非负有限数")
         if not _finite(preload_n) or preload_n < 0.0:
             raise ValueError("preload_n 需为非负有限数")
         if f_min >= f_max:
             raise ValueError("需 f_min < f_max")
-        if not _finite(max_step) or max_step <= 0.0:
-            raise ValueError("max_step 需为正数")
         self.tau_d = [float(v) for v in tau_d]
         self.preload_n = float(preload_n)
-        self.kp, self.ki, self.trim_gain = float(kp), float(ki), float(trim_gain)
-        self.trim_sign = [float(v) for v in trim_sign]
-        self.max_trim, self.max_step = float(max_trim), float(max_step)
-        self.f_max, self.f_min = float(f_max), float(f_min)
-        self.deadband = float(deadband)
+        self.kp, self.ki = kp, ki
+        self.kp_inner, self.ki_inner = float(kp_inner), float(ki_inner)
+        self.trim_sign = trim_sign
+        self.max_trim, self.max_step = max_trim, max_step
+        self.f_max, self.f_min = f_max, float(f_min)
+        self.deadband = deadband
         self.r_m = r_m       # 2×3 list，不拷贝（调用方保证一致性）
         self.null_dir = null_dir  # 3 tuple | None
 
 
-class WristForceV2State:
-    """v2 状态：2 轴力矩外环积分 + 3 缆内环增量积分/残差。"""
-    __slots__ = ("integ_tau", "integ_f", "resid")
+class IncrPiState:
+    """增量式 PI 状态：3 缆误差积分 + 步长小数残差（三个力控模式共用）。
+
+    2026-11-19 合并：原先 `WristTensionState` / `WristForceV2State` 是两份
+    结构相同的类（字段名一个叫 integ、一个叫 integ_f），现已统一为一份；
+    旧名保留为别名，现有调用点/测试不需要改。
+    """
+    __slots__ = ("integ", "resid")
 
     def __init__(self) -> None:
-        self.integ_tau = [0.0, 0.0]
-        self.integ_f = [0.0, 0.0, 0.0]
+        self.integ = [0.0, 0.0, 0.0]
         self.resid = [0.0, 0.0, 0.0]
 
     def reset(self) -> None:
-        self.integ_tau = [0.0, 0.0]
-        self.integ_f = [0.0, 0.0, 0.0]
+        self.integ = [0.0, 0.0, 0.0]
         self.resid = [0.0, 0.0, 0.0]
+
+
+# 兼容别名（scope 与测试按这些名字导入）
+WristTensionState = IncrPiState
+WristForceV2State = IncrPiState
 
 
 def wrist_force_v2_step(p: WristForceV2Params,
@@ -224,48 +255,35 @@ def wrist_force_v2_step(p: WristForceV2Params,
     if any(f > p.f_max for f in f_n):
         return None, FORCE_OVERLOAD, math.nan
 
-    # 1) 观测 τ = R·f
+    # 1) 观测 τ = R·f（**只用于状态显示**；2026-11-18 起不再参与控制）
     tau_meas_r = sum(p.r_m[0][i] * f_n[i] for i in range(3))
     tau_meas_p = sum(p.r_m[1][i] * f_n[i] for i in range(3))
 
-    # 2) 力矩 PI → 校正量 u（N·m 域）。
-    #    可达力矩上界 = 张力可用跨度 × 力臂绝对值和：超出它 TDA 也只能
-    #    α 缩，u 钳在这里防积分在不可达域狂灌（windup）。
-    span = p.f_max - p.f_min
-    lim_r = span * sum(abs(p.r_m[0][i]) for i in range(3))
-    lim_p = span * sum(abs(p.r_m[1][i]) for i in range(3))
-    errs = [p.tau_d[0] - tau_meas_r, p.tau_d[1] - tau_meas_p]
-    for j in range(2):
-        if abs(errs[j]) <= p.deadband:
-            errs[j] = 0.0
-    u_r = max(-lim_r, min(lim_r, p.kp * errs[0] + state.integ_tau[0]))
-    u_p = max(-lim_p, min(lim_p, p.kp * errs[1] + state.integ_tau[1]))
+    # 2) 【已移除】力矩 PI 外环。
+    #    旧实现：u = sat(Kp_τ·(τ_d − R·f) + ∫, ±lim)，再把 τ_d+u 送 TDA。
+    #    实测（τ_d=0.1、预紧15）：外环关掉反而更好
+    #        Kp=0,Ki=0 → 稳态 0.1012，摆动 0.0038，α≡1
+    #        Kp=20,Ki=10 → 稳态 0.1147，摆动 0.0751，51% 的拍 α<1
+    #    原因：TDA 算 f_d 精确、内环跟得上 → R·f 自然≈τ_d，外环只是在
+    #    "内环还没跟上"的窗口里过度纠正 → 振荡。故改为**纯前馈**。
+    #    参数 kp/ki/deadband 保留（兼容旧调用/布局），但**不再使用**。
 
-    # 3) TDA 分配（τ_d + u 校正后 → f_d 三缆目标张力）
+    # 3) TDA 分配（纯前馈：τ_d 直接进 TDA → 三缆目标张力 f_d）
     f_d, tda_flags, alpha = tda_solver(p.r_m, p.null_dir,
-                                        p.tau_d[0] + u_r, p.tau_d[1] + u_p,
+                                        p.tau_d[0], p.tau_d[1],
                                         p.preload_n, p.f_min, p.f_max)
     if f_d is None:
         return None, tda_flags | FORCE_TDA_INFEASIBLE, math.nan
 
-    #    抗饱和：α<1 = 目标力矩不可达，本拍冻结积分（条件积分法）。
-    #    否则误差持续存在会把 integ 灌满限幅，解除饱和后猛烈回冲。
-    if alpha >= 1.0 - 1e-9:
-        state.integ_tau[0] = max(-lim_r, min(lim_r,
-                                state.integ_tau[0] + p.ki * errs[0] * dt))
-        state.integ_tau[1] = max(-lim_p, min(lim_p,
-                                state.integ_tau[1] + p.ki * errs[1] * dt))
-
     # 4) 张力误差 → 增量步长（内环执行，与张力/张紧模式同一增量基元）。
-    #    trim_sign 在出口统一翻方向；内环 P=I=trim_gain（单旋钮，沿袭原设计）。
-    #    外环保持力矩域位置式（其输出 u 是给 TDA 的代数校正量，不是位置指令，
-    #    不经过"累加到实测位置"的执行接口——增量式的定义域在位置出口层）。
+    #    trim_sign 在出口统一翻方向；内环 P/I 分离（2026-11-17，旧 trim_gain
+    #    是 P=I 单旋钮 → S·50=2.32 越界，实测 50Hz 极限环 + 稳态跟不到目标）。
     trim = [0.0, 0.0, 0.0]
     for i in range(3):
         f_err = f_d[i] - f_n[i]
-        state.integ_f[i], state.resid[i], step = _incr_step(
-            f_err, state.integ_f[i], state.resid[i],
-            p.trim_gain, p.trim_gain, dt, p.max_step, p.max_trim)
+        state.integ[i], state.resid[i], step = _incr_step(
+            f_err, state.integ[i], state.resid[i],
+            p.kp_inner, p.ki_inner, dt, p.max_step, p.max_trim)
         trim[i] = p.trim_sign[i] * step
     return trim, FORCE_OK, alpha
 
@@ -293,42 +311,19 @@ class WristTensionParams:
         if (not isinstance(f_target, (list, tuple)) or len(f_target) != 3
                 or not all(_finite(v) and v >= 0.0 for v in f_target)):
             raise ValueError("f_target 需为长度 3 的非负有限数组 [N]")
-        for name, v in (("kp", kp), ("ki", ki)):
-            if not _finite(v) or v < 0.0:
-                raise ValueError(f"{name} 需为非负有限数")
-        if (not isinstance(trim_sign, (list, tuple)) or len(trim_sign) != 3
-                or any(v not in (-1, 1) for v in trim_sign)):
-            raise ValueError("trim_sign 需为长度 3 的 ±1 数组")
-        if not _finite(max_trim) or max_trim <= 0.0:
-            raise ValueError("max_trim 需为正数")
-        if not _finite(max_step) or max_step <= 0.0:
-            raise ValueError("max_step 需为正数")
-        if not _finite(f_max) or f_max <= 0.0:
-            raise ValueError("f_max 需为正数")
-        if not _finite(deadband) or deadband < 0.0:
-            raise ValueError("deadband 需为非负有限数")
-        if i_term_lim is not None and (not _finite(i_term_lim) or i_term_lim <= 0.0):
-            raise ValueError("i_term_lim 需为正数")
+        (kp, ki, trim_sign, max_trim, max_step, f_max, deadband,
+         i_term_lim) = _check_common(kp, ki, trim_sign, max_trim, max_step,
+                                     f_max, deadband, i_term_lim)
         self.f_target = [float(v) for v in f_target]
-        self.kp, self.ki = float(kp), float(ki)
-        self.trim_sign = [float(v) for v in trim_sign]
-        self.max_trim, self.f_max = float(max_trim), float(f_max)
-        self.max_step = float(max_step)
-        self.deadband = float(deadband)
-        self.i_term_lim = float(i_term_lim) if i_term_lim is not None else float(max_trim)
+        self.kp, self.ki = kp, ki
+        self.trim_sign = trim_sign
+        self.max_trim, self.f_max = max_trim, f_max
+        self.max_step = max_step
+        self.deadband = deadband
+        self.i_term_lim = i_term_lim
 
 
-class WristTensionState:
-    """张力模式状态：误差积分（N·s）+ 步长小数残差（相对增量输出）。"""
-    __slots__ = ("integ", "resid")
-
-    def __init__(self) -> None:
-        self.integ = [0.0, 0.0, 0.0]
-        self.resid = [0.0, 0.0, 0.0]
-
-    def reset(self) -> None:
-        self.integ = [0.0, 0.0, 0.0]
-        self.resid = [0.0, 0.0, 0.0]
+# 张力环状态类见上面的 `IncrPiState`（三个力控模式共用）。
 
 
 def wrist_tension_step(p: WristTensionParams,
@@ -394,82 +389,30 @@ class WristTightParams:
                  i_term_lim: float = None):
         if not _finite(t_target) or t_target < 0.0:
             raise ValueError("t_target 需为非负有限数 [N]")
-        for name, v in (("kp", kp), ("ki", ki)):
-            if not _finite(v) or v < 0.0:
-                raise ValueError("kp/ki 需为非负有限数")
-        if (not isinstance(trim_sign, (list, tuple)) or len(trim_sign) != 3
-                or any(v not in (-1, 1) for v in trim_sign)):
-            raise ValueError("trim_sign 需为长度 3 的 ±1 数组")
-        if not _finite(max_trim) or max_trim <= 0.0:
-            raise ValueError("max_trim 需为正数")
-        if not _finite(max_step) or max_step <= 0.0:
-            raise ValueError("max_step 需为正数")
-        if not _finite(f_max) or f_max <= 0.0:
-            raise ValueError("f_max 需为正数")
+        (kp, ki, trim_sign, max_trim, max_step, f_max, deadband,
+         i_term_lim) = _check_common(kp, ki, trim_sign, max_trim, max_step,
+                                     f_max, deadband, i_term_lim)
         if not _finite(f_min) or f_min < 0.0 or f_min >= f_max:
             raise ValueError("f_min 需为 0（禁用）或 [0, f_max)")
-        if not _finite(deadband) or deadband < 0.0:
-            raise ValueError("deadband 需为非负有限数")
         if null_dir is not None and (not isinstance(null_dir, (list, tuple))
                                      or len(null_dir) != 3):
             raise ValueError("null_dir 需为长度 3 数组或 None")
-        if i_term_lim is not None and (not _finite(i_term_lim) or i_term_lim <= 0.0):
-            raise ValueError("i_term_lim 需为正数")
         self.t_target = float(t_target)
-        self.kp, self.ki = float(kp), float(ki)
-        self.trim_sign = [float(v) for v in trim_sign]
-        self.max_trim, self.max_step = float(max_trim), float(max_step)
-        self.f_max = float(f_max)
+        self.kp, self.ki = kp, ki
+        self.trim_sign = trim_sign
+        self.max_trim, self.max_step = max_trim, max_step
+        self.f_max = f_max
         self.f_min = float(f_min)
-        self.deadband = float(deadband)
+        self.deadband = deadband
         self.null_dir = null_dir
-        # 积分贡献钳制 [counts]：缺省 = max_trim（旧行为）；2026-11-14 起由调用方传 5
-        self.i_term_lim = (float(i_term_lim) if i_term_lim is not None
-                           else float(max_trim))
+        self.i_term_lim = i_term_lim
 
 
-class WristTightState:
-    """张紧模式状态：误差积分 + 步长小数残差（增量式）。"""
-    __slots__ = ("integ", "resid")
+# ============================================================
+# 张紧模式：2026-11-19 起**实现在 mmhand_scope._cl_tick_tight**
+#   f_d = t*·n̂ → 复用 wrist_tension_step（每缆绝对目标）
+# 旧的单标量 PI（wrist_tight_step + WristTightState + 方向地板）已删除：
+#   反馈秩只有 1，n̂_i 小的缆不可观测；新结构秩 3。
+# 这里只保留 `WristTightParams` 作为**参数容器**（scope 仍在用）。
+# ============================================================
 
-    def __init__(self) -> None:
-        self.integ = [0.0, 0.0, 0.0]
-        self.resid = [0.0, 0.0, 0.0]
-
-    def reset(self) -> None:
-        self.integ = [0.0, 0.0, 0.0]
-        self.resid = [0.0, 0.0, 0.0]
-
-
-def wrist_tight_step(p: WristTightParams,
-                     state: WristTightState,
-                     f_n, age_ms: float, dt: float) -> tuple:
-    """张紧模式一拍：t_meas=f·n̂ → 增量式 PI → 步长∝n̂ 分配（τ 守恒）。
-
-    Returns:
-        (trim|None, flags)；null_dir 缺失 → (None, FORCE_NO_NULL)
-    """
-    if p.null_dir is None:
-        return None, FORCE_NO_NULL
-    f_n, flags = _sample_prelude(f_n, age_ms, dt, p.f_max)
-    if f_n is None:
-        return None, flags
-    n = p.null_dir
-    t_meas = sum(f_n[i] * n[i] for i in range(3))
-    err = p.t_target - t_meas
-    if abs(err) <= p.deadband:
-        err = 0.0
-    trim = [0.0, 0.0, 0.0]
-    for i in range(3):
-        e_i = err * n[i]                    # 预紧误差沿零空间分到各缆
-        state.integ[i], state.resid[i], step = _incr_step(
-            e_i, state.integ[i], state.resid[i],
-            p.kp, p.ki, dt, p.max_step, p.i_term_lim)
-        if p.f_min > 0.0 and f_n[i] <= p.f_min and step < 0:
-            # 方向地板（v8.3）：贴地禁放——step<0=物理放（Δ张力=sign(step)），
-            # 与 trim_sign 无关；清三态防积分/残差继续泄。
-            step = 0.0
-            state.integ[i] = 0.0
-            state.resid[i] = 0.0
-        trim[i] = p.trim_sign[i] * step
-    return trim, FORCE_OK

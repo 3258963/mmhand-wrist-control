@@ -63,6 +63,65 @@ def _mat_vec(m, v):
     return [m[i][0]*v[0] + m[i][1]*v[1] + m[i][2]*v[2] for i in range(3)]
 
 
+def preload_window(r_m, null_dir, tau_roll, tau_pitch, f_min, f_max):
+    """给定目标力矩 τ，求预紧 `p` 的可行区间（**带 τ 项的通用式**）。
+
+    数学：`f_i(τ, p) = c_i·τ + p·n̂_i`，其中 `c = P⁻¹·[e_axis]`。
+    对每根缆解 `f_min ≤ f_i ≤ f_max`，得到 p 的上下界，取交集。
+
+    与旧公式的关系：
+        τ = 0 时退化为  `f_min/max(n̂) … f_max/min(n̂)`？ ——不，见下：
+        τ = 0 时 `f_i = p·n̂_i`，所以是 `p ≥ f_min/max? ` 逐缆约束
+        ⇒ `p_min = max_i (f_min/n̂_i) = f_min/min(n̂)`
+        ⇒ `p_max = min_i (f_max/n̂_i) = f_max/max(n̂)`
+        与代码旧实现 `fmin/min(n̂) … fmax/max(n̂)` **完全一致**。
+
+    Args:
+        r_m: 2×3 力臂矩阵（`wrist_eval().r_m`）
+        null_dir: 3 元 n̂（`positive_null_direction` 的返回值），必须全正
+        tau_roll, tau_pitch: 目标关节力矩 [N·m]
+        f_min, f_max: 每缆张力上下限 [N]
+
+    Returns:
+        (p_min, p_max) | None
+        None 表示该位姿/该力矩下**无解**（n̂ 缺失、P 奇异、或区间为空）。
+    """
+    if null_dir is None or len(null_dir) != 3:
+        return None
+    if any((not math.isfinite(v)) or v <= 0.0 for v in null_dir):
+        return None
+    P = [
+        [r_m[0][0], r_m[0][1], r_m[0][2]],
+        [r_m[1][0], r_m[1][1], r_m[1][2]],
+        [null_dir[0], null_dir[1], null_dir[2]],
+    ]
+    P_inv = _inv3(P)
+    if P_inv is None:
+        return None
+    # c = P⁻¹·[τ_r, τ_p, 0]（τ 的那一半；另一半 p·n̂ 单独算）
+    c = _mat_vec(P_inv, [tau_roll, tau_pitch, 0.0])
+    p_lo, p_hi = -math.inf, math.inf
+    for i in range(3):
+        n_i = null_dir[i]
+        ci = c[i]
+        if n_i > 1e-12:
+            lo = (f_min - ci) / n_i
+            hi = (f_max - ci) / n_i
+        elif n_i < -1e-12:
+            lo = (f_max - ci) / n_i
+            hi = (f_min - ci) / n_i
+        else:
+            # n̂_i ≈ 0：该缆不受 p 影响，只能靠 τ 本身满足边界
+            if not (f_min - 1e-9 <= ci <= f_max + 1e-9):
+                return None
+            continue
+        p_lo = max(p_lo, lo)
+        p_hi = min(p_hi, hi)
+    if (not math.isfinite(p_lo)) or (not math.isfinite(p_hi)) or p_lo > p_hi:
+        return None
+    return p_lo, p_hi
+
+
 def tda_solve(r_m, null_dir, tau_roll, tau_pitch, preload_t,
               f_min, f_max):
     """TDA 主入口。

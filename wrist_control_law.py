@@ -188,6 +188,15 @@ COUNTS_PER_REV = 4096.0
 SPOOL_RADIUS_M = (0.006, 0.0055, 0.0055)          # C1 / C2 / C3，米
 K_NOMINAL_ABS = tuple(COUNTS_PER_REV / (2.0 * math.pi * r) for r in SPOOL_RADIUS_M)
 
+# 「UI/硬件角」与「模型角」的逐路符号（2026-11-19 引入）。
+#   模型角 = 本常量 × UI 角
+#   +1 = 两者正方向一致；-1 = 相反（模型在该轴上是镜像的）
+# **本模块是纯模型函数**，不自己用这个常量；换算由调用方做
+# （mmhand_scope._cl_tick 传给 wrist_control_step_pid 的 roll 参数，
+#   以及 _force_geo 求 R/n̂ 时）。这样单元测试仍是模型口径。
+# 台架结论（2026-11-19）：位置环 roll 目标 −2° 却朝 +2° 走 → ROLL 取 −1；PITCH 已验证正确，保持 +1。
+MODEL_AXIS_SIGN = (-1.0, 1.0)         # (ROLL, PITCH)
+
 
 def parse_wrist_calib(data):
     """解析 wrist_calib.json 内容 -> (WristCalib, None) | (None, 原因)。
@@ -313,6 +322,8 @@ def wrist_control_step_pid(p: WristControlParams,
         flags |= FLAG_FEEDBACK_CLAMPED
 
     # deg → rad 仅此一处（目标/反馈/参考一并转换，θ_model = θ_rel + δ）。
+    # 注意：本函数收的是**模型角**；UI/硬件角 → 模型角的换算在调用方
+    # （mmhand_scope 用它自己的 MODEL_AXIS_SIGN）完成，这样本模块仍是纯模型函数。
     t_r = math.radians(rt + dr)
     t_p = math.radians(pt + dp)
     fb_r = math.radians(rf + dr)
