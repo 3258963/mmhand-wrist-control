@@ -35,21 +35,14 @@ from matplotlib.patches import Rectangle  # noqa: E402
 from wrist_control_law import K_NOMINAL_ABS  # noqa: E402
 from wrist_model import PITCH, ROLL, positive_null_direction, wrist_eval  # noqa: E402
 
-# counts/m，逐路（C1 电机反向安装，取负；半径 6/5.5/5.5mm，见 wrist_control_law）
-K = [-K_NOMINAL_ABS[0], K_NOMINAL_ABS[1], K_NOMINAL_ABS[2]]
+# counts/m，逐路；2026-11-19 台架定案：三路 k 均为负（+100c 点动 → 张力全升=收绳）。
+# 旧的 "C1 取负、C2/C3 取正" 是错的（位置环 J 在那两路上会反向）。
+K = [-K_NOMINAL_ABS[0], -K_NOMINAL_ABS[1], -K_NOMINAL_ABS[2]]
 KP = 0.6
 
-# 与仓里其它绘图脚本一致的中文/负号设置
-plt.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei", "DejaVu Sans"]
-plt.rcParams["axes.unicode_minus"] = False
-
-INK = "#24303f"
-MUTED = "#6b7785"
-GRID = "#dfe4ea"
-BLUE = "#3b82f6"
-RED = "#ef4444"
-GREEN = "#10b981"
-AMBER = "#f59e0b"
+# 中文字体/负号由 tools._figbase 统一设置（2026-11-19 抽出）
+from tools._figbase import (AMBER, BLUE, GRID, GREEN, INK, MUTED,  # noqa: E402
+                            RED, plt)
 
 
 def l_m(rd, pd):

@@ -252,7 +252,7 @@ def test_recheck_does_not_touch_status_line(win):
     _pose_env(win)
     _fresh_tension(win)
     win._cl_mode = "tight"
-    win.cl_edits["t_tgt"].setText("150")     # 超可行上界 → 旧版此处在写状态行
+    win.cl_edits["preload"].setText("150")   # 超可行上界（合并后 t* = 「预紧N」）
     win._start_closed_loop()
     assert not win.cl_enabled
     dlg = win._reject_dlg
@@ -261,7 +261,7 @@ def test_recheck_does_not_touch_status_line(win):
     dlg._recheck_tick()
     dlg._recheck_tick()
     assert win.ctrl_status.text() == before   # 状态行纹丝不动
-    win.cl_edits["t_tgt"].setText("5.0")
+    win.cl_edits["preload"].setText("5.0")
 
 
 def test_start_cl_reject_leaves_no_side_effects(win):

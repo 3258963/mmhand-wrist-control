@@ -279,7 +279,7 @@ class TestButtonsGating:
         win.angle_baseline = {
             16: scope.ScopeWindow._axis_deg(16, 8000.0),
             17: scope.ScopeWindow._axis_deg(17, 9000.0)}
-        win.cl_edits["t_tgt"].setText("0.5")     # < fmin/min(n̂)≈1.89
+        win.cl_edits["preload"].setText("0.5")   # < fmin/min(n̂)≈1.89（合并后 t* = 预紧N）
         win.cl_edits["f_min"].setText("0.5")
         win.cl_edits["fmax_f"].setText("30")
         win._on_tighten_rope()
@@ -295,10 +295,11 @@ class TestButtonsGating:
         win.angle_baseline = {
             16: scope.ScopeWindow._axis_deg(16, 8000.0),
             17: scope.ScopeWindow._axis_deg(17, 9000.0)}
-        win.cl_edits["t_tgt"].setText("5.0")
+        # 合并后 t* = 「预紧N」：给 7.7 但 UI t_max=5 夹到 5 → 事务应把它改写成 5
+        win.cl_edits["preload"].setText("7.7")
+        win.cl_edits["t_max"].setText("5")
         win.cl_edits["f_min"].setText("0.5")
         win.cl_edits["fmax_f"].setText("30")
-        win.cl_edits["preload"].setText("7.7")     # 事务应改写为 t_use=5
         before_mode = win._cl_mode
         # 使 _start_closed_loop 成功：armed+磁编+起点齐全
         win._motor_origin = {27: 1000, 28: 2000, 29: 3000}
@@ -320,14 +321,14 @@ class TestButtonsGating:
         win.angle_baseline = {
             16: scope.ScopeWindow._axis_deg(16, 8000.0),
             17: scope.ScopeWindow._axis_deg(17, 9000.0)}
-        win.cl_edits["t_tgt"].setText("5.0")
+        win.cl_edits["t_max"].setText("5")        # 合并后：t_use 由「预紧N」+ t_max 决定
         win.cl_edits["f_min"].setText("0.5")
         win.cl_edits["fmax_f"].setText("30")
         win._cl_mode = "position"
         win.cl_mode_combo.blockSignals(True)
         win.cl_mode_combo.setCurrentIndex(0)
         win.cl_mode_combo.blockSignals(False)
-        win.cl_edits["preload"].setText("9.9")
+        win.cl_edits["preload"].setText("9.9")    # 原值；事务会改成 t_use=5，失败须回滚到 9.9
         # 确定性失败注入：打桩 _start_closed_loop 抛 RuntimeError
         orig = win._start_closed_loop
         def _boom():

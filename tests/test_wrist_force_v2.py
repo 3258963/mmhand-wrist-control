@@ -7,7 +7,7 @@ from wrist_force_law import (FORCE_OK, FORCE_OVERLOAD, FORCE_STALE,
                               WristForceV2Params, WristForceV2State,
                               wrist_force_v2_step)
 from wrist_tda import (TDA_OK, TDA_ALPHA_CLAMPED, TDA_INFEASIBLE,
-                        TDA_NO_NULL, tda_solve)
+                        TDA_NO_NULL, tda_solve, preload_window)
 from wrist_model import wrist_eval, positive_null_direction
 
 # 零位 R 和零空间（预计算一次）
@@ -18,7 +18,8 @@ assert _N is not None
 
 BASE = dict(
     tau_d=(0.0, 0.0), preload_n=5.0,
-    kp=100.0, ki=10.0, trim_gain=50.0, trim_sign=(1.0, 1.0, 1.0),
+    kp=100.0, ki=10.0, kp_inner=50.0, ki_inner=50.0,
+    trim_sign=(1.0, 1.0, 1.0),
     max_trim=3000.0, f_max=30.0, f_min=0.5,
     deadband=0.01, r_m=_R, null_dir=_N,
 )
@@ -105,32 +106,38 @@ class TestForceV2:
         for i in range(3):
             assert t_neg[i] == pytest.approx((-1 if i in (0, 2) else 1) * t_pos[i])
 
-    def test_integ_bounded_and_frozen_when_scaled(self):
-        """不可达大力矩（α<1）：integ_tau 有界（±可达力矩）且被冻结。"""
-        p = WristForceV2Params(**{**BASE, 'tau_d': (5.0, 5.0), 'ki': 100.0})
+    def test_alpha_scaled_when_torque_unreachable(self):
+        """不可达大力矩（τ_d 远超能力）：TDA 打折，输出仍是界内的张力目标。
+
+        （2026-11-19：外环删除后不再有 `integ_tau`，这里改为验证"打折后仍合法"。）
+        """
+        p = WristForceV2Params(**{**BASE, 'tau_d': (5.0, 5.0)})
         st = WristForceV2State()
         f = [3.0, 3.0, 3.0]
         for _ in range(500):
-            trim, flags, _alpha = wrist_force_v2_step(p, st, f, 10.0, 0.01, tda_solve)
+            trim, flags, alpha = wrist_force_v2_step(p, st, f, 10.0, 0.01, tda_solve)
             assert trim is not None and flags == FORCE_OK
-        span = p.f_max - p.f_min
-        lim = [span * sum(abs(v) for v in p.r_m[j]) for j in range(2)]
-        for j in range(2):
-            assert abs(st.integ_tau[j]) <= lim[j] + 1e-9
-        snap = list(st.integ_tau)
-        for _ in range(100):
-            wrist_force_v2_step(p, st, f, 10.0, 0.01, tda_solve)
-        assert st.integ_tau == snap          # 冻结：分毫不动
+            assert alpha < 1.0                      # 目标不可达 → 打折
+        assert not hasattr(st, "integ_tau")         # 外环积分器已彻底移除
 
-    def test_integ_integrates_when_feasible(self):
-        """可达小力矩（α=1，预紧 10N 留足下探余量）：积分正常累积。"""
-        p = WristForceV2Params(**{**BASE, 'tau_d': (0.05, 0.0),
-                                   'preload_n': 10.0, 'ki': 50.0, 'kp': 0.0})
-        st = WristForceV2State()
+    def test_outer_pi_removed(self):
+        """2026-11-18：力矩 PI 外环已移除，改为纯前馈。
+
+        旧断言是"α=1 时 integ_tau 会累积"；现在外环不存在（连字段都删了），改为断言：
+        ① 没有 `integ_tau`；
+        ② 输出与 `kp`/`ki` 无关（TDA 直接吃 τ_d，不再加 u）。
+        """
         f = [3.0, 3.0, 3.0]
-        integ0 = list(st.integ_tau)
-        wrist_force_v2_step(p, st, f, 10.0, 0.01, tda_solve)
-        assert any(abs(st.integ_tau[j] - integ0[j]) > 1e-9 for j in range(2))
+        outs = []
+        for kp, ki in ((0.0, 0.0), (100.0, 50.0)):
+            p = WristForceV2Params(**{**BASE, 'tau_d': (0.05, 0.0),
+                                      'preload_n': 10.0, 'kp': kp, 'ki': ki})
+            st = WristForceV2State()
+            trim, fl, _a = wrist_force_v2_step(p, st, f, 10.0, 0.01, tda_solve)
+            assert trim is not None and fl == FORCE_OK
+            assert not hasattr(st, "integ_tau")
+            outs.append(list(trim))
+        assert outs[0] == outs[1]                  # kp/ki 不再影响任何输出
 
     def test_zero_torque_hold(self):
         """零力矩+预紧 → trim 应趋稳（张力在目标附近）。"""
@@ -157,10 +164,10 @@ class TestForceV2:
         st = WristForceV2State()
         f, _, _ = tda_solve(_R, _N, 0, 0, 5.0, 0.5, 30.0)
         wrist_force_v2_step(p, st, f, 10.0, 0.01, tda_solve)  # 预热
-        integ_before = list(st.integ_tau)
+        integ_before = list(st.integ)
         trim, flags, _alpha = wrist_force_v2_step(p, st, f, 350.0, 0.01, tda_solve)
         assert trim is None and flags == FORCE_STALE
-        assert st.integ_tau == integ_before
+        assert st.integ == integ_before          # 过期 → 内环积分也不动
 
     def test_overload_stops(self):
         p = WristForceV2Params(**{**BASE, 'f_max': 5.0})
@@ -229,3 +236,77 @@ class TestForceV2:
                                           tda_solve)
         assert trim is None
         assert flags & FORCE_TDA_INFEASIBLE
+
+
+class TestInnerGainSplit:
+    """2026-11-17：内环 P/I 分离（2026-11-19 起 `trim_gain` 彻底删除）。
+
+    旧设计 `trim_gain` 同时当 P 和 I（P=I=50）⇒ S·Kp = 2.32 > 2，
+    实测力矩模式 50 Hz 极限环、稳态跟不上目标。改成 kp_inner/ki_inner 后
+    与张力环共用同一组增益（S·Kp = 0.70）。
+    """
+
+    def test_gains_taken_as_given(self):
+        p = WristForceV2Params(**{**BASE, 'kp_inner': 15.0, 'ki_inner': 20.0})
+        assert (p.kp_inner, p.ki_inner) == (15.0, 20.0)
+
+    def test_requires_both_inner_gains(self):
+        with pytest.raises(ValueError):
+            WristForceV2Params(**{**BASE, 'kp_inner': None})
+        with pytest.raises(ValueError):
+            WristForceV2Params(**{**BASE, 'ki_inner': None})
+        with pytest.raises(ValueError):
+            WristForceV2Params(**{**BASE, 'kp_inner': None, 'ki_inner': None})
+
+    def test_split_gains_track_torque_target(self):
+        """S·Kp=0.70：600 拍后 τ 稳定跟住 τ_d，抖动 < 0.005 N·m。"""
+        p = WristForceV2Params(**{**BASE, 'tau_d': (0.01, 0.03),
+                                  'kp_inner': 15.0, 'ki_inner': 20.0,
+                                  'max_step': 20.0})
+        st = WristForceV2State()
+        f = [5.0 * v for v in _N]
+        hist = []
+        for _ in range(600):
+            trim, fl, _a = wrist_force_v2_step(p, st, f, 0.0, 0.01, tda_solve)
+            assert trim is not None and fl == FORCE_OK
+            f = [max(0.0, f[i] + 0.0464029 * trim[i]) for i in range(3)]
+            hist.append((sum(_R[0][i] * f[i] for i in range(3)),
+                         sum(_R[1][i] * f[i] for i in range(3))))
+        tail = hist[int(len(hist) * 0.6):]
+        rip = (max(v[0] for v in tail) - min(v[0] for v in tail),
+               max(v[1] for v in tail) - min(v[1] for v in tail))
+        assert rip[0] < 0.005 and rip[1] < 0.005, f"ripple too large: {rip}"
+        assert tail[-1][0] == pytest.approx(0.01, abs=0.003)
+        assert tail[-1][1] == pytest.approx(0.03, abs=0.003)
+
+
+class TestPreloadWindow:
+    """2026-11-18 A2：可行域改成带 τ 项的通用式（wrist_tda.preload_window）。
+
+    旧实现 `t_min = f_min/min(n̂)`、`t_max = f_max/max(n̂)` 只在 τ=0 时成立；
+    接重力补偿后会误判。新函数在 τ=0 时应与旧式**逐位一致**。
+    """
+
+    def test_tau_zero_equals_closed_form(self):
+        for n in (_N,):
+            w = preload_window(_R, n, 0.0, 0.0, 0.5, 30.0)
+            assert w is not None
+            assert w[0] == pytest.approx(0.5 / min(n), abs=1e-9)
+            assert w[1] == pytest.approx(30.0 / max(n), abs=1e-9)
+
+    def test_window_shifts_up_with_torque(self):
+        """正 pitch 力矩会吃掉 C1 的余量 → 预紧下界抬高。"""
+        w0 = preload_window(_R, _N, 0.0, 0.0, 0.5, 25.0)
+        w1 = preload_window(_R, _N, 0.0, 0.10, 0.5, 25.0)
+        assert w0 is not None and w1 is not None
+        assert w1[0] > w0[0]                 # 下界升（0.1 N·m → 约 7.94 N）
+        assert w1[0] == pytest.approx(7.94, abs=0.05)
+
+    def test_none_when_torque_unreachable(self):
+        """力矩远超能力 → 区间为空 → None。"""
+        assert preload_window(_R, _N, 0.0, 0.5, 0.5, 25.0) is None
+
+    def test_none_without_null(self):
+        assert preload_window(_R, None, 0.0, 0.0, 0.5, 25.0) is None
+        assert preload_window(_R, (0.5, -0.5, 0.7), 0.0, 0.0, 0.5, 25.0) is None
+

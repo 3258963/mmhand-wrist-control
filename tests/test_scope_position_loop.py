@@ -115,10 +115,15 @@ def test_pure_pid_base_is_measured(win):
 
 
 def test_pure_pid_moves_toward_target(win):
-    """纯PID：+2° 目标 ⇒ C2 的 counts 增大、C3 减小（k>0=放绳约定下 C2 要放、C3 要收）。"""
+    """纯PID：+2° 目标 ⇒ C2 的 counts 减小、C3 增大。
+
+    2026-11-19：UI/硬件 roll 与模型 roll 方向相反（`MODEL_AXIS_SIGN[ROLL] = -1`，
+    台架实测"给 −2 却朝 +2 走"），所以 UI 的 +2° 对应模型 −2°，三缆方向随之镜像。
+    本用例用合成标定 k=+130380（全正，老写法的"counts↑=放绳"）。
+    """
     sent = _prep(win, variant=1, roll_tgt="2.0")
     win._cl_tick()
-    assert sent[28] > 2100 and sent[29] < 3100, sent
+    assert sent[28] < 2100 and sent[29] > 3100, sent
 
 
 def test_pure_pid_single_tick_step_is_bounded_by_kp(win):

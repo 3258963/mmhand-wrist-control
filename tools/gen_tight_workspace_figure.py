@@ -26,19 +26,12 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-import matplotlib
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 from matplotlib.patches import Rectangle  # noqa: E402
 
+from tools._figbase import GRID, INK, MUTED, plt  # noqa: E402
 from wrist_model import positive_null_direction  # noqa: E402
 
-plt.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei", "DejaVu Sans"]
-plt.rcParams["axes.unicode_minus"] = False
-
-INK, MUTED, GRID = "#24303f", "#6b7785", "#dfe4ea"
 RED, GREEN, AMBER, BLUE = "#ef4444", "#10b981", "#f59e0b", "#3b82f6"
 
 # 采样位姿（与文档里的例子一致）

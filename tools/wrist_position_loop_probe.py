@@ -48,7 +48,10 @@ def load_k(sign_nominal: bool = True) -> list:
             return list(calib.k_counts_per_m)
     except (OSError, ValueError):
         pass
-    return [-K_NOMINAL_ABS[0], K_NOMINAL_ABS[1], K_NOMINAL_ABS[2]] if sign_nominal \
+    # 2026-11-19 台架定案：直控 +100c 逐缆点动，三根张力全部上升（收绳）
+    # ⇒ 三路 k 均为负（见 run_data/scope_exports/wrist_calib.json 的 note）。
+    # sign_nominal=True 时用这个符号约定（旧的 C2/C3 取正是错的）。
+    return [-abs(v) for v in K_NOMINAL_ABS] if sign_nominal \
         else list(K_NOMINAL_ABS)
 
 
