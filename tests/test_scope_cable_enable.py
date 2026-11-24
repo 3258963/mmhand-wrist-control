@@ -19,7 +19,6 @@ import mmhand_scope as scope
 from desktop.core.protocol import (
     build_active_scope_cmd,
     build_motor_pos_abs_cmd,
-    build_motor_pos_abs_one_cmd,
     build_servo_reset_zero_cmd,
 )
 
@@ -136,14 +135,55 @@ def test_multiturn_zero_uses_enabled_mask(win):
 
 def test_send_motor_target_gated(win):
     _arm_env(win)
-    win.ramp_check.setChecked(False)    # 关斜坡：直发单帧便于断言
+    win.ramp_check.setChecked(False)    # 关斜坡：直发一帧便于断言
+    win.targets = {27: 100, 28: 100, 29: 100}
+    win.rx_thread.frames.clear()
     win.cable_enable_checks[29].setChecked(False)
     win._send_motor_target(29, 12345)
     assert win.rx_thread.frames == []
     win._send_motor_target(27, 456)
-    assert win.rx_thread.frames == [build_motor_pos_abs_one_cmd(27, 456)]
+    # 2026-11-23：单电机也走 0xD3 批量帧（0xDE 会把 P4 活动域收缩成单电机，
+    # 之后闭环/一键操作会被门禁拒并要求重新使能）。
+    expect = [100] * 30
+    expect[27] = 456
+    assert win.rx_thread.frames == [build_motor_pos_abs_cmd(expect)]
+    assert not any(f[2] == 0xDE for f in win.rx_thread.frames if len(f) > 2)
     win.ramp_check.setChecked(True)
     win.cable_enable_checks[29].setChecked(True)
+
+
+def test_manual_target_accumulates_from_last_target(win):
+    """Go 框：连按两次 2000 应累加（基准=上次下发的目标）。
+
+    旧实现以**实测位置**为基准：第一次还没走完时连按，第二次算出的目标
+    可能还是同一个 → 看起来"没反应"（2026-11-23 改成与 ± 点动同语义）。
+    """
+    _arm_env(win)
+    win.ramp_check.setChecked(False)
+    win.armed = True
+    win.targets = {27: 1000, 28: 1000, 29: 1000}
+    win.target_edits[27].setText("2000")
+    win._send_manual_target(27, win.target_edits[27])
+    assert win.targets[27] == 3000, win.targets
+    win._send_manual_target(27, win.target_edits[27])
+    assert win.targets[27] == 5000, win.targets
+    win.armed = False
+
+
+def test_direct_within_step_twice_is_batch(win):
+    """回归（2026-11-23）：步长 1000、目标相对 2000 曾命中 0xDE 单发分支
+    （`|Δ| <= step*2`），固件把活动域收缩成单电机 → 闭环/一键操作全部要求重新使能。"""
+    _arm_env(win)
+    win.ramp_check.setChecked(False)
+    win.step_combo.setCurrentText("1000")
+    win.targets = {27: 100, 28: 100, 29: 100}
+    win.rx_thread.frames.clear()
+    win._send_motor_target(27, 100 + 2000)      # |Δ| = 2000 = step*2 → 以前走 0xDE
+    assert len(win.rx_thread.frames) == 1
+    assert win.rx_thread.frames[0][2] == 0xD3, win.rx_thread.frames
+    expect = [100] * 30
+    expect[27] = 2100
+    assert win.rx_thread.frames[0] == build_motor_pos_abs_cmd(expect)
 
 
 def test_goto_zero_skips_unchecked(win):

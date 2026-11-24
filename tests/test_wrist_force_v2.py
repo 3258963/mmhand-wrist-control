@@ -2,7 +2,8 @@
 import math
 import pytest
 
-from wrist_force_law import (FORCE_OK, FORCE_OVERLOAD, FORCE_STALE,
+from wrist_force_law import (F_SENSOR_MIN_N, FORCE_OK, FORCE_OVERLOAD,
+                              FORCE_SENSOR_FAULT, FORCE_STALE,
                               FORCE_TDA_INFEASIBLE,
                               WristForceV2Params, WristForceV2State,
                               wrist_force_v2_step)
@@ -176,6 +177,27 @@ class TestForceV2:
                                           tda_solve)
         assert trim is None and flags == FORCE_OVERLOAD
 
+    def test_sensor_fault_stops(self):
+        """2026-11-23 现场事故回归：C2 报 −396.65 N（物理不可能）。
+
+        旧行为：`max(0, f)` 钳 0 继续控 → 误差恒为正 → 每拍满步收绳，永不收敛。
+        新行为：低于 `F_SENSOR_MIN_N` 立即返回 FORCE_SENSOR_FAULT，由调用方停环。
+        """
+        p = WristForceV2Params(**BASE)
+        st = WristForceV2State()
+        trim, flags, _alpha = wrist_force_v2_step(
+            p, st, (-0.01, -396.65, -0.09), 10.0, 0.01, tda_solve)
+        assert trim is None
+        assert flags & FORCE_SENSOR_FAULT
+
+    def test_small_negative_still_clamped(self):
+        """零点漂移级的小负值（−0.5 N）仍按松绳处理：钳 0 继续控。"""
+        p = WristForceV2Params(**BASE)
+        st = WristForceV2State()
+        trim, flags, _alpha = wrist_force_v2_step(
+            p, st, (-0.5, 3.0, 3.0), 10.0, 0.01, tda_solve)
+        assert not (flags & FORCE_SENSOR_FAULT)
+
     def test_torque_tracking_convergence(self):
         """给非零 τ_d，模拟一阶张力响应，验证 τ 误差收敛。"""
         p = WristForceV2Params(**{**BASE, 'tau_d': (0.1, -0.05),
@@ -257,6 +279,19 @@ class TestInnerGainSplit:
             WristForceV2Params(**{**BASE, 'ki_inner': None})
         with pytest.raises(ValueError):
             WristForceV2Params(**{**BASE, 'kp_inner': None, 'ki_inner': None})
+
+    def test_inner_gains_and_i_term_lim_honoured(self):
+        """2026-11-20：力矩模式必须真的吃进 i_term_lim。
+
+        曾经这里有个 bug —— `_check_common` 收到 None 后返回 max_trim(5000)，
+        把调用方给的 5.0 覆盖掉，等于积分钳制对力矩模式完全没生效。
+        """
+        p = WristForceV2Params(**{**BASE, 'kp_inner': 15.0, 'ki_inner': 20.0,
+                                  'i_term_lim': 5.0})
+        assert p.i_term_lim == 5.0
+        # 不显式给时回退到全局常量（当前 5.0）
+        p2 = WristForceV2Params(**{**BASE, 'kp_inner': 15.0, 'ki_inner': 20.0})
+        assert p2.i_term_lim == pytest.approx(5.0)
 
     def test_split_gains_track_torque_target(self):
         """S·Kp=0.70：600 拍后 τ 稳定跟住 τ_d，抖动 < 0.005 N·m。"""

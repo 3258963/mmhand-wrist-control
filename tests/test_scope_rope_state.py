@@ -378,9 +378,6 @@ class TestRampMutex:
         # 2026-11-10：位置模式必须带模型前馈才能启动（门禁新增），这里补齐
         from wrist_control_law import WristCalib
         win.wrist_calib = WristCalib([-130380.0] * 3, [0.0, 0.0])
-        win.pos_loop_combo.blockSignals(True)
-        win.pos_loop_combo.setCurrentIndex(0)
-        win.pos_loop_combo.blockSignals(False)
         win._start_closed_loop()
         assert not win._ramp_timer.isActive()
         assert 27 not in win._ramp_state
