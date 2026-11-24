@@ -343,18 +343,6 @@ void dispatchHostCommand(SystemRuntimeContext* sharedData, const uint8_t* frame,
         return;
     }
 
-    if (cmd == CMD_MOTOR_POS_ABS_ONE)
-    {
-        if (frameLen >= 1 + kMotorPosAbsOnePayloadBytes) {
-            const uint8_t motorIndex = frame[1];
-            upperApplySingleMotorTarget(sharedData,
-                                        motorIndex,
-                                        readI32BigEndian(frame + 2));
-        }
-        return;
-    }
-
-
     if (cmd == CMD_ACTIVE_SCOPE)
     {
         uint8_t status = PROTO_ACK_STATUS_OK;

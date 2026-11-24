@@ -28,6 +28,8 @@ inline constexpr uint32_t kServoTelemetryTimeoutMs = 500;
 
 /** 直控与反馈模式的硬过载阈值；碰撞检测不使用该负载值。 */
 inline constexpr int16_t kDirectOverloadLoadThreshold = 800;
+inline constexpr int16_t kWristDirectOverloadLoadThreshold = 1000; ///< M27..M29 舵机负载幅值。
+inline constexpr uint32_t kWristDirectOverloadHoldMs = 1000; ///< 腕部直控连续过载的反馈时间。
 inline constexpr int16_t kFeedbackOverloadLoadThreshold = 2000;
 inline constexpr uint8_t kDirectOverloadLatchCycles = 20;
 inline constexpr uint8_t kFeedbackOverloadLatchCycles = 20;

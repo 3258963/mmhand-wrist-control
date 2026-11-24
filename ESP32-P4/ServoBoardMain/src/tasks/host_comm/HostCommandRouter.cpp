@@ -146,51 +146,6 @@ bool upperApplyMotorTargets(SystemRuntimeContext* sharedData,
     return true;
 }
 
-bool upperApplySingleMotorTarget(SystemRuntimeContext* sharedData,
-                                 uint8_t motorIndex,
-                                 int32_t target)
-{
-    if (!sharedData || motorIndex >= SERVO_TOTAL_NUM) {
-        return false;
-    }
-    const uint32_t motorMask = (1UL << motorIndex) & validMotorChannelMask();
-    if (motorMask == 0) {
-        return false;
-    }
-    SemaphoreHandle_t lock = sharedData->commandStateMutex;
-    if (lock && xSemaphoreTake(lock, pdMS_TO_TICKS(10)) != pdTRUE) {
-        return false;
-    }
-    if (sharedData->pending_direct_valid != 0) {
-        // 保留尚未提升的最新整组直控修改，避免单电机编辑覆盖同帧其他通道。
-    } else {
-        memcpy(sharedData->pendingMotorTargetRaw,
-               sharedData->motorTargetRaw,
-               sizeof(sharedData->pendingMotorTargetRaw));
-    }
-    sharedData->pendingMotorTargetRaw[motorIndex] = target;
-    const uint32_t generation = sharedData->pending_direct_generation + 1U;
-    sharedData->pending_direct_generation = generation;
-    sharedData->pending_direct_source = MOTOR_DIRECT_SOURCE_ABSOLUTE;
-    sharedData->pending_direct_motor_mask = motorMask;
-    sharedData->pending_direct_joint_mask = 0;
-    sharedData->pending_direct_require_can = 0;
-    sharedData->pending_direct_valid = 1;
-    sharedData->direct_reject_reason = DIRECT_REJECT_NONE;
-    if (lock) {
-        xSemaphoreGive(lock);
-    }
-    FW_LOG_INFO_PRINTF("[UPPER] SINGLE_MOTOR_TARGET M%02u target=%ld mask=0x%08lX\r\n",
-                  (unsigned)motorIndex,
-                  (long)target,
-                  (unsigned long)motorMask);
-    if (!postSystemEventForToken(sharedData, SYSTEM_EVENT_RUN_DIRECT, generation)) {
-        cancelStagedDirectCommand(sharedData, generation, DIRECT_REJECT_EVENT_QUEUE);
-        return false;
-    }
-    return true;
-}
-
 // Active scope 仅能在无 owner、控制关闭的静止态修改，并在持锁后复核一次状态。
 bool upperApplyActiveScope(SystemRuntimeContext* sharedData,
                            uint32_t activeMotorMask,

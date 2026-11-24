@@ -10,7 +10,11 @@
 #include "DimensionsConfig.h"
 
 inline constexpr uint32_t SERVO_SYNC_READ_TIMEOUT_MS_DEFAULT = 3; ///< 同步读单批等待时限。
-inline constexpr uint16_t SERVO_TARGET_SPEED_DEFAULT = 1000; ///< 标定/直控默认速度 steps/s（1000≈88°/s≈缆速7.7mm/s；阶梯回升 600→1000，2026-11-03 用户定值。量程 0~3400，单位=steps/s）。
+inline constexpr uint16_t SERVO_TARGET_SPEED_DEFAULT = 3400; ///< 标定/直控/闭环的目标速度上限 steps/s。
+// 2026-11-20 用户要求"量程直接拉满"：1000 → 3400（协议上限，= 3400 counts/s ≈ 299°/s ≈ 缆速 28.7 mm/s）。
+// 注意：这只是**天花板**。闭环实际速度由"命令领先量 × 伺服内环"决定（领先 20c 时只有 ~267 c/s），
+// 所以拉满**不会**让闭环自己变快；它主要让直控点动/斜坡/一键紧绳/松绳能跑更快。
+// 拉满带来的风险：直控和松绳的冲击速度是原来的 3.4 倍，首次使用请从小步长（100~250c）开始试。
 inline constexpr uint8_t SERVO_TARGET_ACC_DEFAULT = 254; ///< 标定/直控默认加速度。
 
 namespace mmhand::config::servo {

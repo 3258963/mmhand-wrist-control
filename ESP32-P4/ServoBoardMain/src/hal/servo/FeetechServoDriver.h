@@ -73,6 +73,7 @@ struct ServoFeedbackInternal {
     int16_t offlineLastTrustedTurn; ///< 离线前最后可信诊断圈数。
     uint32_t offlineLastTrustedTimestampMs; ///< 上述快照的采样时间。
     bool offlineTrustedSnapshotPending; ///< ServoBus 尚未消费的本次会话冻结快照。
+    uint32_t loadSampleMs; ///< 最近一次收到 Present Load 的时间。
     uint32_t lastUpdate; ///< 最近一次有效反馈时间。
 };
 
@@ -956,6 +957,7 @@ private:
             fb.offlineLastTrustedTimestampMs = millis();
         }
         fb.lastUpdate = millis();
+        fb.loadSampleMs = fb.lastUpdate;
     }
 
     /** 累计读失败；达到阈值时冻结最后可信位置并撤销多圈可信状态。 */

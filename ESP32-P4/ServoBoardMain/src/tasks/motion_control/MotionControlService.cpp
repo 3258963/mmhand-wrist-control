@@ -28,6 +28,7 @@
 #include "../../generated/UrdfJointLimits.generated.h"
 #include "../../platform/rtos/SharedSafetyState.h"
 #include "../../platform/log/FirmwareLog.h"
+#include "../../platform/time/Clock.h"
 #include "../../runtime/SystemRuntimeContext.h"
 #include "../../runtime/ports/SystemEventPort.h"
 #include "../../runtime/metrics/TaskRuntimeMetrics.h"
@@ -103,7 +104,7 @@ struct ControlServiceRuntime {
     JointCalibrationRuntimeSnapshot calibrationSnapshot[ENCODER_TOTAL_NUM];
     uint32_t calibrationSnapshotValidMask;
     uint32_t overloadFaultLatched;
-    uint8_t overloadHighCount[SERVO_TOTAL_NUM];
+    p4::safety::OverloadHistory overloadHistory[SERVO_TOTAL_NUM];
     int32_t feedbackCollisionHoldAbs[ENCODER_TOTAL_NUM][MAX_JOINT_ACTUATORS];
     bool feedbackCollisionPidPushActive[ENCODER_TOTAL_NUM];
     // 上一控制周期采用的碰撞窗口档位；单电机按物理方向更新，双电机固定 RELEASE。
@@ -843,7 +844,7 @@ bool stepMotionControlService(SystemRuntimeContext* sharedData,
     auto& calibrationSnapshot = runtime.calibrationSnapshot;
     auto& calibrationSnapshotValidMask = runtime.calibrationSnapshotValidMask;
     auto& overloadFaultLatched = runtime.overloadFaultLatched;
-    auto& overloadHighCount = runtime.overloadHighCount;
+    auto& overloadHistory = runtime.overloadHistory;
     auto& feedbackCollisionHoldAbs = runtime.feedbackCollisionHoldAbs;
     auto& feedbackCollisionPidPushActive = runtime.feedbackCollisionPidPushActive;
     auto& feedbackCollisionDriveMotionMode =
@@ -901,7 +902,7 @@ bool stepMotionControlService(SystemRuntimeContext* sharedData,
         {
             // 操作端请求故障复位时，同时清理私有锁存状态和共享故障 bitmap/负载快照。
             overloadFaultLatched = 0;
-            memset(overloadHighCount, 0, sizeof(overloadHighCount));
+            memset(overloadHistory, 0, sizeof(overloadHistory));
             {
                 SharedSafetyGuard guard;
                 sharedAtomicStore(&sharedData->overload_fault_bitmap, (uint32_t)0);
@@ -931,8 +932,8 @@ bool stepMotionControlService(SystemRuntimeContext* sharedData,
         bool telemetryFresh = false;
         if (sharedData->servoTelemetryQueue.peek(&telemetryData)) {
             // 负载/电流数据用于过载保护，因此比编码器映射更快过期。
-            telemetryFresh =
-                (uint32_t)(nowMs - telemetryData.timestamp) <= kServoTelemetryTimeoutMs;
+            telemetryFresh = (p4::platform::time::monotonicMillis() - telemetryData.timestamp)
+                             <= kServoTelemetryTimeoutMs;
         }
 
         for (uint8_t ch = 0; ch < SERVO_TOTAL_NUM; ch++)
@@ -1148,16 +1149,18 @@ bool stepMotionControlService(SystemRuntimeContext* sharedData,
                 if (((overloadMotorMask & bit) == 0) ||
                     telemetryData.onlineStatus[ch] == 0)
                 {
-                    overloadHighCount[ch] = 0;
+                    overloadHistory[ch] = {};
                     continue;
                 }
 
                 const p4::safety::OverloadSampleDecision overloadDecision =
                     p4::safety::evaluateOverloadSample(
                         commandSnapshot.controlMode,
+                        ch,
                         telemetryData.load[ch],
-                        overloadHighCount[ch]);
-                overloadHighCount[ch] = overloadDecision.nextHighCount;
+                        telemetryData.loadSampleMs[ch],
+                        overloadHistory[ch]);
+                overloadHistory[ch] = overloadDecision.next;
 
                 if (overloadDecision.shouldLatch &&
                     (overloadFaultLatched & bit) == 0)
@@ -1167,18 +1170,18 @@ bool stepMotionControlService(SystemRuntimeContext* sharedData,
                         SharedSafetyGuard guard;
                         sharedData->overload_fault_load[ch] = telemetryData.load[ch];
                     }
-                    FW_LOG_INFO_PRINTF("[CONTROL] OVERLOAD_HOLD M%02u load=%d threshold=%d cycles=%u mode=%u\r\n",
+                    FW_LOG_INFO_PRINTF("[CONTROL] OVERLOAD_HOLD M%02u load=%d threshold=%d elapsedMs=%lu mode=%u\r\n",
                                   (unsigned)ch,
                                   mmhand::servo::loadMagnitude(telemetryData.load[ch]),
                                   overloadDecision.threshold,
-                                  (unsigned)overloadDecision.latchCycles,
+                                  (unsigned long)(telemetryData.loadSampleMs[ch] - overloadHistory[ch].firstHighMs),
                                   (unsigned)commandSnapshot.controlMode);
                 }
             }
         }
         else
         {
-            memset(overloadHighCount, 0, sizeof(overloadHighCount));
+            memset(overloadHistory, 0, sizeof(overloadHistory));
         }
         sharedAtomicFetchOr(&sharedData->overload_fault_bitmap, overloadFaultLatched);
         overloadFaultLatched = sharedAtomicLoad(&sharedData->overload_fault_bitmap);

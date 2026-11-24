@@ -196,6 +196,7 @@ void publishFeedback(SystemRuntimeContext* sharedData,
 
             telemetryData.speed[ch] = feedback.speed;
             telemetryData.load[ch] = feedback.load;
+            telemetryData.loadSampleMs[ch] = feedback.loadSampleMs;
             telemetryData.current[ch] = feedback.current;
             telemetryData.voltage[ch] = feedback.voltage;
             telemetryData.temperature[ch] = feedback.temperature;

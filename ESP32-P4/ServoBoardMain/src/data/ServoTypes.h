@@ -33,6 +33,7 @@ struct ServoAngleData_t {
 struct ServoTelemetryData_t {
     int16_t speed[SERVO_TOTAL_NUM]; ///< 飞特 Present Speed 原始有符号值。
     int16_t load[SERVO_TOTAL_NUM];  ///< 飞特 Present Load 原始有符号值。
+    uint32_t loadSampleMs[SERVO_TOTAL_NUM]; ///< 各电机最近一次成功读取负载的时间。
     // ST3215 Present Current 原始有符号读数，物理单位由上位机解释。
     int16_t current[SERVO_TOTAL_NUM];
     uint8_t voltage[SERVO_TOTAL_NUM];     ///< Present Voltage 原始值。

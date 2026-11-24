@@ -44,21 +44,40 @@ uint32_t overloadActiveMotorMask(SystemRuntimeContext* runtime,
 }
 
 OverloadSampleDecision evaluateOverloadSample(uint8_t controlMode,
+                                              uint8_t motorChannel,
                                               int16_t signedLoad,
-                                              uint8_t previousHighCount)
+                                              uint32_t sampleMs,
+                                              const OverloadHistory& previous)
 {
     OverloadSampleDecision decision = {};
     const bool feedbackMode = controlMode == CONTROL_MODE_JOINT;
-    decision.threshold = feedbackMode ? kFeedbackOverloadLoadThreshold
-                                      : kDirectOverloadLoadThreshold;
-    decision.latchCycles = feedbackMode ? kFeedbackOverloadLatchCycles
-                                        : kDirectOverloadLatchCycles;
-    decision.thresholdExceeded =
-        mmhand::servo::loadMagnitude(signedLoad) >= decision.threshold;
-    decision.nextHighCount = decision.thresholdExceeded
-        ? (previousHighCount < 255 ? previousHighCount + 1 : 255)
-        : 0;
-    decision.shouldLatch = decision.nextHighCount >= decision.latchCycles;
+    const bool wristDirect = controlMode == CONTROL_MODE_DIRECT_MOTOR &&
+                            motorChannel >= 27 && motorChannel <= 29;
+    decision.threshold = feedbackMode ? kFeedbackOverloadLoadThreshold : kDirectOverloadLoadThreshold;
+    if (wristDirect) {
+        decision.threshold = kWristDirectOverloadLoadThreshold;
+    }
+    if (mmhand::servo::loadMagnitude(signedLoad) < decision.threshold) {
+        return decision;
+    }
+
+    decision.next = previous;
+    if (wristDirect && (sampleMs - previous.lastHighMs) > kServoTelemetryTimeoutMs) {
+        decision.next = {};
+    }
+    if (decision.next.highCount == 0) {
+        decision.next.firstHighMs = sampleMs;
+    }
+    if (decision.next.highCount < UINT8_MAX) {
+        ++decision.next.highCount;
+    }
+    decision.next.lastHighMs = sampleMs;
+    if (wristDirect) {
+        decision.shouldLatch = (sampleMs - decision.next.firstHighMs) >= kWristDirectOverloadHoldMs;
+    } else {
+        const uint8_t latchCycles = feedbackMode ? kFeedbackOverloadLatchCycles : kDirectOverloadLatchCycles;
+        decision.shouldLatch = decision.next.highCount >= latchCycles;
+    }
     return decision;
 }
 

@@ -54,7 +54,6 @@ inline constexpr uint8_t CMD_RUN_FEEDBACK = 0xD8; ///< 申请状态机进入负�
 inline constexpr uint8_t CMD_PAUSE = 0xD9; ///< 暂停当前负反馈或直控运行
 inline constexpr uint8_t CMD_RESTORE_MULTITURN = 0xDA; ///< 按位图恢复 30 路 logical ABS 多圈快照
 inline constexpr uint8_t CMD_HOST_HEARTBEAT = 0xDC; ///< 刷新上位机在线计时器，不携带业务数据
-inline constexpr uint8_t CMD_MOTOR_POS_ABS_ONE = 0xDE; ///< 单台 Mxx logical ABS 直控，Mxx 加 int32 counts
 inline constexpr uint8_t CMD_CALIB_LOAD_JOINT = 0xDF; ///< 恢复单关节唯一 Auto/LUT v4 标定快照
 inline constexpr uint8_t CMD_CALIB_LOAD_LIMITS = 0xE0; ///< 批量恢复 30 路 ABS 标定范围与有效位图
 inline constexpr uint8_t CMD_CLEAR_CALIBRATION = 0xE5; ///< 清除全部 Auto/LUT 标定结果，保留 Manual
@@ -100,7 +99,6 @@ inline constexpr uint8_t UPLINK_MASK_ALL_PERIODIC = 127; ///< 全部周期遥测
 inline constexpr size_t kFloatPayloadBytes = 84;
 inline constexpr size_t kMaskedFloatPayloadBytes = 88;
 inline constexpr size_t kMotorPosAbsPayloadBytes = 120;
-inline constexpr size_t kMotorPosAbsOnePayloadBytes = 5;
 inline constexpr size_t kActiveScopePayloadBytes = 9;
 inline constexpr size_t kRestoreMultiTurnPayloadBytes = 124;
 inline constexpr size_t kCalibLoadJointPayloadBytes = 189;
@@ -132,7 +130,6 @@ inline constexpr size_t generatedCommandPayloadLength(uint8_t command)
         case CMD_PAUSE: return 0;
         case CMD_RESTORE_MULTITURN: return kRestoreMultiTurnPayloadBytes;
         case CMD_HOST_HEARTBEAT: return 0;
-        case CMD_MOTOR_POS_ABS_ONE: return kMotorPosAbsOnePayloadBytes;
         case CMD_CALIB_LOAD_JOINT: return kCalibLoadJointPayloadBytes;
         case CMD_CALIB_LOAD_LIMITS: return kCalibLoadLimitsPayloadBytes;
         case CMD_CLEAR_CALIBRATION: return 0;
