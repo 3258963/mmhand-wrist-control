@@ -1396,10 +1396,3 @@ def build_motor_pos_abs_cmd(motor_abs: List[int]) -> bytes:
         payload.extend(struct.pack(">i", int(value)))
     return _build_command_frame(CMD_MOTOR_POS_ABS, bytes(payload))
 
-
-def build_motor_pos_abs_one_cmd(motor_index: int, motor_abs: int) -> bytes:
-    idx = int(motor_index)
-    if idx < 0 or idx >= MOTOR_COUNT:
-        raise ValueError(f"motor index out of range: {idx}")
-    payload = bytes([idx & 0xFF]) + struct.pack(">i", int(motor_abs))
-    return _build_command_frame(CMD_MOTOR_POS_ABS_ONE, payload)

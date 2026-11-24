@@ -52,7 +52,6 @@ CMD_RUN_FEEDBACK = 0xD8  # 申请状态机进入负反馈运行
 CMD_PAUSE = 0xD9  # 暂停当前负反馈或直控运行
 CMD_RESTORE_MULTITURN = 0xDA  # 按位图恢复 30 路 logical ABS 多圈快照
 CMD_HOST_HEARTBEAT = 0xDC  # 刷新上位机在线计时器，不携带业务数据
-CMD_MOTOR_POS_ABS_ONE = 0xDE  # 单台 Mxx logical ABS 直控，Mxx 加 int32 counts
 CMD_CALIB_LOAD_JOINT = 0xDF  # 恢复单关节唯一 Auto/LUT v4 标定快照
 CMD_CALIB_LOAD_LIMITS = 0xE0  # 批量恢复 30 路 ABS 标定范围与有效位图
 CMD_CLEAR_CALIBRATION = 0xE5  # 清除全部 Auto/LUT 标定结果，保留 Manual
@@ -135,7 +134,6 @@ COMMAND_PAYLOAD_LENGTHS = {
     CMD_PAUSE: 0,
     CMD_RESTORE_MULTITURN: 124,
     CMD_HOST_HEARTBEAT: 0,
-    CMD_MOTOR_POS_ABS_ONE: 5,
     CMD_CALIB_LOAD_JOINT: 189,
     CMD_CALIB_LOAD_LIMITS: 248,
     CMD_CLEAR_CALIBRATION: 0,

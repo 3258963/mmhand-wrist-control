@@ -35,6 +35,19 @@ v2 位置环（2026-10-25 前馈+P，2026-11-10 扩为两种结构）：
        没有"角度→绝对 counts"的模型映射，只能以**实测位置**为基准：
        out = 实测 counts + J_i·δθ；δθ 同上（PID 在关节角域，比例/积分/微分都作用在 e 上）。
 
+    C. PID加前馈（feedforward=False + chord_from_fb=True，增量式）
+       每拍以**本拍实测位置**为基准，前馈也按**当前位姿→目标**重算（弦）：
+           out = 实测 counts + k_i·[l_i(θ*) − l_i(θ_fb)] + J_i(θ_fb)·δθ
+       与 A 的区别只在"锚在哪"：A 锚在起环瞬间（origin + l(θ*)−l(θ_ref)），
+       C 每拍从实测重新算，所以：
+         · e=0 时 Δ 恒为 0 ⟹ 稳态误差里不含模型/标定误差，ki=0 也能对零；
+         · 弦项自带二阶项，没有 A 的切线近似残差（双轴大误差下的法向对拉）；
+         · 不需要 origin/ref 同步 ⟹ 起环姿态不一致、模式重入都不再有坑。
+       代价（必须一起处理）：
+         · 指令 = 实测 + Δ，磁编噪声会 1:1 进指令 → 静止时要有"小步不发"门限；
+         · 没有绝对锚点，编码器卡死时会一直走 → 必须给累计行程上限；
+         · 等效位置增益 ≈ 1+kp（弦项自身已是 1 倍），kp 要按 A 的口径重新定。
+
     符号（2026-11-10 更正为"符号无关"表述）：
         k 的定义是 Δcounts = k·Δl，所以 k>0 ⇒ counts 增大是放绳（绳变长）、
         k<0 ⇒ counts 增大是收绳。k 的符号 = 硬件收放方向，由台架点动判定，
@@ -95,7 +108,8 @@ class WristControlParams:
     __slots__ = (
         "origin", "gain_roll", "gain_pitch", "kp", "ki", "kd",
         "deadband_deg", "target_limit_deg", "soft_limit",
-        "i_limit_deg", "d_filter_alpha",
+        "i_limit_deg", "d_filter_alpha", "max_step", "k_ff",
+        "max_step_roll", "max_step_pitch",
     )
 
     def __init__(self):
@@ -110,6 +124,10 @@ class WristControlParams:
         self.soft_limit = 5000
         self.i_limit_deg = 25.0        # 积分项的等效角上限：|ki·∫e| ≤ 此值（防 windup）
         self.d_filter_alpha = 0.25     # 微分一阶低通系数（1=不滤；0=微分恒 0）
+        self.max_step = 20.0           # 每拍步长上限 [counts]（调用方 clamp 用；law 不读）
+        self.k_ff = 1.0                # 绳长前馈系数 0~1（只对 chord_from_fb 生效）
+        self.max_step_roll = 0.0       # 分轴每拍限幅 [counts]，0=不限（用 max_step 兜底）
+        self.max_step_pitch = 0.0
 
 
 def clampf(v: float, lo: float, hi: float) -> float:
@@ -255,7 +273,8 @@ def wrist_control_step_pid(p: WristControlParams,
                            roll_enabled: bool = True,
                            pitch_enabled: bool = True,
                            ref_roll_deg: float | None = None,
-                           ref_pitch_deg: float | None = None) -> tuple:
+                           ref_pitch_deg: float | None = None,
+                           chord_from_fb: bool = False) -> tuple:
     """位置环一拍：可选模型前馈 + 关节角域 PID（经当前雅可比折算到 counts）。
 
     两种结构（同一份代码，只差基准）：
@@ -266,6 +285,9 @@ def wrist_control_step_pid(p: WristControlParams,
             out = 实测 counts + J(θ_fb)·δθ
           ——没有"角度→绝对 counts"的映射，基准只能是实测位置（与三个力控模式
             同一个执行器语义：每拍从实测出发走一步）。
+        C PID加前馈（feedforward=False + chord_from_fb=True，增量式 + 弦）
+            out = 实测 counts + k·[l(θ*) − l(θ_fb)] + J(θ_fb)·δθ
+          ——前馈每拍从**当前位姿**重算；e=0 时 Δ=0，稳态不含模型误差。
 
         δθ_A = kp·e + ki·∫e·dt + kd·(−dθ_fb/dt)         （关节角域，deg）
         J_i  = −k_i·R_i·(π/180)                          （counts/deg，自带硬件方向）
@@ -273,8 +295,10 @@ def wrist_control_step_pid(p: WristControlParams,
     Args:
         state: PID 状态；None = 旧接口（ki/kd 强制为 0、不读写状态，等价于纯 P）。
         dt: 本拍实际间隔（s），积分/微分用；state=None 时忽略。
-        base_counts: 变体 B 的基准（实测电机 counts，3 个）；变体 A 忽略。
+        base_counts: 变体 B/C 的基准（实测电机 counts，3 个）；变体 A 忽略。
         ref_*: 变体 A 的前馈参考位姿；**必须是 origin 对应的那个实测位姿**。
+        chord_from_fb: 变体 C 开关（仅 feedforward=False 时生效）：前馈改为按
+            **反馈位姿**求弦 l(θ*)−l(θ_fb)，基准仍是 base_counts。缺省 False = 变体 B。
 
     Returns:
         (out[3] | None, flags)：硬错误（非有限/几何无效/基准缺失）时 out=None，
@@ -405,15 +429,56 @@ def wrist_control_step_pid(p: WristControlParams,
             if pitch_enabled:
                 dl += out_t.s_m[PITCH][i] - out_ref.s_m[PITCH][i]
             base = p.origin[i] + k_i * dl
+            delta_c = 0.0
+            if roll_enabled:
+                delta_c += -k_i * out_fb.r_m[ROLL][i] * (dth_r * d2r)
+            if pitch_enabled:
+                delta_c += -k_i * out_fb.r_m[PITCH][i] * (dth_p * d2r)
+            value = base + delta_c
+        elif p.max_step_roll > 0.0 or p.max_step_pitch > 0.0:
+            # 2026-11-23 分轴每拍限幅（方案 B）：把「前馈 + PI」按 ROLL / PITCH
+            # 两轴拆开，各自钳到 ±max_step_roll / ±max_step_pitch（counts），
+            # 再相加。0 = 该轴不单独限幅。外层仍可再用 max_step_f 兜底。
+            dr = 0.0
+            dp = 0.0
+            if chord_from_fb:
+                if roll_enabled:
+                    dr += p.k_ff * k_i * (out_t.s_m[ROLL][i] - out_fb.s_m[ROLL][i])
+                if pitch_enabled:
+                    dp += p.k_ff * k_i * (out_t.s_m[PITCH][i] - out_fb.s_m[PITCH][i])
+            if roll_enabled:
+                dr += -k_i * out_fb.r_m[ROLL][i] * (dth_r * d2r)
+            if pitch_enabled:
+                dp += -k_i * out_fb.r_m[PITCH][i] * (dth_p * d2r)
+            if p.max_step_roll > 0.0:
+                dr = clampf(dr, -p.max_step_roll, p.max_step_roll)
+            if p.max_step_pitch > 0.0:
+                dp = clampf(dp, -p.max_step_pitch, p.max_step_pitch)
+            value = float(base_counts[i]) + dr + dp
+        elif chord_from_fb:
+            # 变体 C：每拍从**当前位姿**重算弦（不是从起环的 ref），
+            # 基准同样是本拍实测。e=0 时 dl=0，输出就是实测（原地保持）。
+            # k_ff ∈ [0,1]：模型可信就给 1，怕模型偏就给 0.2~0.5 只借一部分。
+            dl = 0.0
+            if roll_enabled:
+                dl += out_t.s_m[ROLL][i] - out_fb.s_m[ROLL][i]
+            if pitch_enabled:
+                dl += out_t.s_m[PITCH][i] - out_fb.s_m[PITCH][i]
+            base = float(base_counts[i]) + p.k_ff * k_i * dl
+            delta_c = 0.0
+            if roll_enabled:
+                delta_c += -k_i * out_fb.r_m[ROLL][i] * (dth_r * d2r)
+            if pitch_enabled:
+                delta_c += -k_i * out_fb.r_m[PITCH][i] * (dth_p * d2r)
+            value = base + delta_c
         else:
             base = float(base_counts[i])
-        # J_i = −k_i·R_i（counts/deg）：δθ 在关节角域，折算到该缆的 counts。
-        delta_c = 0.0
-        if roll_enabled:
-            delta_c += -k_i * out_fb.r_m[ROLL][i] * (dth_r * d2r)
-        if pitch_enabled:
-            delta_c += -k_i * out_fb.r_m[PITCH][i] * (dth_p * d2r)
-        value = base + delta_c
+            delta_c = 0.0
+            if roll_enabled:
+                delta_c += -k_i * out_fb.r_m[ROLL][i] * (dth_r * d2r)
+            if pitch_enabled:
+                delta_c += -k_i * out_fb.r_m[PITCH][i] * (dth_p * d2r)
+            value = base + delta_c
         out[i] = clampi(int(round(value)),
                         p.origin[i] - p.soft_limit,
                         p.origin[i] + p.soft_limit)
@@ -547,5 +612,30 @@ if __name__ == "__main__":
         wrist_control_step_pid(q, calib, st, 0.0, 0.0, 25.0, 0.0, 0.01,
                                feedforward=False, base_counts=base)
     assert abs(q.ki * st.integ_deg[0]) <= q.i_limit_deg + 1e-9, st.integ_deg
+
+    # ---- 变体 C：PID加前馈（增量式 + 每拍重算弦） ----
+    q.kp, q.ki, q.kd = 0.0, 0.0, 0.0
+    st.reset()
+    # F) 误差 0 ⇒ 弦 = 0、δθ = 0 ⇒ 输出就是实测基准（原地保持）
+    out_c0, fl_c0 = wrist_control_step_pid(
+        q, calib, st, 0.0, 0.0, 0.0, 0.0, 0.01,
+        feedforward=False, base_counts=base, chord_from_fb=True)
+    assert out_c0 == base and fl_c0 == FLAG_OK, (out_c0, fl_c0)
+    # G) kp=0 ⇒ 单拍位移精确等于弦 k·[l(θ*)−l(θ_fb)]（不是切线 J·e）
+    out_cc, _ = wrist_control_step_pid(
+        q, calib, st, 0.0, 0.0, 2.0, 0.0, 0.01,
+        feedforward=False, base_counts=base, chord_from_fb=True)
+    m_t = wrist_eval(math.radians(2.0), 0.0)
+    m_f = wrist_eval(0.0, 0.0)
+    exp_cc = [int(round(base[i] + calib.k_counts_per_m[i]
+                        * (m_t.s_m[ROLL][i] - m_f.s_m[ROLL][i])))
+              for i in range(MOTOR_COUNT)]
+    assert out_cc == exp_cc, (out_cc, exp_cc)
+    # H) 变体 C 同样要实测基准：缺 base_counts 直接硬错误
+    out_cn, fl_cn = wrist_control_step_pid(
+        q, calib, st, 0.0, 0.0, 2.0, 0.0, 0.01,
+        feedforward=False, base_counts=None, chord_from_fb=True)
+    assert out_cn is None and fl_cn & FLAG_NONFINITE, (out_cn, fl_cn)
+
     print("wrist_control_law 自测全部通过")
 

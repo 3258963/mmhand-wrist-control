@@ -200,6 +200,259 @@ def tda_solve(r_m, null_dir, tau_roll, tau_pitch, preload_t,
     return f_d, flags, alpha
 
 
+# ---------------------------------------------------------------- 力矩优先分配
+# 2026-11-22：`tda_solve` 是"固定预紧 t → 做不到就把力矩缩 alpha"。
+# 用户要的是反过来：**力矩是任务、预紧是手段**。所以加这个函数。
+TDA_PRELOAD_RAISED = 1 << 4        # 预紧被抬到 s_lo 以上（满足力矩所需）
+TDA_PRELOAD_INFEASIBLE = 1 << 5    # 用户预紧下限超过 s_hi（预紧本身不可行）
+
+
+# ---------------------------------------------------------------- 闭式能力
+# 2026-11-23：3 缆 2 轴的能力集是**沿方向凸集**，不是"每轴独立矩形"。
+# 旧实现按轴各自二分再各砍各的 → 双轴组合会被高估 → 砍完仍不可行 → 误判停环
+# （实测 (τ_r,τ_p)=(0.1,-2.0)：pitch 单轴能力 1.443，但叠加 0.1 roll 后
+#  真实能力只有 1.380，按轴砍到 1.429 仍然无解）。
+# 现在改成"沿目标方向求最大缩放系数"——这正是论文的 α，且可闭式求出。
+#
+# 推导（详见 docs/张力能力闭式推导_20261122.md）：
+#   f(m,t) = m·u + t·n̂,  m = 交付力矩幅值,  u = P⁻¹[d;0]（d 为单位方向）
+#   每缆界约束换算成 t 的区间：L_i(m) ≤ t ≤ U_i(m)
+#       L_i = (f_min − m·u_i)/n̂_i = a_i − m·b_i
+#       U_i = (f_max − m·u_i)/n̂_i = c_i − m·b_i
+#   其中 a_i = f_min/n̂_i,  b_i = u_i/n̂_i,  c_i = f_max/n̂_i
+#   存在 t ⟺ max(t_floor, max_i L_i) ≤ min_j U_j
+#   ⟹ L_i ≤ U_j（对所有 i,j，给出 m 的上界）与 t_floor ≤ U_j
+#   ⟹ m_max = min{ min_{b_j>b_i}(c_j−a_i)/(b_j−b_i), min_{b_j>0}(c_j−t_floor)/b_j }
+#   （b_j<b_i 的那些对给的是 m 的**下界**，对 m≥0 自动满足，跳过）
+# 与论文算法 2（迭代解 2×2）逐位等价（9 工况 + 10 方向验证，差 0.000000），
+# 但没有迭代、没有 2×2 奇异风险，并且附带给出"该方向的绝对能力"。
+
+
+def capacity_closed_form(r_m, null_dir, tau_roll, tau_pitch,
+                         t_floor, f_min, f_max):
+    """沿 (tau_roll, tau_pitch) 方向的 |τ| 上界 [N·m]（闭式，O(m²)）。
+
+    Args:
+        r_m: 2×3 力臂矩阵
+        null_dir: 3 元正零空间方向（全正）
+        tau_roll, tau_pitch: 目标力矩（决定方向；幅值不参与，只取方向）
+        t_floor: 预紧**下限** [N]（≤0 表示不设）
+        f_min, f_max: 每缆张力界 [N]
+
+    Returns:
+        · `None`：几何无效（无零空间 / P 奇异）
+        · `0.0` ：连零力矩都不可行（预紧下限太高，或 f_min/f_max 自相矛盾）
+        · `>0`  ：该方向可交付的力矩幅值上限 [N·m]
+    """
+    if null_dir is None:
+        return None
+    if not all(math.isfinite(n) and n > 0.0 for n in null_dir):
+        return None
+    P = [
+        [r_m[0][0], r_m[0][1], r_m[0][2]],
+        [r_m[1][0], r_m[1][1], r_m[1][2]],
+        [null_dir[0], null_dir[1], null_dir[2]],
+    ]
+    P_inv = _inv3(P)
+    if P_inv is None:
+        return None
+
+    floor = float(t_floor) if math.isfinite(t_floor) else 0.0
+    floor = max(0.0, floor)
+    a = [f_min / null_dir[i] for i in range(3)]
+    c = [f_max / null_dir[i] for i in range(3)]
+    # m=0 可行性：t·n̂ 必须能落进盒子
+    if max(floor, max(a)) > min(c):
+        return 0.0
+
+    k = math.hypot(tau_roll, tau_pitch)
+    if k < 1e-12:
+        return float("inf")          # 方向无定义：零力矩总能做
+    d = [tau_roll / k, tau_pitch / k]
+    u = _mat_vec(P_inv, [d[0], d[1], 0.0])
+    b = [u[i] / null_dir[i] for i in range(3)]
+
+    m_max = float("inf")
+    for i in range(3):
+        for j in range(3):
+            den = b[j] - b[i]
+            if den > 1e-12:
+                m_max = min(m_max, (c[j] - a[i]) / den)
+    for i in range(3):
+        if b[i] > 1e-12:
+            m_max = min(m_max, (c[i] - floor) / b[i])
+    return max(0.0, m_max)
+
+
+def allocation_step(r_m, null_dir, tau_roll, tau_pitch,
+                    t_floor, f_min, f_max, alpha_cap=1.0):
+    """**完整分配**：α 内生（闭式能力）+ t 反解（下限）→ (f_d, flags, alpha, info)。
+
+    与 `allocate_torque_priority` 的区别：
+        · `allocate_torque_priority`：α ≡ 1，做不到就返回 None（对方自己钳 τ）
+        · 本函数：做不到时**沿方向**把力矩缩到能力上限（α < 1），永远给出可行解
+          —— 与论文算法 2 等价（论文迭代解 2×2，本函数闭式解，结果逐位相同）
+
+    Args:
+        alpha_cap: α 的上限（安全系数）。1.0 = 对齐论文；0.9 = 只给 90% 能力。
+
+    Returns:
+        (f_d[3] | None, flags, alpha, info)
+        · `info` = dict(k, m_max, m, t, s_lo, alpha, cap_limited)
+          —— 供状态行/诊断显示；`None` 时为空 dict
+        · `alpha`：力矩实现比例（1=全额；<1=打 α 折）；错误路径 NaN
+        · `R·f_d == alpha·τ*`（恒等式，可自检）
+    """
+    info = {}
+    if null_dir is None:
+        return None, TDA_NO_NULL, math.nan, info
+    if not all(math.isfinite(n) and n > 0.0 for n in null_dir):
+        return None, TDA_NO_NULL, math.nan, info
+    P = [
+        [r_m[0][0], r_m[0][1], r_m[0][2]],
+        [r_m[1][0], r_m[1][1], r_m[1][2]],
+        [null_dir[0], null_dir[1], null_dir[2]],
+    ]
+    P_inv = _inv3(P)
+    if P_inv is None:
+        return None, TDA_SINGULAR, math.nan, info
+
+    floor = float(t_floor) if math.isfinite(t_floor) else 0.0
+    floor = max(0.0, floor)
+    cap = float(alpha_cap) if math.isfinite(alpha_cap) else 1.0
+    cap = min(1.0, max(0.0, cap))
+    a = [f_min / null_dir[i] for i in range(3)]
+    c = [f_max / null_dir[i] for i in range(3)]
+
+    # ---- 零力矩：只需预紧（t 取"刚好不松"与下限的较大者）
+    k = math.hypot(tau_roll, tau_pitch)
+    if k < 1e-12:
+        s_lo0 = max(a)
+        s_hi0 = min(c)
+        if max(floor, s_lo0) > s_hi0:
+            return None, TDA_PRELOAD_INFEASIBLE, math.nan, info
+        t = max(floor, s_lo0)
+        f_d = [t * null_dir[i] for i in range(3)]
+        raised = floor < s_lo0 - 1e-12
+        info.update(k=0.0, m_max=float("inf"), m=0.0, t=t,
+                    s_lo=s_lo0, alpha=1.0, cap_limited=False)
+        return f_d, (TDA_PRELOAD_RAISED if raised else TDA_OK), 1.0, info
+
+    # ---- m=0 可行性（预紧下限太高 / 界自相矛盾）
+    if max(floor, max(a)) > min(c):
+        return None, TDA_PRELOAD_INFEASIBLE, math.nan, info
+
+    # ---- 闭式能力（与 capacity_closed_form 同一段逻辑，内联避免重复求逆）
+    d = [tau_roll / k, tau_pitch / k]
+    u = _mat_vec(P_inv, [d[0], d[1], 0.0])
+    b = [u[i] / null_dir[i] for i in range(3)]
+    m_max = float("inf")
+    for i in range(3):
+        for j in range(3):
+            den = b[j] - b[i]
+            if den > 1e-12:
+                m_max = min(m_max, (c[j] - a[i]) / den)
+    for i in range(3):
+        if b[i] > 1e-12:
+            m_max = min(m_max, (c[i] - floor) / b[i])
+    m_max = max(0.0, m_max)
+    if m_max <= 0.0:
+        return None, TDA_PRELOAD_INFEASIBLE, math.nan, info
+
+    # ---- α：沿方向缩到能力内（再受安全系数约束）
+    alpha = min(cap, m_max / k) if math.isfinite(m_max) else cap
+    alpha = min(1.0, max(0.0, alpha))
+    cap_limited = alpha < min(1.0, m_max / k) - 1e-12 if math.isfinite(m_max) else False
+    m = alpha * k
+
+    # ---- t 反解：满足力矩所需的最小预紧，且不低于下限
+    f_tau = [m * u[i] for i in range(3)]
+    s_lo = max((f_min - f_tau[i]) / null_dir[i] for i in range(3))
+    s_hi = min((f_max - f_tau[i]) / null_dir[i] for i in range(3))
+    if not (math.isfinite(s_lo) and math.isfinite(s_hi)):
+        return None, TDA_INFEASIBLE, math.nan, info
+    t = max(s_lo, floor)
+    if t > s_hi:
+        # 数值贴边（m 恰好等于能力）：夹进区间，避免一根缆破界 1e-15
+        t = max(s_lo, s_hi)
+    if s_lo > s_hi + 1e-9:
+        return None, TDA_INFEASIBLE, math.nan, info
+
+    f_d = [f_tau[i] + t * null_dir[i] for i in range(3)]
+    raised = (t > floor + 1e-12) and (floor < s_lo - 1e-12)
+    flags = TDA_PRELOAD_RAISED if raised else TDA_OK
+    info.update(k=k, m_max=m_max, m=m, t=t, s_lo=s_lo, alpha=alpha,
+                cap_limited=cap_limited)
+    return f_d, flags, alpha, info
+
+
+def allocate_torque_priority(r_m, null_dir, tau_roll, tau_pitch,
+                             t_floor, f_min, f_max):
+    """力矩优先分配：**力矩精确实现，不降额**（α ≡ 1）。
+
+    保留此函数是因为它的契约很硬：**要么全额，要么 None**（调用方自己决定
+    钳制/拒绝）。内部委托给 `allocation_step`，把 alpha<1 翻译成 None。
+
+    Args:
+        r_m: 2×3 力臂矩阵（`wrist_eval(...).r_m`）
+        null_dir: 3 元正零空间方向（全正；`positive_null_direction`）
+        tau_roll, tau_pitch: 期望关节力矩 [N·m]
+        t_floor: 预紧**下限** [N]（用户填的 preload；≤0 表示只保证力封闭）
+        f_min, f_max: 每缆张力上下限 [N]
+
+    Returns:
+        (f_d[3] | None, flags, alpha)
+        · f_d 非 None 时 `alpha ≡ 1.0`（力矩全额实现）
+        · flags: TDA_OK / TDA_PRELOAD_RAISED / TDA_NO_NULL / TDA_SINGULAR
+                 / TDA_INFEASIBLE（力矩超能力）/ TDA_PRELOAD_INFEASIBLE（预紧下限太大）
+        · None = 做不到（**不是降额**；调用方应钳制 τ 或拒绝启动）
+        · 错误路径 alpha = NaN（曲线断口语义，与 `tda_solve` 一致）
+    """
+    f_d, flags, alpha, _info = allocation_step(
+        r_m, null_dir, tau_roll, tau_pitch, t_floor, f_min, f_max,
+        alpha_cap=1.0)
+    if f_d is None:
+        return None, flags, math.nan
+    if alpha < 1.0 - 1e-9:
+        # 旧契约：α≠1 → 视为"该力矩做不到"
+        return None, flags | TDA_INFEASIBLE, math.nan
+    return f_d, flags, 1.0
+
+
+def torque_capacity(r_m, null_dir, t_floor, f_min, f_max,
+                    axis=1, sign=1.0, tol=1e-6, hi=50.0):
+    """当前位姿/预紧下可实现的 |τ| 上限 [N·m]（沿 `axis`：0=roll, 1=pitch）。
+
+    ⚠ **方向不对称**：`R` 的力臂对不同转向不同，实测 (0,0) 位姿 pitch 正向
+    0.50 vs 负向 1.44 N·m。所以必须传 `sign`（+1/-1，取目标力矩的符号）。
+
+    二分找 `s_lo(τ) = s_hi(τ)` 的根；不可行返回 0.0。
+    用于"超能力拒绝/钳制"与状态行显示。
+    """
+    if null_dir is None or not all(math.isfinite(n) and n > 0.0 for n in null_dir):
+        return 0.0
+    sg = 1.0 if sign >= 0.0 else -1.0
+
+    def feasible(tau):
+        tr, tp = (sg * tau, 0.0) if axis == 0 else (0.0, sg * tau)
+        f, _fl, _a = allocate_torque_priority(r_m, null_dir, tr, tp,
+                                              t_floor, f_min, f_max)
+        return f is not None
+
+    if not feasible(tol):
+        return 0.0
+    lo, up = tol, float(hi)
+    if feasible(up):
+        return up
+    for _ in range(40):
+        mid = 0.5 * (lo + up)
+        if feasible(mid):
+            lo = mid
+        else:
+            up = mid
+    return lo
+
+
 if __name__ == "__main__":
     # 自测
     from wrist_model import wrist_eval, positive_null_direction

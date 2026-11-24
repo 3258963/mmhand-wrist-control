@@ -1187,16 +1187,6 @@ class HandController:
         if self.comm and self._control_mode == ControlMode.DIRECT_MOTOR:
             self.comm.send_command(("motor_pos_abs", raw))
 
-    def set_single_motor_position_absolute(self, motor_index: int, motor_abs: int) -> None:
-        if self._paused:
-            return
-        idx = int(motor_index)
-        if idx < 0 or idx >= MOTOR_COUNT:
-            raise ValueError(f"motor index out of range: {idx}")
-        raw = self._clamp_motor_abs_for_current_session(idx, motor_abs)
-        if self.comm and self._control_mode == ControlMode.DIRECT_MOTOR:
-            self.comm.send_command(("motor_pos_abs_one", idx, raw))
-
     def _validate_angles(self, angles: List[float]) -> List[float]:
         out: List[float] = []
         for a in angles:

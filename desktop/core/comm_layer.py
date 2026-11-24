@@ -87,7 +87,6 @@ from .protocol import (
     build_servo_reset_zero_cmd,
     build_host_heartbeat_cmd,
     build_motor_pos_abs_cmd,
-    build_motor_pos_abs_one_cmd,
     build_manual_encoder_reference_cmd,
     build_clear_manual_encoder_reference_cmd,
     build_manual_encoder_query_cmd,
@@ -1517,7 +1516,6 @@ class LowerComputerComm:
     def _is_high_rate_command(cmd: SendCmd) -> bool:
         return isinstance(cmd, tuple) and cmd[0] in (
             "motor_pos_abs",
-            "motor_pos_abs_one",
             "angle_live",
             "joint_target_run",
             "angle_live_masked",
@@ -1542,7 +1540,7 @@ class LowerComputerComm:
         with self.tx_queue.mutex:
             pending = self.tx_queue.queue
             kept = [item for item in pending if item != "start" and not (
-                isinstance(item, tuple) and item[0] in ("motor_pos_abs", "motor_pos_abs_one")
+                isinstance(item, tuple) and item[0] == "motor_pos_abs"
             )]
             removed = len(pending) - len(kept)
             pending.clear()
@@ -1710,8 +1708,6 @@ class LowerComputerComm:
             return build_rope_init_cmd(cmd[1])
         if isinstance(cmd, tuple) and len(cmd) == 2 and cmd[0] == "motor_pos_abs":
             return build_motor_pos_abs_cmd(cmd[1])
-        if isinstance(cmd, tuple) and len(cmd) == 3 and cmd[0] == "motor_pos_abs_one":
-            return build_motor_pos_abs_one_cmd(cmd[1], cmd[2])
         if isinstance(cmd, tuple) and len(cmd) == 2 and cmd[0] == "angle_live":
             return build_angle_cmd(cmd[1])
         if isinstance(cmd, tuple) and len(cmd) == 3 and cmd[0] == "angle_live_masked":

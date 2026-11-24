@@ -39,7 +39,8 @@ def safe_export_path(filename: str) -> Path | None:
     return candidate
 
 
-def dump_csv(filename: str, header: list[str], t: list[float], columns: list[list[float]]) -> Path | None:
+def dump_csv(filename: str, header: list[str], t: list[float], columns: list[list[float]],
+             *, value_precision: int = 2) -> Path | None:
     """把若干同长度数据列写成 CSV；返回写出的文件路径。
 
     内容先在内存中组好，再经 write_text 一次性写入校验过的路径。
@@ -51,7 +52,7 @@ def dump_csv(filename: str, header: list[str], t: list[float], columns: list[lis
     writer = csv.writer(buf)
     writer.writerow(["t_s"] + header)
     for i in range(len(t)):
-        row = [f"{t[i]:.3f}"] + [f"{col[i]:.2f}" for col in columns]
+        row = [f"{t[i]:.3f}"] + [f"{col[i]:.{value_precision}f}" for col in columns]
         writer.writerow(row)
     # StringIO(newline="") 保留 csv.writer 的 \r\n；写入端不再做换行翻译。
     path.write_text(buf.getvalue(), encoding="utf-8-sig", newline="")

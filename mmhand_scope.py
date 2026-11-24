@@ -13,6 +13,8 @@ CSV 由 mmhand_scope_export 模块固定导出到 run_data/scope_exports/。
 from __future__ import annotations
 
 import argparse
+import csv
+import io
 import json
 import math
 import os
@@ -64,7 +66,7 @@ def safety_log(action: str, **fields) -> None:
 
 import numpy as np
 import serial
-from PySide6.QtCore import QEvent, QObject, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QObject, QPointF, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QColor, QIcon
 from PySide6.QtWidgets import QPlainTextEdit, QScrollArea
 from PySide6.QtWidgets import (
@@ -79,6 +81,7 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QGridLayout,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QMainWindow,
@@ -112,26 +115,36 @@ if os.environ.get("MMHAND_GL") == "1":
         print("[plot] OpenGL 已按 MMHAND_GL=1 启用（实验性）")
     except Exception as exc:
         print(f"[plot] OpenGL 启用失败，回退软件光栅: {exc}")
-# 主图帧率：默认 60FPS（数据链路 0.5ms + paint 实测最坏 13ms，预算够）。
-# 想省电/省 CPU 可 MMHAND_PLOT_HZ=30；想试更高 MMHAND_PLOT_HZ=120。
+# 主图帧率：默认 75FPS（数据链路 0.5ms + paint 实测最坏 13ms，预算够）。
+# 数据源只有 100Hz（P4 控制周期 10ms），75~90 已经接近"一帧一个新点"，再往上
+# 没有新数据可画，反而和 drain/表格定时器抢线程（实测把间隔压到 8ms/5ms，
+# 帧率反掉到 ~57）。想省电可 MMHAND_PLOT_HZ=30。
+# 2026-11-24：帧率不再只靠环境变量 —— 工具栏有「帧率」下拉（60/75/90），
+# 见 _set_plot_hz()；这里的常量只是启动默认值。
 # 曲线点数由 _adapt_density 按 paint 实测自适应，帧率不会被点数拖下来。
 try:
-    PLOT_HZ = float(os.environ.get("MMHAND_PLOT_HZ", "60"))
+    PLOT_HZ = float(os.environ.get("MMHAND_PLOT_HZ", "75"))
 except ValueError:
-    PLOT_HZ = 60.0
+    PLOT_HZ = 75.0
 PLOT_HZ = max(5.0, min(120.0, PLOT_HZ))
 PLOT_INTERVAL_MS = max(1, int(round(1000.0 / PLOT_HZ)))
 
 # 全局主题（app_theme：夜间/白天/赛博朋克/自定义；工具栏可切，即时生效）
 import app_theme as AT
-pg.setConfigOptions(background=AT.T("plot_bg"), foreground=AT.T("plot_fg"))
+# antialias 默认 **关**：实测（4 条 100Hz 曲线，原生窗口）+5.4ms/帧
+# （paint 7.5→12.9ms），75FPS 预算下会掉帧。想要顺滑线条可勾工具栏
+# 「抗锯齿」，见 _set_plot_aa()（会按需重建曲线项）。
+pg.setConfigOptions(background=AT.T("plot_bg"), foreground=AT.T("plot_fg"),
+                    antialias=False)
 
 from desktop.core.communication.frame_decoder import FrameDecoder
 from desktop.core.generated_upper_protocol import (
     CMD_UPLINK_MASK,
     PACKET_TYPE_ENCODER_RAW,
+    PACKET_TYPE_FAULT_STATUS,
     PACKET_TYPE_PROTO_ACK,
     PACKET_TYPE_SERVO_ANGLE,
+    PACKET_TYPE_SERVO_LOGICAL_RANGE,
     PACKET_TYPE_SERVO_RAW,
     PACKET_TYPE_SERVO_ROUTE_STATUS,
     PACKET_TYPE_SERVO_TELEM,
@@ -149,21 +162,34 @@ from desktop.core.generated_upper_protocol import (
 from desktop.core.protocol import (
     DISCONNECT_SENTINEL,
     ENCODER_COUNT,
+    SYSTEM_FAULT_OVERLOAD,
+    SYSTEM_STATE_IDLE,
+    SYSTEM_STATE_READY,
+    SYSTEM_STATE_RECOVERY_REQUIRED,
+    SYSTEM_STATE_RUN_DIRECT,
+    SYSTEM_STATE_UNCONTROLLABLE,
     build_active_scope_cmd,
     build_reset_cmd,
     build_host_heartbeat_cmd,
     build_motor_pos_abs_cmd,
-    build_motor_pos_abs_one_cmd,
     build_servo_reset_zero_cmd,
     build_start_cmd,
+    build_state_sync_request_cmd,
     build_stop_cmd,
+    parse_fault_status_packet,
     parse_proto_ack,
     parse_servo_angle_packet,
+    parse_servo_logical_range_packet,
     parse_servo_raw_packet,
     parse_servo_route_status_packet,
     parse_servo_telem_packet,
     parse_system_status_packet,
 )
+try:                                  # 状态同步位（生成的协议常量）
+    from desktop.core.generated_upper_protocol import (
+        STATE_SYNC_SERVO_LOGICAL_RANGE as _SYNC_LOGICAL_RANGE)
+except Exception:                     # 老版本没有该常量时退回字面量 4（bit2）
+    _SYNC_LOGICAL_RANGE = 4
 
 # 示波器保留的上行流：映射角 + 舵机 ABS + 磁编 raw + 路由（状态/故障/安全事件不受掩码影响）。
 SCOPE_UPLINK_MASK = (UPLINK_MASK_SERVO_ANGLE |
@@ -172,6 +198,65 @@ SCOPE_UPLINK_MASK = (UPLINK_MASK_SERVO_ANGLE |
 # 逐绳使能开关（2026-11-02）后活动域不再是固定 M27-29 全集：使能时按勾选
 # 动态算掩码（ScopeWindow._enabled_motor_mask），故不再有模块级 MOTOR_SCOPE_MASK。
 MOTOR_SOFT_LIMIT = 2000000  # counts 输出上界（≈int32 安全域，等效解除 ±5000；仅防溢出）
+# 伺服可持续速度上限 [counts/s]：必须与固件 `SERVO_TARGET_SPEED_DEFAULT` 一致。
+# 固件已从 1000 拉满到 **3400**（ServoConfig.h，2026-11-20），这里原来还写 1000，
+# 导致「命令能力 vs 伺服能力」的告警按过时的数误判（2026-11-24 修正）。
+#
+# ⚠ 但这只是**天花板**，不是闭环能达到的速度。固件注释实测：
+#   「闭环实际速度由『命令领先量 × 伺服内环』决定（领先 20c 时只有 ~267 c/s）」。
+# 因为力控输出是增量式 `target = 实测 + 步长`，**实测每拍刷新**，所以舵机看到的
+# 位置误差恒等于 `步长`。`max_step_f` 在本架构里充当的是**位置领先量**，
+# 不是速度上限 —— 它决定"给舵机喂多大误差"，舵机按误差给速度：
+#     v ≈ 13.35 × 领先量 [c/s]        （实测标定：20c → 267 c/s）
+#   领先 10c  → ~133 c/s（≈6 N/s 张力斜率）→ 松绳起步会慢到像"推不动"
+#   领先 20c  → ~267 c/s（≈12 N/s）
+#   领先 30c  → ~400 c/s（≈18 N/s）
+#   领先 120c → ~1600 c/s（≈74 N/s）
+#   领先 255c → ~3400 c/s  ← **才真的打满固件天花板**（3400/13.35 ≈ 255）
+# ⟹ **想让它跑快，`max_step` 要给到"比较大的值"**；给 34 只有 454 c/s。
+# 代价是过冲 ≈ 张力斜率 × 延时(26 ms)，所以它是"快 ↔ 过冲"的单旋钮；
+# 压过冲要靠 Kp/延时/速度前馈，不是靠把 max_step 压小。
+# 详见 docs/每拍限幅_领先量与舵机速度_20261124.md。
+SERVO_MAX_COUNTS_PER_S = 3400.0
+# 闭环控制周期 [s]。
+#
+# 2026-11-20 用户选定 **100 Hz**（10 ms）：控制节拍与 P4 内环、舵机总线同拍。
+# 力控输出是增量式的（`out = 实测 + 步长`），命令**不会**跑到实测前面。
+#
+# ⚠ 2026-11-24 更正：以前这里写着「乘法约束 max_step × 频率 ≤ 伺服 c/s」是**错的**，
+# 那是把"领先量"当成了"速度"。按那条规则算出的 34 counts/拍，舵机只会跑 454 c/s。
+# `max_step × 频率` 只是"若舵机能完全跟上"的假想速率，用来做**饱和提示**可以，
+# 但不能当 `max_step` 的上限。真实速度见上面 13.35 c/s per count 的标定。
+CL_LOOP_PERIOD_S = 0.010
+# 力矩模式 α 的告警阈值（**只告警，不停环**）。
+# 2026-11-23 用户定案：目标超能力时**始终给到可行最大**（α=m_max/k），不拒绝启动；
+# α 小于本值时每秒提示一次"你填了多少、实际只有多少"。
+# 安全由 `f > f_max` 过载停环负责。
+ALPHA_WARN = 0.5
+# 位姿超出力封闭域多少度就**停环**（2026-11-23）。
+# 背景：现场 roll 读数 16.85°（可行域上限 +10°）被静默钳到 10° 继续控，
+# 模型 R/n̂ 与真实几何不符 → 分配出的 f_d 错 → C3 被单独收到 30N+ 还在收。
+# 钳制 >3° 就说明已经不在"能算准"的区域内，必须停下让用户摆回去。
+POSE_CLAMP_STOP_DEG = 3.0
+# 零空间份额下限（2026-11-23）。`n̂_i` 是第 i 根缆在"预紧"里能分到的比例；
+# 靠近力封闭边界时某一根会趋近 0（实测 roll=−18.2° 时 n̂=[0.235,0.972,**0.002**]）。
+# 这时那根缆**几乎无法承载预紧**：
+#   · 分配要它 ≥ f_min=0.2N ⟹ t 得抬到 0.2/0.002 = 100 N ⟹ 其它缆爆掉 ⟹ 无解
+#   · 就算有解，它也会被"永远收不满"→ 现场表现为**一直收绳**
+# 所以在分配之前先判"病态"，直接停下并告诉用户把腕摆离边界。
+FORCE_NULL_MIN_SHARE = 0.05
+# 分配层给 f_max 留的余量（2026-11-23）。f_d 不再顶到 f_max 天花板：
+# 现场某边界位姿下，目标力矩把 C3 分到正好 25.00 N，内环一次正常超调
+# （实测 25.06~26.05）就触发"张力过载 ≥25N"停环，表现为"跑一会就自动停"。
+# 留 min(1 N, 10% f_max) 给超调，真正的过载仍由守卫按 f_max 判。
+FORCE_FMAX_HEADROOM_N = 1.0
+# 力矩修正（慢积分外环）的修正量上限 [N·m]（2026-11-24）。
+# 意义：`τ_cmd = τ* + trim`，`|trim| ≤ 本值`。取 0.3 大约是本机最强方向（1.44）的 21%、
+# 最弱方向（0.43）的 70% —— 足够补"内环到不了"的差距，又不会把目标推到能力之外。
+TAU_TRIM_MAX = 0.3
+# 过载停环的去抖拍数（2026-11-23）：连续 N 拍超 f_max 才停。
+# 目标贴着 f_max 时单拍超调（25.06 N）不应停环；真过载会持续 >30 ms。
+OVERLOAD_STOP_TICKS = 3
 # ---------- 张力链（ZNSV6-F8-485 八通道称重变送器，驱动 znsv_app/znsv.py） ----------
 # 逻辑通道号(1..8) → C1/C2/C3。2026-10-28 用户实机确认：C1↔CH1、C2↔CH2、
 # C3↔CH3（原工程体检报告曾测得传感器落 CH1/5/7，以本次确认为准）。
@@ -193,13 +278,19 @@ TENSION_POLL_HZ = 250.0      # 重量帧目标频率：RTT~2ms+帧间隙1ms 的�
                              # 设备刷新 1280Hz、波特率 600000（见 znsv_app/rate_upgrade.py）；依赖 FTDI LatencyTimer=1，
                              # 未修复的机器上 RTT 16ms 自动降速 ~55Hz，无超时风暴。闭环 100Hz 下每拍都有新张力。
 # J16/J17 角度显示方向（-1 = 与磁编原始方向相反，按用户实测约定）。
-AXIS_SIGN = {16: 1.0, 17: -1.0}   # J16=ROLL / J17=PITCH 方向；2026-10-28 pitch 取反（编码器重接线后方向复核）
+AXIS_SIGN = {16: 1.0, 17: -1.0}   # J16=ROLL / J17=PITCH 方向（2026-11-23 用户要求改回）
 # 界面 pitch ↔ 模型 pitch（+X 右手定则）的换算。
-# 2026-11-10 曾整体取反一次（AXIS_SIGN[17]=+1、本常数=-1），台架反馈"又反了" —— 已按用户
-# 要求改回原约定：界面角 = AXIS_SIGN[17]·raw，模型角 = 界面角（本常数 +1，等价于不换算）。
+# 2026-11-23 曾按现场读数成对取反（+1 / −1）验证过，用户要求**改回原约定**：
+# 界面角 = AXIS_SIGN[17]·raw，模型角 = 界面角（本常数 +1）。
 # 若以后要翻 pitch 正方向：**两个一起改**（AXIS_SIGN[17] 与 PITCH_MODEL_SIGN 同时取反），
 # 只改一个会让 R/l 与编码器错位、闭环变正反馈。
 PITCH_MODEL_SIGN = 1.0
+# 阻抗外环输出的 roll 符号（2026-11-23 台架：给正 roll 目标，腕往反方向走）。
+# 只作用于**阻抗外环的最终 τ_roll**（弹簧 K·e、阻尼 D·ė、前馈 τ_ff 一起翻），
+# 不影响位置环 / 张力 / 张紧 / 力矩四个模式。
+# 放在这里而不是 `wrist_impedance.py`：该模块保持"UI 角度口径的纯函数"，
+# 硬件方向约定统一由调用方（本文件）负责——与 MODEL_AXIS_SIGN 同款。
+IMPEDANCE_ROLL_SIGN = -1.0
 
 
 def pitch_model_deg(pitch_deg: float) -> float:
@@ -216,7 +307,10 @@ def pitch_ui_range() -> tuple:
 # J16/J17 滤波链：中值5(砍EMI尖刺) + EMA低通(压宽带噪声)——实现抽出为
 # wrist_filter.py（可移植模块），此处仅引用；设计依据见该模块 docstring。
 from wrist_filter import FILTER_ALPHA, FILTER_MEDIAN_N, WristAxisFilter, unwrap_counts
-from wrist_model import RANGE_DEG, PITCH, ROLL, positive_null_direction, wrist_eval
+from wrist_model import (FORCE_CLOSURE_ENVELOPE_PITCH_DEG,
+                         FORCE_CLOSURE_ENVELOPE_ROLL_DEG, PITCH, RANGE_DEG,
+                         ROLL, clamp_force_closure, positive_null_direction,
+                         wrist_eval)
 from znsv_app.widgets import Sparkline
 from znsv_app.znsv import ZnsvTransmitter
 
@@ -313,24 +407,35 @@ def CHC(i: int) -> str:
     return AT.T("channels")[i]
 from wrist_tension import (TENSION_OVERLOAD, TENSION_SLACK, TENSION_STALE,
                            TensionConfig, tension_evaluate)
-from wrist_force_law import (FORCE_OK, FORCE_NO_NULL, FORCE_OVERLOAD,
-                              FORCE_STALE, FORCE_TDA_INFEASIBLE,
+from wrist_force_law import (F_SENSOR_MIN_N, FORCE_OK, FORCE_NO_NULL,
+                              FORCE_OVERLOAD, FORCE_SENSOR_FAULT,
+                              FORCE_STALE, FORCE_TDA_INFEASIBLE, STALE_MS,
                               WristForceV2Params, WristForceV2State,
                               WristTensionParams, WristTensionState,
                               WristTightParams,
-                              tension_i_term_lim_counts,
+                              parse_per_cable, sine_target_step,
+                              tau_trim_step, tension_i_term_lim_counts,
                               wrist_force_v2_step, wrist_tension_step)
-from wrist_tda import tda_solve, preload_window
+from wrist_hybrid_control import (C1TensionParams, C1TensionState, HybridWristParams,
+                                  c1_tension_target)
+from wrist_tension_observer import TensionEstimatePanel
+from wrist_impedance import (IMP_NO_TARGET, IMP_OK, IMP_TAU_CLAMPED,
+                             WristImpedanceParams, gravity_tau_sine,
+                             wrist_impedance_torque)
+from wrist_tda import (TDA_INFEASIBLE, TDA_NO_NULL, TDA_PRELOAD_INFEASIBLE,
+                       allocation_step, capacity_closed_form, preload_window,
+                       tda_solve, torque_capacity)
 DIRECT_REJECT_NAMES = {
     0: "无", 1: "状态不允许", 2: "硬件不可控", 3: "多圈未知",
     4: "事件队列满", 5: "命令过期", 6: "系统故障",
 }
 from mmhand_scope_export import (EXPORT_DIR, dump_csv, load_layout_json,
-                                 load_named_json, save_layout_json, save_named_json)
+                                 load_named_json, safe_export_path,
+                                 save_layout_json, save_named_json)
 from wrist_control_law import (FLAG_FEEDBACK_CLAMPED, FLAG_GEOM_INVALID,
                                FLAG_I_CLAMPED, FLAG_LOW_PITCH, FLAG_NONFINITE,
                                FLAG_TARGET_CLAMPED, K_NOMINAL_ABS, MODEL_AXIS_SIGN,
-                               SPOOL_RADIUS_M, WristControlParams,
+                               SPOOL_RADIUS_M, WristCalib, WristControlParams,
                                WristPidState,
                                parse_wrist_calib,
                                wrist_control_step_pid)
@@ -408,6 +513,12 @@ class RingBuffer:
             return math.nan
         idx = (self.head - 1) % self.capacity
         return float(self.v[idx])
+
+    def last_sample(self) -> tuple[float, float]:
+        if self.count == 0:
+            return math.nan, math.nan
+        idx = (self.head - 1) % self.capacity
+        return float(self.t[idx]), float(self.v[idx])
 
     def series(self, tail_seconds: float) -> tuple[np.ndarray, np.ndarray]:
         """按时间倒取最近 tail_seconds 的数据，按时间升序返回。"""
@@ -572,6 +683,13 @@ class SerialRxThread(threading.Thread):
             raws = parse_servo_raw_packet(body)
             if raws:
                 self.out_queue.put(("servo_raw", now, [raws[i] for i in SERVO_TARGETS]))
+        elif packet_type == PACKET_TYPE_SERVO_LOGICAL_RANGE:
+            rng = parse_servo_logical_range_packet(body)
+            if rng:
+                bitmap, mins, maxs = rng
+                self.out_queue.put(("servo_range", now, {
+                    "bitmap": int(bitmap), "min": list(mins), "max": list(maxs),
+                }))
         elif packet_type == PACKET_TYPE_SERVO_TELEM:
             telem = parse_servo_telem_packet(body)
             if telem:
@@ -583,6 +701,13 @@ class SerialRxThread(threading.Thread):
                     "volt": [volts[i] / 10.0 for i in SERVO_TARGETS],
                     "temp": [float(temps[i]) for i in SERVO_TARGETS],
                 }))
+        elif packet_type == PACKET_TYPE_FAULT_STATUS:
+            fault = parse_fault_status_packet(body)
+            if fault:
+                mask, loads = fault
+                self.out_queue.put(("overload", now, {
+                    m: load for m, load in enumerate(loads) if mask & (1 << m)
+                }))
         elif packet_type == PACKET_TYPE_SYSTEM_STATUS:
             st = parse_system_status_packet(body)
             if st:
@@ -591,6 +716,7 @@ class SerialRxThread(threading.Thread):
                     "control_enabled": st[1],
                     "owner": st[2],
                     "control_mode": st[3],
+                    "faults": st[5],
                     "servo_online": st[12],
                     "encoder_online": st[13],
                     "can_online": st[14],
@@ -598,7 +724,9 @@ class SerialRxThread(threading.Thread):
                     # 活动域：0xD3 批量帧在固件里会与它求交（0xDE 单电机不查），
                     # 上位机必须核对，否则"只有活动域里那台动"。
                     "active_motor_mask": st[8] if len(st) > 8 else 0,
-                    "direct_reject": st[29] if len(st) > 29 else 0,
+                    "pending_generation": st[32] if st[35] else None,
+                    "applied_generation": st[33] if st[35] else None,
+                    "direct_reject": st[34],
                 }))
 
 
@@ -869,6 +997,8 @@ class RTensionWindow(QWidget):
         self.tabs = QTabWidget()
         self.tabs.addTab(page1, "📊 张力 · R")
         self.tabs.addTab(page2, "🔧 链路 · CH")
+        self.estimate_panel = TensionEstimatePanel(w)
+        self.tabs.addTab(self.estimate_panel, "张力预估")
         root.addWidget(self.tabs, 1)
 
         # 常驻底部：链路健康行
@@ -1064,11 +1194,11 @@ class RTensionWindow(QWidget):
             plt.showGrid(x=True, y=True, alpha=0.25)
             plt.setLabel("left", y_name)
             plt.setLabel("bottom", "时间", units="s")
-            # 渲染减压：峰值降采样+关抗锯齿（clipToView 已撤——与手动
-            # setXRange 组合在边界帧有裁剪边角，参与"显示不全"）
+            # 渲染减压：峰值降采样（clipToView 已撤——与手动 setXRange 组合在
+            # 边界帧有裁剪边角，参与"显示不全"）。抗锯齿跟随主图开关。
             pi = plt.getPlotItem()
             pi.setDownsampling(mode="peak")
-            plt.setAntialiasing(False)
+            plt.setAntialiasing(pg.getConfigOption("antialias"))
             for ax in ("left", "bottom"):
                 plt.getAxis(ax).setPen(fg)
                 plt.getAxis(ax).setTextPen(fg)
@@ -1106,8 +1236,10 @@ class RTensionWindow(QWidget):
         btn_row.addWidget(exp_btn)
         diag_btn = QPushButton("🔬 诊断 CSV")
         diag_btn.setToolTip(
-            "导出「位姿 + 三缆张力 + τ + 预紧 + 下发 trim」到 run_data/scope_exports/diag_*.csv\n"
-            "20 Hz 抽样、约 25 分钟缓冲。用于离线分析张紧时 τ 的偏置/抖动来源。")
+            "导出 20 Hz 诊断数据到 run_data/scope_exports/：\n"
+            "· 位置模式 → diag_pos_*.csv（角度/目标角/下发 counts/实测 counts，调 PID 用）\n"
+            "· 力控/张力 → diag_*.csv（位姿 + 三缆张力 + τ + 预紧 + 下发 trim）\n"
+            "缓冲约 25 分钟；每次起环清空。")
         diag_btn.clicked.connect(lambda: self.scope._export_diag_csv())
         btn_row.addWidget(diag_btn)
         btn_row.addStretch(1)
@@ -1127,7 +1259,11 @@ class RTensionWindow(QWidget):
         self.force_curve_card.setMaximumHeight(280 if on else 110)
 
     def _export_force_rows(self):
-        """力状态历史导出 CSV（t_s, τR, τP, t；NaN 行自动跳过由 csv 写空）。"""
+        """力状态历史导出 CSV（t_s, τR, τP, t；NaN 行由 csv 写空）。
+
+        2026-11-20 修：`dump_csv` 会自己前置一列 `t_s`，这里**不能**再写 `t_s`，
+        否则表头多一列、各列名整体右移一格（曾导致"τ_roll 读到 τ_pitch"的误判）。
+        """
         rows = list(self._force_rows)
         if len(rows) < 2:
             if getattr(self.scope, "tension_status", None) is not None:
@@ -1136,7 +1272,7 @@ class RTensionWindow(QWidget):
         name = "force_status_" + datetime.now().strftime("%Y%m%d_%H%M%S") + ".csv"
         path = dump_csv(
             name,
-            header=["t_s", "tau_roll_mNm", "tau_pitch_mNm", "tight_t_N"],
+            header=["tau_roll_mNm", "tau_pitch_mNm", "tight_t_N"],
             t=[r[0] for r in rows],
             columns=[[r[1] for r in rows], [r[2] for r in rows],
                      [r[3] for r in rows]])
@@ -1272,6 +1408,7 @@ class RTensionWindow(QWidget):
         ref = ref_len = self._ref_cache
 
         pose = w._r_at_current()
+        self.estimate_panel.refresh(pose)
         if pose is not None:
             roll_deg, pitch_deg, out, roll_rad, pitch_rad = pose
         else:
@@ -1358,7 +1495,11 @@ class RTensionWindow(QWidget):
         # τ 双向 + 张紧 t（力状态汇总）+ t 的三缆分配 + 曲线推数（同一份数值）
         tau_r_v = tau_p_v = t_v = None
         if fvals is not None and pose is not None:
-            tau_r_v = sum(out.r_m[ROLL][i] * fvals[i] for i in range(3)) * 1000.0
+            # **2026-11-23：观测台这块原来没做 roll 换号** → 显示的是模型系，
+            # 与状态行/曲线（UI 系）反号。用户实测"C2 加、τ ROLL 减小"就是这个。
+            # 现在统一走 `w._roll_tau_sign()`（界面「τ方向」可翻转），单位 mN·m。
+            _s_r = w._roll_tau_sign()
+            tau_r_v = _s_r * sum(out.r_m[ROLL][i] * fvals[i] for i in range(3)) * 1000.0
             tau_p_v = sum(out.r_m[PITCH][i] * fvals[i] for i in range(3)) * 1000.0
             self.tau_roll.setText(f"{tau_r_v:+8.1f} mN·m")
             self.tau_pitch.setText(f"{tau_p_v:+8.1f} mN·m")
@@ -1431,6 +1572,136 @@ class WatchTile(QLabel):
     def mousePressEvent(self, ev):
         if ev.button() == Qt.RightButton and self.removed is not None:
             self.removed(self.property("param_key"))
+
+
+class ServoInfoWindow(QWidget):
+    """舵机信息窗（2026-11-20）：每台电机的实时状态 + 会话逻辑行程。
+
+    数据全部来自**已有上行**，不需要改固件：
+      · `0x03 SERVO_ANGLE`  → ABS
+      · `0x09 SERVO_RAW`    → 单圈 raw
+      · `0x05 SERVO_TELEM`  → 速度/负载/电流/电压/温度
+      · `0x13 SERVO_LOGICAL_RANGE` → 逻辑行程 min/max（点「读取行程」发 0xED 请求）
+    **舵机 EEPROM 里的 P/D/I/力矩限制/加速度，目前协议没有读命令**（要改固件）。
+    """
+
+    COLS = ["电机", "ID", "在线", "ABS", "raw", "速度 c/s", "负载",
+            "电流", "电压 V", "温度 ℃", "逻辑min", "逻辑max", "行程", "起点", "目标", "累计"]
+
+    def __init__(self, scope):
+        super().__init__(scope)
+        self.scope = scope
+        self.setWindowTitle("舵机信息（M27-M29）")
+        self.setMinimumWidth(980)
+        self.setWindowFlag(Qt.Window, True)
+        root = QVBoxLayout(self)
+        bar = QHBoxLayout()
+        btn_read = QPushButton("🔄 读取行程")
+        btn_read.setToolTip("向 P4 请求 30 路会话逻辑行程（CMD_STATE_SYNC_REQUEST, bit2）")
+        btn_read.clicked.connect(self.request_range)
+        bar.addWidget(btn_read)
+        btn_csv = QPushButton("💾 导出 CSV")
+        btn_csv.clicked.connect(self.export_csv)
+        bar.addWidget(btn_csv)
+        self.note = QLabel("逻辑行程 = P4 上电会话可达范围；EEPROM 的 P/D/I/力矩限制需固件支持")
+        self.note.setObjectName("muted")
+        bar.addWidget(self.note, 1)
+        root.addLayout(bar)
+
+        self.table = QTableWidget(len(SERVO_TARGETS), len(self.COLS))
+        self.table.setHorizontalHeaderLabels(self.COLS)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        # 16 列按内容宽（原来只拉伸最后一列 → 总宽超窗口，最右「温度/行程」被裁）
+        _hdr = self.table.horizontalHeader()
+        _hdr.setSectionResizeMode(QHeaderView.ResizeToContents)
+        _hdr.setStretchLastSection(False)
+        _hdr.setDefaultAlignment(Qt.AlignCenter)
+        self.table.verticalHeader().setDefaultSectionSize(28)
+        root.addWidget(self.table, 1)
+
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._refresh)
+        self._timer.start(200)          # 5Hz：只刷 3 行 16 列，开销可忽略
+        self._refresh()
+
+    # ---------- 数据 ----------
+    def _row_values(self, m: int) -> list:
+        sc = self.scope
+        ch = sc.channels
+        def last(name, default=None):
+            c = ch.get(name)
+            v = c.buf.last() if c is not None else None
+            return default if v is None or math.isnan(v) else v
+        abs_v = last(f"m{m}_abs")
+        raw_v = last(f"m{m}_raw")
+        spd = last(f"m{m}_speed")
+        load = last(f"m{m}_load")
+        cur = last(f"m{m}_current")
+        volt = last(f"m{m}_volt")
+        temp = last(f"m{m}_temp")
+        rng = getattr(sc, "servo_range", None)
+        lo = hi = None
+        if rng and (int(rng.get("bitmap", 0)) >> m) & 1:
+            lo, hi = rng["min"][m], rng["max"][m]
+        online = "●" if sc._motor_enabled(m) and abs_v is not None else "○"
+        origin = sc._motor_origin.get(m)
+        tgt = sc.targets.get(m)
+        acc = (int(abs_v) - int(origin)) if (abs_v is not None and origin is not None) else None
+        fmt = lambda v, nd=0: ("—" if v is None else f"{v:+.{nd}f}")
+        return [
+            f"M{m}", str(m), online, fmt(abs_v), fmt(raw_v), fmt(spd), fmt(load),
+            fmt(cur), fmt(volt, 1), fmt(temp, 0),
+            fmt(lo), fmt(hi),
+            ("—" if (lo is None or hi is None) else f"{hi - lo}"),
+            fmt(origin), fmt(tgt), fmt(acc),
+        ]
+
+    def _refresh(self) -> None:
+        for r, m in enumerate(SERVO_TARGETS):
+            for c, v in enumerate(self._row_values(m)):
+                if self.table.item(r, c) is None:
+                    item = QTableWidgetItem(v)
+                    item.setTextAlignment(Qt.AlignCenter)
+                    self.table.setItem(r, c, item)
+                elif self.table.item(r, c).text() != v:
+                    self.table.item(r, c).setText(v)
+
+    # ---------- 动作 ----------
+    def request_range(self) -> None:
+        """请求 P4 回传 30 路会话逻辑行程。"""
+        sc = self.scope
+        if sc.rx_thread is None:
+            sc._ctrl_status("舵机信息：未连接，无法读取行程", log=False)
+            return
+        ok = sc.rx_thread.send(build_state_sync_request_cmd(_SYNC_LOGICAL_RANGE))
+        sc._ctrl_status("舵机信息：已请求逻辑行程" if ok else "舵机信息：请求发送失败",
+                        log=False)
+
+    def export_csv(self) -> None:
+        """把当前表导出 CSV（UTF-8-BOM，Excel 可直接开）。"""
+        name = "servo_info_" + datetime.now().strftime("%Y%m%d_%H%M%S") + ".csv"
+        rows = [[self.table.item(r, c).text() if self.table.item(r, c) else ""
+                 for c in range(len(self.COLS))] for r in range(self.table.rowCount())]
+        buf = io.StringIO(newline="")
+        w = csv.writer(buf)
+        w.writerow(self.COLS)
+        w.writerows(rows)
+        path = safe_export_path(name)
+        if path is None:
+            self.scope._ctrl_status("舵机信息：导出失败（路径校验不过）", log=False)
+            return
+        try:
+            path.write_text(buf.getvalue(), encoding="utf-8-sig", newline="")
+        except OSError as exc:
+            self.scope._ctrl_status(f"舵机信息：导出失败 {exc}", log=False)
+            return
+        self.scope._ctrl_status(f"舵机信息：已导出 → {name}", log=False)
+
+    def closeEvent(self, ev):  # noqa: N802
+        self._timer.stop()
+        self.scope.servo_info_window = None
+        super().closeEvent(ev)
 
 
 class ParameterWatchWindow(QWidget):
@@ -1685,11 +1956,53 @@ def install_no_wheel_guard(app=None) -> None:
 
 
 class _TimedPlotWidget(pg.PlotWidget):
-    """主图控件：始终统计 paint 用时（喂给自适应点数阀门）；MMHAND_FPS=1 时每 2s 打印。"""
+    """主图控件：始终统计 paint 用时（喂给自适应点数阀门）；MMHAND_FPS=1 时每 2s 打印。
+
+    另带一个"贴在图区正中的提示层"：早先用 pg.TextItem 挂在 ViewBox 上，
+    位置按数据坐标算，窗口一改大小就漂到图区上沿、被裁成半行（用户看到的
+    那两行乱码）。改成子 QLabel + resize 时重新居中，永远压在图区正中间。
+
+    2026-11-24 新增：双击事件上抛给 ScopeWindow（加/删水平标记线）。
+    """
 
     _report = os.environ.get("MMHAND_FPS") == "1"
     paint_ema_ms = 0.0
     last_paint_ms = 0.0
+
+    def add_overlay(self, label: QLabel) -> None:
+        label.setParent(self)
+        label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        label.setAlignment(Qt.AlignCenter)
+        self._overlays = getattr(self, "_overlays", [])
+        self._overlays.append(label)
+        self._place_overlays()
+
+    def _place_overlays(self) -> None:
+        for lb in getattr(self, "_overlays", ()):
+            if lb is None:
+                continue
+            lb.adjustSize()
+            lb.move(max(0, (self.width() - lb.width()) // 2),
+                    max(0, (self.height() - lb.height()) // 2))
+
+    def resizeEvent(self, ev):
+        super().resizeEvent(ev)
+        self._place_overlays()
+
+    def mouseDoubleClickEvent(self, ev):  # noqa: N802 (Qt 命名)
+        scope = getattr(self, "scope", None)
+        handler = getattr(scope, "_on_plot_double_click", None)
+        if handler is not None and handler(ev):
+            ev.accept()
+            return
+        super().mouseDoubleClickEvent(ev)
+
+    def leaveEvent(self, ev):  # noqa: N802
+        super().leaveEvent(ev)
+        scope = getattr(self, "scope", None)
+        hide = getattr(scope, "_hide_hover", None)
+        if hide is not None:
+            hide()
 
     def paintEvent(self, ev):
         t0 = time.perf_counter()
@@ -1941,18 +2254,100 @@ class RejectDialog(QWidget):
         self._scope._on_stop()
 
 
+class _ClLoopThread(QThread):
+    """闭环控制线程：固定周期调用 `win._cl_tick()`（2026-11-19 新增）。
+
+    **为什么存在**：原来闭环由 `QTimer` 驱动，和主图/表格/曲线重绘**在同一个
+    GUI 线程**排队；实测控制拍周期 22~28 ms（设计 10 ms）→ 只有 36~44 Hz，
+    `max_step=20 × 44 Hz = 880 c/s` 远低于设计 2000 c/s，"电机变化慢"的一部分
+    就是它。本线程用「绝对时间表 + sleep」调度，抖动约 1 ms，不再受重绘影响。
+
+    **线程安全约定**：
+    · 线程里只调 `_cl_tick()`（已把 UI 写操作改成 `_ui_call` 投递）；
+    · UI 一律通过 `win._ui_call(...)` 排队，由 GUI 线程的 `_drain_ui_queue` 执行；
+    · 停环：GUI 线程调 `stop()` 置 `_halt`，线程在下一拍开头退出。
+    """
+
+    def __init__(self, win, period_s: float = 0.01):
+        super().__init__(win if isinstance(win, QObject) else None)
+        self._win = win
+        self._period = float(period_s)
+        self._halt = False
+
+    def stop(self) -> None:
+        self._halt = True
+
+    def run(self) -> None:
+        win = self._win
+        period = self._period
+        # 2026-11-24：把本线程提到 Windows 高优先级，并把 GIL 切换间隔缩到 1 ms。
+        # 现场 dt 中位 15.6 ms、38% 连跑 —— 与"GUI 曲线/表格每秒 60~75 帧、
+        # 单帧 17 ms"吻合：控制线程抢不到 GIL，晚到后又被"追补"连跑。
+        # 这两项只是缓解；真正的负载要 GUI 侧降帧（MMHAND_PLOT_HZ）。
+        try:
+            import sys as _sys
+            _sys.setswitchinterval(0.001)
+        except Exception:
+            pass
+        try:
+            import ctypes as _ct
+            _k32 = _ct.windll.kernel32
+            _k32.SetThreadPriority(_k32.GetCurrentThread(), 2)   # HIGHEST
+        except Exception:
+            pass
+        t_next = time.perf_counter() + period
+        while not self._halt:
+            if win._cl_stop_request is not None:
+                break
+            try:
+                win._cl_tick()
+            except Exception as exc:       # 线程异常不能静默，交给 GUI 停环
+                win._cl_stop_request = f"控制线程异常：{exc!r}"
+                # 2026-11-23：以前只置标志、GUI 没人消费 —— 线程悄悄死掉，
+                # 界面还显示"运行中"，按启动只会动一下。现在写日志 + 走 GUI 停环。
+                try:
+                    win._safety("CL_THREAD_DIED", err=repr(exc))
+                except Exception:
+                    pass
+                try:
+                    win._ui_call(win._stop_closed_loop,
+                                 f"控制线程异常：{exc!r}", popup=True)
+                except Exception:
+                    pass
+                break
+            now = time.perf_counter()
+            # 2026-11-24：**不追补**。
+            # 旧实现 `t_next += period` 累加欠账：一旦某拍超过 10 ms（GUI 抢
+            # GIL / 串口发送阻塞），`t_next` 就落在过去 → `gap ≤ 0` → 下一拍
+            # **立刻连跑**，用的还是同一个张力样本 → P 作用两遍、连发两帧。
+            # 现场证据（run_data/sine/*.csv）：dt 中位 15~16 ms，且 38% 的相邻
+            # 行时间戳完全相同（连跑），而两行的 trim 不同（确实算了两遍）。
+            # 现在：落后超过一整拍就**重锚**到"现在 + 周期"，绝不连跑两拍。
+            if now - t_next > period:
+                t_next = now + period
+            else:
+                t_next += period
+            gap = t_next - now
+            if gap > 0.0:
+                time.sleep(gap)
+
+
 class ScopeWindow(QMainWindow):
     exportFinished = Signal()
+    # 双击加的横线标记：上限（同时也限制写进布局存档的条数）
+    _H_MARKER_MAX = 20
 
     def __init__(self, default_port: str = "COM13"):
         super().__init__()
         install_no_wheel_guard()   # 滚轮不得改控制模式/步长/波特率等（全局一次）
         self.setWindowTitle("MMHand 示波器+直控 - 磁编 J00-J20 + M27-M29")
-        self.resize(1600, 900)  # 16:9
-        # 居中到主屏
+        # 默认尺寸按屏幕算（原来硬写 1600x900：1366/1280 屏会超出可视区）
         screen = QApplication.primaryScreen().availableGeometry()
-        self.move(max(0, (screen.width() - 1600) // 2),
-                  max(0, (screen.height() - 900) // 2))
+        w = min(1600, max(1100, screen.width() - 80))
+        h = min(900, max(620, screen.height() - 80))
+        self.resize(w, h)
+        self.move(max(0, screen.x() + (screen.width() - w) // 2),
+                  max(0, screen.y() + (screen.height() - h) // 2))
         self.channels = {}
         self.rx_queue = queue.Queue()
         self.rx_thread = None
@@ -1964,10 +2359,15 @@ class ScopeWindow(QMainWindow):
                             "control_enabled": 0}
         self.route_info = {"scan_state": 0, "controllable_bitmap": 0, "valid_bitmap": 0}
         self.last_servo_abs_all = None
+        self._overload_motors = {}
+        self._status_rx_at = 0.0
+        self._admit_sent_at = 0.0
+        self._prior_applied_generation = None
         self.armed = False
         self.targets = {m: None for m in SERVO_TARGETS}
         self._zero_poll_count = 0
         self._ramp_state = {}
+        self._ramp_first_tick = False
         self._visible_series = {}
         # 曲线点数密度（点/像素）：_adapt_density 按 paint 实测在 0.25~3 之间自动调，
         # 帧率钉在 PLOT_HZ，点数让路（不会出现"为了画全点把帧率拖到 30"）。
@@ -1982,10 +2382,6 @@ class ScopeWindow(QMainWindow):
         self._tighten_cl_active = False   # 当前闭环是否由一键紧绳启动（停环弹窗用）
         self._latest_t = None
         self._motor_origin = {m: None for m in SERVO_TARGETS}
-        # 位置环前馈参考位姿（启动瞬间的实测 roll/pitch，UI 约定）：
-        # 前馈算 origin→目标 的绳长增量，origin 记的是启动瞬间的电机计数，
-        # 两者必须同一姿态，否则稳态偏 s/(1−kp)（2026-11-10 修复）。
-        self._cl_ref_pose = None
         self.target_edits = {}
         # 逐绳使能开关（2026-11-02 用户需求：每根绳一个勾选框，勾了才允许使能）。
         # 未勾选的电机：使能时不纳入 ACTIVE_SCOPE/归零/在线检查，点动/Go/斜坡/
@@ -1997,6 +2393,7 @@ class ScopeWindow(QMainWindow):
         self._cl_motor_on = frozenset(SERVO_TARGETS)   # 本轮闭环实际驱动的电机（启动时快照）
         self.cl_enabled = False
         self._want_closed_loop = False
+        self._want_goto_zero = False
         self.cl_edits = {}
         self.watch_window = None
         self.rt_window = None
@@ -2029,6 +2426,7 @@ class ScopeWindow(QMainWindow):
         self._tension_guard_saved = {"f_min": "", "f_max": ""}
         # 串口号/波特率同款持久镜像（换 USB 口后不必每次重选）。
         self._tension_link_saved = {"port": "", "baud": ""}
+        self._tension_estimate_k = ["", ""]  # C2/C3 标定刚度，N/mm
         # 观测台缆卡张力走势显示开关（2026-11-04 用户需求：自选看不看）。
         self._tension_trend_on = True
         # 观测台绳长卡折叠态（方案二改：R/绳长与张力同屏，绳长默认展开可折）。
@@ -2050,12 +2448,11 @@ class ScopeWindow(QMainWindow):
         self._build_ui(default_port)
         self._build_timers()
         self.exportFinished.connect(self._export_done)
-        # 标定文件存在就随启动载入（否则「模型前馈」永远是灰的，每次重启都得手点）
-        self._load_wrist_calib(quiet=True)
+        # 标定：默认就可用（k 幅值=结构常数、符号=−trim方向、δ=0），
+        # 文件只是**可选覆盖**（换卷筒/换线径/需要 δ 时）。放在布局之后载入，
+        # 这样「trim方向」已从布局恢复，符号反推用的是最终值。
         self._load_layout()
-        # 布局里恢复了「trim方向」→ 符号自检要按恢复后的值再算一次（只刷新标签，不重读策略）
-        if self.wrist_calib is not None:
-            self._load_wrist_calib(quiet=True)
+        self._load_wrist_calib(quiet=True)
 
     # ---------- 数据通道 ----------
     def _build_channels(self) -> None:
@@ -2073,6 +2470,18 @@ class ScopeWindow(QMainWindow):
         for i in (1, 2, 3):
             self.channels[f"tension_f{i}"] = Channel(
                 f"tension_f{i}", f"C{i} 张力N", "腕部张力")
+            # 2026-11-24 用户要求：张力**目标值**与实测值同图对比（力控族三模式都有）
+            self.channels[f"tension_f{i}_tgt"] = Channel(
+                f"tension_f{i}_tgt", f"C{i} 张力目标N", "腕部张力")
+        # 位姿曲线（2026-11-23 用户要求）：roll/pitch 的目标角与当前角同图对比
+        self.channels["pose_roll"] = Channel(
+            "pose_roll", "ROLL 当前°", "位姿角度")
+        self.channels["pose_roll_tgt"] = Channel(
+            "pose_roll_tgt", "ROLL 目标°", "位姿角度")
+        self.channels["pose_pitch"] = Channel(
+            "pose_pitch", "PITCH 当前°", "位姿角度")
+        self.channels["pose_pitch_tgt"] = Channel(
+            "pose_pitch_tgt", "PITCH 目标°", "位姿角度")
         # 张紧程度 t = f·n̂ 常驻曲线（数据驱动，无需闭环；无 n̂ 位姿记 NaN 断口）
         self.channels["tension_preload"] = Channel(
             "tension_preload", "张紧 t N", "腕部张力")
@@ -2100,8 +2509,15 @@ class ScopeWindow(QMainWindow):
         self.setCentralWidget(central)
         root_layout = QVBoxLayout(central)
 
-        # 顶部工具栏
+        # ---------------- 顶部工具栏（两行分组，统一行高/间距） ----------------
+        # 2026-11-24 重排：原来 25 个控件全挤在一行 HBox 里 —— 间距随文字长度乱变、
+        # 复选框和按钮基线不齐、最右边「舵机信息」被挤出窗口（窗口最小宽度被顶到
+        # 1936px，1366/1600 屏直接看不全）。现在拆两行，每行按语义分组：
+        #   ① 连接 / 运行   ② 曲线显示 / 预设 / 独立窗口
+        # 行高与控件尺寸由 app_theme 的 QWidget#toolbar 规则统一（26px），
+        # 组间用 1px 竖线分隔，组内 8px。
         bar = QHBoxLayout()
+        bar.setSpacing(8)
         self.port_combo = QComboBox()
         self.port_combo.setEditable(True)
         self.port_combo.addItem(default_port)
@@ -2145,20 +2561,55 @@ class ScopeWindow(QMainWindow):
         self.export_btn = QPushButton("导出CSV")
         self.export_btn.clicked.connect(self._export_csv)
         bar.addWidget(self.export_btn)
-        bar.addWidget(QLabel("窗口"))
+        bar.addStretch(1)
+
+        # ---- 第二行：曲线显示 / 预设 / 独立窗口 ----
+        bar2 = QHBoxLayout()
+        bar2.setSpacing(8)
+        bar2.addWidget(QLabel("窗口"))
         self.window_combo = QComboBox()
         self.window_combo.addItems(["10s", "30s", "60s", "120s"])
         self.window_combo.setCurrentIndex(1)
-        bar.addWidget(self.window_combo)
+        bar2.addWidget(self.window_combo)
+        # 主图帧率上限（2026-11-24 新增）：60/75/90，即时生效。
+        # 数据源只有 100Hz，再高没有新点可画，反会和 drain/表格抢线程。
+        bar2.addWidget(QLabel("帧率"))
+        self.plot_hz_combo = QComboBox()
+        self.plot_hz_combo.addItems(["60", "75", "90"])
+        # 环境变量 MMHAND_PLOT_HZ 给了非预设值（如 30）时也如实显示
+        _hz_txt = str(int(PLOT_HZ))
+        if self.plot_hz_combo.findText(_hz_txt) < 0:
+            self.plot_hz_combo.addItem(_hz_txt)
+        self.plot_hz_combo.setCurrentText(_hz_txt)
+        self.plot_hz_combo.setFixedWidth(64)
+        self.plot_hz_combo.setToolTip(
+            "主图刷新率上限（FPS）。数据源只有 100Hz（P4 控制周期 10ms）：\n"
+            "· 60 = 最省 CPU，一帧约 1.7 个新点\n"
+            "· 75 = 默认，一帧约 1.3 个新点\n"
+            "· 90 = 接近原生 100Hz，GUI 线程忙时吃不满\n"
+            "勾「运行优先」时闭环运行期间减半。改完立即生效，不写存档。")
+        self.plot_hz_combo.currentTextChanged.connect(self._set_plot_hz)
+        bar2.addWidget(self.plot_hz_combo)
+        # 抗锯齿（默认关）：勾上线条明显顺滑，代价是 paint 约 +70%。
+        self.aa_check = QCheckBox("抗锯齿")
+        self.aa_check.setChecked(False)
+        self.aa_check.setToolTip(
+            "曲线抗锯齿（默认关）。\n"
+            "· 开 = 线条顺滑（高 DPI 下差别明显），但 paint +70%，"
+            "帧率高时会掉帧\n"
+            "· 关 = 省 CPU，锯齿感重一些\n"
+            "只有曲线重绘受影响，数据链不受影响。")
+        self.aa_check.toggled.connect(self._set_plot_aa)
+        bar2.addWidget(self.aa_check)
         self.xauto_check = QCheckBox("X跟随")
         self.xauto_check.setChecked(True)
         self.xauto_check.setToolTip("X 轴自动跟随最新数据滚动（示波器模式）；取消勾选可手动拖动/缩放")
-        bar.addWidget(self.xauto_check)
+        bar2.addWidget(self.xauto_check)
         self.yauto_check = QCheckBox("Y自适应")
         self.yauto_check.setChecked(True)
         self.yauto_check.toggled.connect(self._on_yauto_toggled)
-        bar.addWidget(self.yauto_check)
-        bar.addWidget(QLabel("Y限"))
+        bar2.addWidget(self.yauto_check)
+        bar2.addWidget(QLabel("Y限"))
         self._loading_layout = False
         self.ymin_spin = QSpinBox()
         self.ymax_spin = QSpinBox()
@@ -2167,28 +2618,30 @@ class ScopeWindow(QMainWindow):
             s.setValue(default)
             s.setFixedWidth(76)
             s.valueChanged.connect(lambda _=0: self._apply_y_limits())
-            bar.addWidget(s)
+            bar2.addWidget(s)
         self.norm_check = QCheckBox("归一化")
         self.norm_check.setToolTip("每条曲线按窗口内自身 min/max 归一化，解决量纲混画")
-        bar.addWidget(self.norm_check)
+        bar2.addWidget(self.norm_check)
         self.abstime_check = QCheckBox("绝对时间")
         self.abstime_check.toggled.connect(self._on_abstime_toggled)
-        bar.addWidget(self.abstime_check)
-        bar.addWidget(QLabel("预设"))
+        bar2.addWidget(self.abstime_check)
+        bar2.addWidget(QLabel("预设"))
         self.preset_combo = QComboBox()
         self.preset_combo.addItems(["自定义", "腕部调试", "全磁编raw", "M27-29遥测", "全清"])
         self.preset_combo.currentIndexChanged.connect(self._apply_preset)
-        bar.addWidget(self.preset_combo)
+        bar2.addWidget(self.preset_combo)
         self.only_online_check = QCheckBox("只显示在线")
         self.only_online_check.setChecked(True)
         self.only_online_check.toggled.connect(self._refresh_table_visibility)
-        bar.addWidget(self.only_online_check)
+        bar2.addWidget(self.only_online_check)
         self.theme_combo = QComboBox()
         self.theme_combo.setToolTip("全局配色：切换立即生效并随布局记住\n自定义=逐槽选色（未设槽继承夜间）")
         self.theme_combo.addItems(list(AT.DISPLAY_NAMES.values()))
         self.theme_combo.currentIndexChanged.connect(self._on_theme_selected)
-        bar.addWidget(self.theme_combo)
-        bar.addStretch(1)
+        bar2.addWidget(self.theme_combo)
+        bar2.addStretch(1)
+        # 带宽指示 + 三个独立窗口按钮移到第一行右侧：第二行加了「帧率/抗锯齿」
+        # 后单行放不下（整窗最小宽度会被顶到 1500），拆开两边之后两行都约 1100。
         self.bw_label = QLabel("带宽: 全开")
         bar.addWidget(self.bw_label)
         self.rt_btn = QPushButton("📐 张力·R")
@@ -2199,7 +2652,23 @@ class ScopeWindow(QMainWindow):
         self.watch_btn.setToolTip("打开独立参数监视窗口（右键删除块/下拉添加/可置顶）")
         self.watch_btn.clicked.connect(self._toggle_watch_window)
         bar.addWidget(self.watch_btn)
-        root_layout.addLayout(bar)
+        # 2026-11-20：舵机信息窗（ABS/raw/速度/负载/电流/电压/温度/逻辑行程）
+        self.servo_info_btn = QPushButton("🔧 舵机信息")
+        self.servo_info_btn.setToolTip(
+            "打开舵机信息窗：M27-M29 的 ABS/raw/速度/负载/电流/电压/温度，\n"
+            "以及会话逻辑行程 min..max（点「读取行程」向 P4 请求）。\n"
+            "可导出 CSV。舵机 EEPROM 里的 P/D/I/力矩限制需要固件支持（暂无）。")
+        self.servo_info_btn.clicked.connect(self._toggle_servo_info_window)
+        bar.addWidget(self.servo_info_btn)
+
+        bar_host = QWidget()
+        bar_host.setObjectName("toolbar")
+        bar_v = QVBoxLayout(bar_host)
+        bar_v.setContentsMargins(0, 0, 0, 0)
+        bar_v.setSpacing(6)
+        bar_v.addLayout(bar)
+        bar_v.addLayout(bar2)
+        root_layout.addWidget(bar_host)
 
         # 中部：通道树 + 曲线
         splitter = QSplitter(Qt.Horizontal)
@@ -2214,7 +2683,7 @@ class ScopeWindow(QMainWindow):
         tree_wrap.addWidget(self.tree_search)
         self.tree = QTreeWidget()
         self.tree.setHeaderLabel("通道（勾选上曲线，双击换色）")
-        self.tree.setMinimumWidth(240)
+        self.tree.setMinimumWidth(180)
         groups = {}
         color_i = 0
         for ch in self.channels.values():
@@ -2241,40 +2710,47 @@ class ScopeWindow(QMainWindow):
 
         self.time_axis = RelativeTimeAxis(orientation="bottom")
         self.plot = _TimedPlotWidget(axisItems={"bottom": self.time_axis})
+        self.plot.setMinimumWidth(460)
         self.plot.showGrid(x=True, y=True, alpha=0.3)
         # 渲染减压（2026-11-03 卡顿修复）：多通道 100FPS 光栅是 GUI 卡顿主源，
         # 配合 33FPS 门 + 峰值降采样 + 视口裁剪，曲线密度再高也稳。
         _pi = self.plot.getPlotItem()
         _pi.setDownsampling(mode="peak")
         _pi.setClipToView(True)
+        # 2026-11-24：抗锯齿默认关（原生窗口实测 +5.4ms paint），
+        # 需要更顺滑的线条时勾工具栏「抗锯齿」，见 _set_plot_aa()。
         self.plot.setAntialiasing(False)
         self.legend = self.plot.addLegend(offset=(10, 10))
+        self._style_legend()
         self.plot.setLabel("bottom", "时间")
         self.plot.getPlotItem().showButtons()
-        # 暂停覆盖标记
-        self.paused_text = pg.TextItem("⏸ 已暂停（点『恢复曲线』继续）", color="#ffb300", anchor=(0.5, 0))
-        self.paused_text.setPos(0, 0)
-        self.paused_text.setParentItem(self.plot.getPlotItem().vb)
-        self.paused_text.setZValue(100)
-        self.paused_text.hide()
+        # 暂停覆盖标记 / 空图提示：用子 QLabel 贴在图区正中（见 _TimedPlotWidget）
+        self.paused_text = QLabel("⏸ 已暂停（点『恢复曲线』继续）")
+        self.paused_text.setObjectName("plotHint")
+        self.plot.add_overlay(self.paused_text)
+        self.paused_text.setVisible(False)
         # 无曲线提示：勾选为空时给出可操作的指引
-        self.empty_plot_text = pg.TextItem(
-            "曲线区为空：在左侧通道树勾选通道，或用工具栏「预设」一键加载",
-            color="#ffb300", anchor=(0.5, 0.5))
-        self.empty_plot_text.setParentItem(self.plot.getPlotItem().vb)
-        self.empty_plot_text.setZValue(99)
-        self.plot.getPlotItem().vb.sigRangeChanged.connect(
-            lambda *_: self.empty_plot_text.setPos(
-                sum(self.plot.getPlotItem().vb.viewRange()[0]) / 2,
-                sum(self.plot.getPlotItem().vb.viewRange()[1]) / 2))
-        # 十字游标 + 数值读出
+        self.empty_plot_text = QLabel(
+            "曲线区为空：在左侧通道树勾选通道，或用工具栏「预设」一键加载")
+        self.empty_plot_text.setObjectName("plotHint")
+        self.plot.add_overlay(self.empty_plot_text)
+        # 十字游标 + 采样点高亮 + 悬停数值浮层（2026-11-24）
+        self.plot.scope = self          # 双击事件回抛（加/删水平标记线）
         self.vLine = pg.InfiniteLine(angle=90, movable=False, pen="#888")
         self.hLine = pg.InfiniteLine(angle=0, movable=False, pen="#888")
         self.plot.addItem(self.vLine, ignoreBounds=True)
         self.plot.addItem(self.hLine, ignoreBounds=True)
-        self.cursor_label = pg.TextItem("", color="#e0e0e0", anchor=(0, 1))
-        self.cursor_label.setParentItem(self.plot.getPlotItem().vb)
-        self.cursor_label.setZValue(99)
+        # 悬停时高亮的"最近采样点"（每条可见曲线一个，颜色同曲线）
+        self._hover_dots = pg.ScatterPlotItem(size=7, pen=pg.mkPen(None))
+        self._hover_dots.setZValue(96)
+        self.plot.addItem(self._hover_dots, ignoreBounds=True)
+        # 数值浮层：子 QLabel 贴着鼠标走，比 pg.TextItem 清晰（不受数据坐标缩放）
+        self._hover_tip = QLabel(self.plot)
+        self._hover_tip.setObjectName("plotTip")
+        self._hover_tip.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self._hover_tip.hide()
+        self._h_markers = []            # 双击加的水平标记线
+        self._series_color = {}         # 通道名 → 颜色（浮层/高亮点用）
         # 鼠标移动事件每秒可达上百次：限流到 30Hz，避免每个事件都全量扫曲线。
         self._mouse_proxy = pg.SignalProxy(
             self.plot.scene().sigMouseMoved, rateLimit=30, delay=0.04,
@@ -2288,9 +2764,14 @@ class ScopeWindow(QMainWindow):
         panel_scroll = QScrollArea()
         panel_scroll.setWidget(self._build_control_panel())
         panel_scroll.setWidgetResizable(True)
+        # 2026-11-24：面板改成"两列 + 固定列宽"后内容最小宽度约 600，视口给
+        # 600~720 刚好不裁；整窗最小宽度从 1936 降到 ~1300（1366 屏可用）。
+        # 视口必须 ≥ 面板内容最小宽度（622 + 滚动条），否则右侧又被裁。
         panel_scroll.setMinimumWidth(640)
-        panel_scroll.setMaximumWidth(700)
-        panel_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        panel_scroll.setMaximumWidth(760)
+        # 2026-11-23：原来强制横向滚动条关闭，视口比内容窄时控件被**裁掉**
+        # （用户看到的"框太小、字被挡住"）。改成需要时出现横向滚动条，宁滚不裁。
+        panel_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         splitter.addWidget(panel_scroll)
 
         # 底部：数值表
@@ -2299,6 +2780,11 @@ class ScopeWindow(QMainWindow):
         self.enc_table.setHorizontalHeaderLabels(["通道", "raw", "角度°", "在线"])
         self.enc_table.verticalHeader().setVisible(False)
         self.enc_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        # 4 列铺满整表宽度（原来是 4 个 90px 的窄列 + 一大片空白，看着像没对齐）
+        _enc_hdr = self.enc_table.horizontalHeader()
+        _enc_hdr.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        for _c in range(1, 4):
+            _enc_hdr.setSectionResizeMode(_c, QHeaderView.Stretch)
         enc_row_names = {16: "J16 ROLL", 17: "J17 PITCH"}
         for r in range(ENCODER_COUNT):
             self.enc_table.setItem(r, 0, QTableWidgetItem(enc_row_names.get(r, f"J{r:02d}")))
@@ -2311,6 +2797,9 @@ class ScopeWindow(QMainWindow):
             ["电机", "ABS", "ABS最小", "ABS最大", "单圈", "速度", "负载", "电流", "电压V", "温度℃", "在线"])
         self.servo_table.verticalHeader().setVisible(False)
         self.servo_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        # 11 列按内容宽 + 最后一列吃掉余量：不再让「电压/温度/在线」被窗口边缘裁掉
+        _srv_hdr = self.servo_table.horizontalHeader()
+        _srv_hdr.setSectionResizeMode(QHeaderView.ResizeToContents)
         for r, m in enumerate(SERVO_TARGETS):
             self.servo_table.setItem(r, 0, QTableWidgetItem(f"M{m}"))
             for c in range(1, 11):
@@ -2334,10 +2823,16 @@ class ScopeWindow(QMainWindow):
         应用户要求把 M27-M29 移到"未使能"旁边，两列并排；2026-10-29 把组框标题
         "腕部直控 M27-M29"移入面板，与"● 未使能"同一行）。"""
         box = QGroupBox()
-        box.setMinimumWidth(620)
-        box.setMaximumWidth(680)
+        box.setObjectName("ctrlPanel")
+        # 面板宽度按"内容最小宽度"给，不再用 640 硬塞：940 宽的两列被挤成
+        # 646 时，右侧的 Go / +500 会被裁成 "Sc"（2026-11-24 用户截图）。
+        box.setMinimumWidth(622)
+        box.setMaximumWidth(760)
         lay = QVBoxLayout(box)
+        lay.setContentsMargins(12, 8, 12, 10)
+        lay.setSpacing(10)
         head = QHBoxLayout()
+        head.setSpacing(8)
         title = QLabel("腕部直控 M27-M29")
         title.setStyleSheet(
             f"font-size: 13px; font-weight: 600; color: {AT.T('muted')}; padding: 2px;")
@@ -2348,39 +2843,62 @@ class ScopeWindow(QMainWindow):
         head.addWidget(self.arm_light)
         head.addStretch(1)
         lay.addLayout(head)
+
+        # 两列：左=使能/急停/归零/步长（固定宽，按钮列对齐），右=M27-29 逐绳块（自适应）。
+        # 用两个真正的容器 widget（而不是裸 layout）才能锁住左列宽度，让右列所有
+        # 电机的 −/+/目标框/Go 共用同一组列边界。
         body = QHBoxLayout()
-        body.setSpacing(12)
+        body.setSpacing(14)
         lay.addLayout(body)
-        left = QVBoxLayout()
-        right = QVBoxLayout()
-        body.addLayout(left, 0)
-        body.addLayout(right, 1)
+        left_host = QWidget()
+        left_host.setFixedWidth(240)
+        left = QVBoxLayout(left_host)
+        left.setContentsMargins(0, 0, 0, 0)
+        left.setSpacing(8)
+        right_host = QWidget()
+        right = QGridLayout(right_host)
+        right.setContentsMargins(0, 0, 0, 0)
+        right.setHorizontalSpacing(6)
+        right.setVerticalSpacing(4)
+        right.setColumnMinimumWidth(0, 92)
+        right.setColumnStretch(1, 0)
+        right.setColumnStretch(2, 0)
+        right.setColumnStretch(3, 1)
+        right.setColumnMinimumWidth(3, 86)
+        right.setColumnMinimumWidth(4, 40)
+        body.addWidget(left_host, 0, Qt.AlignTop)
+        body.addWidget(right_host, 1, Qt.AlignTop)
 
         self.roll_label = QLabel("ROLL  --.-°")
         self.roll_label.setStyleSheet(
-            f"font-size: 26px; font-weight: bold; color: {AT.T('accent')}; padding: 2px;")
+            f"font-size: 24px; font-weight: bold; color: {AT.T('accent')}; padding: 0;")
         self.roll_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.pitch_label = QLabel("PITCH --.-°")
         self.pitch_label.setStyleSheet(
-            f"font-size: 26px; font-weight: bold; color: {AT.T('good')}; padding: 2px;")
+            f"font-size: 24px; font-weight: bold; color: {AT.T('good')}; padding: 0;")
         self.pitch_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
-        left.addWidget(self.roll_label)
-        left.addWidget(self.pitch_label)
         self.roll_detail = QLabel("绝对 --.-°  raw --  基准 --")
         self.roll_detail.setObjectName("muted")
         self.pitch_detail = QLabel("绝对 --.-°  raw --  基准 --")
         self.pitch_detail.setObjectName("muted")
+        # 数值与自己的说明行紧挨着（原来 4 行是 "ROLL/PITCH/说明/说明"，
+        # 两条「无数据」叠在一起看不出是哪根轴）；说明允许换行，别撑宽左列。
+        for _w in (self.roll_detail, self.pitch_detail):
+            _w.setWordWrap(True)
+        left.addWidget(self.roll_label)
         left.addWidget(self.roll_detail)
+        left.addWidget(self.pitch_label)
         left.addWidget(self.pitch_detail)
         zero_row = QHBoxLayout()
+        zero_row.setSpacing(6)
         tip = "把当前角度记为 0 点参考，Δ 立即归零；随时可按，不影响控制"
-        self.zero_roll_btn = QPushButton("📐 ROLL")
+        self.zero_roll_btn = QPushButton("ROLL 归零")
         self.zero_roll_btn.setToolTip("ROLL(J16) 零位 = 当前角度。" + tip)
         self.zero_roll_btn.clicked.connect(lambda _=False: self._set_angle_baseline_now(16))
-        self.zero_pitch_btn = QPushButton("📐 PITCH")
+        self.zero_pitch_btn = QPushButton("PITCH 归零")
         self.zero_pitch_btn.setToolTip("PITCH(J17) 零位 = 当前角度。" + tip)
         self.zero_pitch_btn.clicked.connect(lambda _=False: self._set_angle_baseline_now(17))
-        self.zero_both_btn = QPushButton("📐 双轴")
+        self.zero_both_btn = QPushButton("双轴")
         self.zero_both_btn.setToolTip("ROLL+PITCH 同时归零。" + tip)
         self.zero_both_btn.clicked.connect(lambda _=False: self._set_angle_baseline_now(None))
         for b in (self.zero_roll_btn, self.zero_pitch_btn, self.zero_both_btn):
@@ -2393,6 +2911,7 @@ class ScopeWindow(QMainWindow):
         left.addWidget(self.enable_btn)
 
         estop_row = QHBoxLayout()
+        estop_row.setSpacing(6)
         self.stop_btn = QPushButton("⛔ 急停 STOP")
         self.stop_btn.setToolTip(
             "抢占式下发 STOP：先清空待发运动指令、不等记账。\n"
@@ -2403,12 +2922,14 @@ class ScopeWindow(QMainWindow):
         self.stop_btn.clicked.connect(self._on_stop)
         estop_row.addWidget(self.stop_btn, 1)
         self.reset_btn = QPushButton("复位")
+        self.reset_btn.setFixedWidth(64)
         self.reset_btn.setStyleSheet("padding: 8px;")
         self.reset_btn.setToolTip("清除 E-STOP 锁存与可恢复故障（CMD_RESET）")
         self.reset_btn.clicked.connect(self._on_reset)
         estop_row.addWidget(self.reset_btn)
         left.addLayout(estop_row)
         zero_row = QHBoxLayout()
+        zero_row.setSpacing(6)
         self.save_zero_btn = QPushButton("💾 存储零位")
         self.save_zero_btn.setToolTip("记录当前 M27-29 位置与 ROLL/PITCH 编码器零点，存到 wrist_zero.json")
         self.save_zero_btn.clicked.connect(self._save_wrist_zero)
@@ -2421,6 +2942,7 @@ class ScopeWindow(QMainWindow):
 
         # 绳一键操作（PLAN v8.2 D2/D3）：紧绳=TDA 恢复到标准分布；松绳=全放
         rope_row = QHBoxLayout()
+        rope_row.setSpacing(6)
         self.tighten_rope_btn = QPushButton("🪢 一键紧绳")
         self.tighten_rope_btn.setToolTip(
             "事务化：切力矩模式→τd=0→预紧=t_tgt→启动闭环（TDA 拉三缆到标准分布\n"
@@ -2441,15 +2963,18 @@ class ScopeWindow(QMainWindow):
         left.addLayout(rope_row)
 
         step_row = QHBoxLayout()
+        step_row.setSpacing(6)
         step_row.addWidget(QLabel("步长"))
         self.step_combo = QComboBox()
         self.step_combo.addItems(["100", "250", "500", "1000", "2000"])
         self.step_combo.setCurrentIndex(2)
         step_row.addWidget(self.step_combo)
+        self.step_combo.setFixedWidth(96)
         step_row.addStretch(1)
         left.addLayout(step_row)
         # 步长快捷档：一键切换（与下拉框同步，按钮文字随选中的档位高亮）
         preset_row = QHBoxLayout()
+        preset_row.setSpacing(6)
         self.step_preset_btns = []
         for s in ("100", "500", "1000", "2000"):
             b = QPushButton(s)
@@ -2463,8 +2988,12 @@ class ScopeWindow(QMainWindow):
 
         self.motor_info = {}
         self.jog_buttons = []
-        for m in SERVO_TARGETS:
-            row = QHBoxLayout()
+        # 逐电机一行 + 一行状态说明，全部落在同一套列边界上：
+        #   col0 使能勾选 | col1 −步长 | col2 +步长 | col3 相对目标输入(拉伸) | col4 Go
+        # 原来每台电机是 3 个独立 HBoxLayout，勾选框/按钮/输入框/Go 的宽度各算各的，
+        # 三台电机之间、以及同一台的上下行之间都错位（2026-11-24 重排）。
+        for i, m in enumerate(SERVO_TARGETS):
+            row0 = i * 2
             # 逐绳使能开关：替代原 "Mxx" 标签。缆号按 MOTOR_FOR_CABLE 动态算，
             # 换序时标签跟着换（如 M28·C3）。默认勾选=与旧行为一致，布局持久化。
             cable = self._cable_label(m)
@@ -2479,43 +3008,40 @@ class ScopeWindow(QMainWindow):
                 "一根都没勾 → 拒绝使能；闭环运行中改勾选 → 先停闭环。")
             tag.toggled.connect(lambda checked, mm=m: self._on_cable_enable_toggled(mm, checked))
             self.cable_enable_checks[m] = tag
-            row.addWidget(tag)
+            right.addWidget(tag, row0, 0, Qt.AlignVCenter)
             minus = QPushButton(f"−{self._step()}")
             plus = QPushButton(f"＋{self._step()}")
             self.jog_buttons_by_motor[m] = [minus, plus]
-            for b, d in ((minus, -1), (plus, 1)):
-                b.setMinimumHeight(34)
+            for b, d, col in ((minus, -1, 1), (plus, 1, 2)):
+                b.setMinimumWidth(50)
                 b.setAutoRepeat(True)
                 b.setAutoRepeatDelay(280)
                 b.setAutoRepeatInterval(90)
                 b.clicked.connect(lambda _=False, mm=m, dd=d: self._jog(mm, dd * self._step()))
                 b.setEnabled(False)
                 self.jog_buttons.append(b)
-                row.addWidget(b, 1)
-            right.addLayout(row)
-            # 手动目标行：绝对值输入 + Go（回车同效）
-            tgt_row = QHBoxLayout()
+                right.addWidget(b, row0, col)
+            # 手动目标行：相对上次目标输入 + Go（回车同效）
             edit = QLineEdit()
-            edit.setPlaceholderText(f"M{m} 相对当前位置，回车=发送")
+            edit.setPlaceholderText(f"M{m} 增量")
+            edit.setToolTip(f"M{m} 手动目标：填相对上次目标的 counts 增量，回车或点 Go 发送")
             edit.setInputMethodHints(Qt.ImhDigitsOnly | Qt.ImhLatinOnly)
-            edit.setMinimumHeight(30)
+            edit.setMinimumWidth(86)
             go = QPushButton("Go")
-            go.setMinimumHeight(30)
-            go.setFixedWidth(44)
+            go.setFixedWidth(40)
             edit.returnPressed.connect(lambda mm=m, ed=edit: self._send_manual_target(mm, ed))
             go.clicked.connect(lambda _=False, mm=m, ed=edit: self._send_manual_target(mm, ed))
-            tgt_row.addWidget(edit, 1)
-            tgt_row.addWidget(go)
-            right.addLayout(tgt_row)
+            right.addWidget(edit, row0, 3)
+            right.addWidget(go, row0, 4)
             self.target_edits[m] = edit
             self.go_buttons[m] = go
             info = QLabel("未使能")
             info.setStyleSheet(
                 f"color: {AT.T('muted')}; font-size: 11px; padding-left: 4px;")
             info.setWordWrap(True)   # 长状态行允许换行，不撑宽右列
-            right.addWidget(info)
+            right.addWidget(info, row0 + 1, 0, 1, 5)
             self.motor_info[m] = info
-        right.addStretch(1)
+        right.setRowStretch(len(SERVO_TARGETS) * 2, 1)
 
         def _refresh_jog_labels():
             for b in self.jog_buttons:
@@ -2528,24 +3054,20 @@ class ScopeWindow(QMainWindow):
         speed_row = QHBoxLayout()
         self.ramp_check = QCheckBox("限速斜坡")
         self.ramp_check.setChecked(True)
-        self.ramp_check.setToolTip("大位移目标按最大速率分步发送，避免舵机全速冲")
+        self.ramp_check.setToolTip("点动和 Go 按最大速率每 50 ms 分步发送；连按会累加到斜坡终点")
         speed_row.addWidget(self.ramp_check)
         speed_row.addWidget(QLabel("最大"))
         self.ramp_rate_spin = QSpinBox()
         self.ramp_rate_spin.setRange(100, 50000)
         self.ramp_rate_spin.setValue(3000)
         self.ramp_rate_spin.setSuffix(" c/s")
+        self.ramp_rate_spin.setFixedWidth(120)
         speed_row.addWidget(self.ramp_rate_spin)
         speed_row.addStretch(1)
         lay.addLayout(speed_row)
-        servo_speed_note = QLabel(
-            "舵机速度：寄存器已烧录 2000 steps/s（2026-11-11 由 1000 升档；量程 0-3400）\n"
-            "（协议直控命令不含速度字段；实测值看底部舵机表『速度』列。\n"
-            " 与「每拍限幅 20 counts/拍 × 100Hz = 2000 c/s」正好配套）")
-        servo_speed_note.setStyleSheet(
-            f"color: {AT.T('muted')}; font-size: 11px; padding: 2px;")
-        servo_speed_note.setWordWrap(True)
-        lay.addWidget(servo_speed_note)
+        # 2026-11-20 删掉原来那段「已烧录 2000 steps/s / 与每拍限幅配套」的说明：
+        # 舵机速度是**固件常量**（SERVO_TARGET_SPEED_DEFAULT，现 3400），
+        # 上位机不发也不读；实测值直接看电机行/舵机信息窗的「速度」列即可。
         lay.addWidget(self._build_closed_loop_panel())
 
         self.ctrl_status = QLabel("未使能")
@@ -2561,120 +3083,217 @@ class ScopeWindow(QMainWindow):
         return box
 
     def _build_closed_loop_panel(self) -> QWidget:
-        """负反馈闭环面板：ROLL/PITCH 目标角 -> 系数矩阵 -> M27-29（闭环 100Hz）。"""
+        """负反馈闭环面板：ROLL/PITCH 目标角 -> 系数矩阵 -> M27-29（闭环 100Hz）。
+
+        2026-11-24 重排：原来十几行各是一个独立 QHBoxLayout，标签宽度随文字长度
+        变化、输入框被拉伸，每行第一个输入框的 x 坐标都不一样（用户截图里就是
+        "对不齐"）。现在每行都是同一套列模板的 QGridLayout：标签列 62px 右对齐
+        + 输入列 96px，3 组/行，所有行的列边界共用，纵向严格对齐。
+        """
         box = QGroupBox("负反馈闭环 ROLL/PITCH")
+        box.setObjectName("clPanel")
         cl = QVBoxLayout(box)
+        cl.setContentsMargins(12, 8, 12, 10)
+        cl.setSpacing(8)
+
+        _LW, _FW, _GAP = 62, 96, 10
+        _PAIRS = 3
+
+        def _p(text: str) -> QLabel:
+            lb = QLabel(text)
+            lb.setFixedWidth(_LW)
+            lb.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            return lb
+
+        def _row_grid() -> QGridLayout:
+            """一行参数（≤3 组）：与其它行共用完全一样的列宽，因此纵向对齐。"""
+            g = QGridLayout()
+            g.setContentsMargins(0, 0, 0, 0)
+            g.setHorizontalSpacing(_GAP)
+            g.setVerticalSpacing(6)
+            for c in range(_PAIRS):
+                g.setColumnMinimumWidth(2 * c, _LW)
+                g.setColumnMinimumWidth(2 * c + 1, _FW)
+                g.setColumnStretch(2 * c + 1, 0)
+            g.setColumnStretch(_PAIRS * 2, 1)
+            return g
+
+        def _add(g: QGridLayout, idx: int, label: str, w) -> QGridLayout:
+            """第 idx 组（0..2）→ 标签 + 控件；label="" 时控件直接从标签列起排。"""
+            col = 2 * idx
+            if label:
+                g.addWidget(_p(label), 0, col)
+                g.addWidget(w, 0, col + 1)
+            else:
+                g.addWidget(w, 0, col, 1, 2)
+            return g
 
         # 控制模式：位置（角度闭环）/ 张力·力控（张力闭环 PI → 位置 trim）
         mode_row = QHBoxLayout()
         mode_row.addWidget(QLabel("模式"))
         self.cl_mode_combo = QComboBox()
-        self.cl_mode_combo.addItems(["位置模式（角度闭环）",
-                                     "张力控制（每缆张力闭环）",
-                                     "张紧控制（预紧度闭环）",
-                                     "力矩控制（解耦力矩闭环）"])
+        for mode, label in (
+            ("position", "位置模式（角度闭环）"),
+            ("tension", "张力控制（每缆张力闭环）"),
+            ("tight", "张紧控制（预紧度闭环）"),
+            ("force", "力矩控制（τ 开环 → 张力闭环）"),
+            ("impedance", "阻抗控制（位置→力矩，框架）"),
+            ("c1_position", "混合控制（C1 张力 + 双轴角度）"),
+        ):
+            self.cl_mode_combo.addItem(label, mode)
         self.cl_mode_combo.setToolTip(
             "位置模式：被控量=关节角度（前馈用解析模型绳长 + R·e 校正，需「模型前馈」）。\n"
             "张力控制：被控量=每根缆的张力 N（逐缆 PI→trim），最直观，台架起步用。\n"
             "张紧控制：被控量=预紧程度（沿零空间整体收紧/放松，力矩保持不变）。\n"
-            "力矩控制：被控量=关节力矩 τ（论文 v2：TDA 分配+解耦校正），进阶。\n"
+            "力矩控制：目标 τ 经分配算 f_d，**再由张力环追 f_d**。\n"
+            "  闭合的是「三根绳的张力」；τ 另外有**慢积分修正**（面板「τ修正」，\n"
+            "  默认 1.0/s）把 τ* 与实测 R·f 的稳态差补回去——只积分不带 P，\n"
+            "  因为 τ 误差本身就是内环的响应，带 P 会和内环打架（2026-11-18 实测振荡）。\n"
+            "  填 0 = 纯前馈；补不了 R 模型误差与导管摩擦。\n"
             "力控投入后腕停在当前位姿附近，手掰会顺从回力；角度目标被忽略。\n"
+            "混合控制：C1 张力闭环，C2/C3 用位置环控制 ROLL/PITCH；只需 C1 张力反馈。\n"
             "切换模式会先停止正在运行的闭环。")
         self.cl_mode_combo.currentIndexChanged.connect(self._on_cl_mode_changed)
         mode_row.addWidget(self.cl_mode_combo, 1)
         cl.addLayout(mode_row)
-        self._cl_mode = "position"          # 'position'|'tension'|'tight'|'force'
+        self._cl_mode = "position"
         self._force_state = WristForceV2State()     # 力矩模式（v2）
         self._tension_state = WristTensionState()   # 张力模式
+        self._c1_position_state = C1TensionState()
+        self._c1_angle_state = WristPidState()
+        self._c1_position_params = None
         # 2026-11-19：张紧已改为「逐缆绝对目标 f_d=t*·n̂ + 同一个张力环」，
         # 原来的 _tight_state（单标量 PI 的状态）不再使用，删掉。
         self._pos_pid_state = WristPidState()       # 位置环 PID 状态（两种结构共用）
         # 诊断记录（2026-11-19）：20Hz × 25min，供「🔬 诊断 CSV」导出
-        self._diag_rows = deque(maxlen=30000)
+        self._diag_rows = deque(maxlen=30000)          # 力控/张力：位姿+张力+τ+trim
+        self._pos_diag_rows = deque(maxlen=30000)      # 位置：位姿+目标+目标counts+实测
+        self._c1_diag_rows = deque(maxlen=30000)
         self._force_base = None             # 进入力控时刻的电机位置基准
         self._force_trim = [0.0, 0.0, 0.0]  # 上次发送的 trim（变更抑制用）
+        self._tau_trim = [0.0, 0.0]         # 力矩修正（慢积分外环）的修正量 [N·m]
         self._force_need_send = False       # 重入首拍强制下发 base（防目标跳变）
 
-        self.cl_roll_now = QLabel("ROLL  --.--°→--.--°  编码器 --→--")
+        self.cl_roll_now = QLabel("ROLL  --.--°→--.--°")
         self.cl_roll_now.setStyleSheet(
             "font-size: 16px; font-weight: bold; color: #64b5f6; padding: 1px;")
         cl.addWidget(self.cl_roll_now)
-        self.cl_pitch_now = QLabel("PITCH --.--°→--.--°  编码器 --→--")
+        self.cl_pitch_now = QLabel("PITCH --.--°→--.--°")
         self.cl_pitch_now.setStyleSheet(
             "font-size: 16px; font-weight: bold; color: #81c784; padding: 1px;")
         cl.addWidget(self.cl_pitch_now)
 
         self._cl_tgt_row_w = QWidget()          # 容器：力控模式下整行隐藏
-        tgt_row = QHBoxLayout(self._cl_tgt_row_w)
-        tgt_row.setContentsMargins(0, 0, 0, 0)
-        tgt_row.addWidget(QLabel("目标°"))
+        tgt_box = QVBoxLayout(self._cl_tgt_row_w)
+        tgt_box.setContentsMargins(0, 0, 0, 0)
+        tgt_box.setSpacing(4)
+
+        # 行1：目标角 + 分轴闭环开关
         self.cl_edits["roll_tgt"] = self._cl_edit("ROLL目标°")
         self.cl_edits["pitch_tgt"] = self._cl_edit("PITCH目标°")
-        tgt_row.addWidget(self.cl_edits["roll_tgt"], 1)
-        tgt_row.addWidget(self.cl_edits["pitch_tgt"], 1)
         # 分轴闭环开关：取消勾选的轴其系数列整体置零（前馈+校正都不作用）
         self.cl_roll_check = QCheckBox("ROLL环")
         self.cl_roll_check.setChecked(True)
         self.cl_roll_check.setToolTip("只闭环 ROLL：kr 系数列置零，Roll 方向不控、随耦合自由漂移")
-        tgt_row.addWidget(self.cl_roll_check)
         self.cl_pitch_check = QCheckBox("PITCH环")
         self.cl_pitch_check.setChecked(True)
         self.cl_pitch_check.setToolTip("只闭环 PITCH：kp 系数列置零，Pitch 方向不控、随耦合自由漂移")
-        tgt_row.addWidget(self.cl_pitch_check)
-        # 自动慢扫掠：闭环目标三角波（标定录数用），须启动闭环后才开始走
+        r1 = _row_grid()
+        _add(r1, 0, "ROLL目标", self.cl_edits["roll_tgt"])
+        _add(r1, 1, "PITCH目标", self.cl_edits["pitch_tgt"])
+        _axis_chk = QHBoxLayout()
+        _axis_chk.setSpacing(10)
+        _axis_chk.addWidget(self.cl_roll_check)
+        _axis_chk.addWidget(self.cl_pitch_check)
+        _axis_chk.addStretch(1)
+        r1.addLayout(_axis_chk, 0, 4, 1, 3)
+        tgt_box.addLayout(r1)
+
+        # 行2：扫掠开关 + 轴 + 波形
         self.sweep_check = QCheckBox("扫掠")
         self.sweep_check.setToolTip(
-            "闭环运行中让所选轴在 ±限幅 间按速度做三角波扫掠（目标框被自动改写）。\n"
-            "标定录数据：勾选「⏺记录」+ 扫掠 + 慢速（如 0.5°/s）= 高质量 CSV")
+            "闭环运行中让目标按所选轴/波形自动摆动（目标框被自动改写）。\n"
+            "三角波=录标定（慢速直线往返）；正弦波=跟随/带宽测试；\n"
+            "双轴正弦=ROLL/PITCH 同时按各自幅值同相位摆。")
         self.sweep_check.toggled.connect(self._on_sweep_toggled)
-        tgt_row.addWidget(self.sweep_check)
         self.sweep_axis = QComboBox()
-        self.sweep_axis.addItems(["ROLL", "PITCH"])
-        # 扫掠中切轴：按新轴目标框重新播种（否则目标跳到上一轴的值）
+        self.sweep_axis.addItems(["ROLL", "PITCH", "双轴正弦"])
+        self.sweep_axis.setMinimumWidth(92)
         self.sweep_axis.currentIndexChanged.connect(self._on_sweep_axis_changed)
-        tgt_row.addWidget(self.sweep_axis)
-        self.sweep_speed = QDoubleSpinBox()
-        self.sweep_speed.setRange(0.1, 5.0)
-        self.sweep_speed.setDecimals(1)
-        self.sweep_speed.setValue(0.5)
-        self.sweep_speed.setSuffix("°/s")
-        self.sweep_speed.setToolTip("扫掠速度（三角波用）：标定建议 0.2~0.5°/s（慢到准）")
-        tgt_row.addWidget(self.sweep_speed)
-        self.sweep_amp = QDoubleSpinBox()
-        self.sweep_amp.setRange(0.5, 90.0)
-        self.sweep_amp.setDecimals(1)
-        self.sweep_amp.setValue(25.0)
-        self.sweep_amp.setSuffix("°")
-        self.sweep_amp.setToolTip(
-            "波形幅值（峰）°：正弦/三角都按它摆；超过「限幅°」时按限幅截断。\n"
-            "正弦峰值速度 = 幅值×2πf，超过每拍限幅折算的速度就会削顶。")
-        tgt_row.addWidget(self.sweep_amp)
-        cl.addWidget(self._cl_tgt_row_w)
-        # 波形行（2026-11-10 新增正弦跟随测试）：三角波=录标定（原有），
-        # 正弦波=带宽/跟随测试——目标 A·sin(2πft)，A=限幅、f=频率框。
-        sweep_row = QHBoxLayout()
         self.sweep_wave_combo = QComboBox()
         self.sweep_wave_combo.addItems(["三角波", "正弦波"])
+        self.sweep_wave_combo.setMinimumWidth(92)
         self.sweep_wave_combo.setToolTip(
-            "三角波：线性往返（录标定数据用，配合慢速）。\n"
-            "正弦波：跟随/带宽测试——目标= 限幅×sin(2π·频率×t)，\n"
-            "看实际曲线的幅度衰减与相位滞后。峰值速度需求=限幅×2πf，\n"
-            "超过每拍限幅速度（20c/拍×100Hz = 2000 c/s）会削顶=带宽已到。")
-        sweep_row.addWidget(self.sweep_wave_combo)
+            "三角波：线性往返，按「速度°/s」走——录标定数据用（慢到准）。\n"
+            "正弦波：按「频率 Hz」走——跟随/带宽测试。\n"
+            "（轴=「双轴正弦」时固定用正弦，本下拉失效）")
+        self.sweep_wave_combo.currentIndexChanged.connect(lambda _=0: self._sync_sweep_widgets())
+        r2 = _row_grid()
+        _add(r2, 0, "", self.sweep_check)
+        _add(r2, 1, "轴", self.sweep_axis)
+        _add(r2, 2, "波形", self.sweep_wave_combo)
+        tgt_box.addLayout(r2)
+
+        # 行3：扫掠频率 + 两轴幅值
         self.sweep_freq = QDoubleSpinBox()
         self.sweep_freq.setRange(0.05, 2.0)
         self.sweep_freq.setDecimals(2)
         self.sweep_freq.setValue(0.2)
         self.sweep_freq.setSuffix(" Hz")
+        self.sweep_freq.setMinimumWidth(84)
         self.sweep_freq.setToolTip(
-            "正弦频率（仅正弦波用）。0.05~0.2Hz 看低频跟随；\n"
+            "正弦频率（三角波不用）。0.05~0.2Hz 看低频跟随；\n"
             "0.5Hz 以上逐步逼近带宽极限（幅度会缩、相位会滞后）")
-        sweep_row.addWidget(self.sweep_freq)
-        sweep_row.addStretch(1)
-        cl.addLayout(sweep_row)
+        self.sweep_amp = QDoubleSpinBox()
+        self.sweep_amp.setRange(0.5, 90.0)
+        self.sweep_amp.setDecimals(1)
+        self.sweep_amp.setValue(10.0)
+        self.sweep_amp.setSuffix("°")
+        self.sweep_amp.setMinimumWidth(76)
+        self.sweep_amp.setToolTip(
+            "ROLL 幅值（峰）°：三角/正弦/双轴都用它。\n"
+            "超过「限幅°」时按限幅截断；峰值速度 = 幅值×2πf。")
+        self.sweep_amp_p = QDoubleSpinBox()
+        self.sweep_amp_p.setRange(0.5, 90.0)
+        self.sweep_amp_p.setDecimals(1)
+        self.sweep_amp_p.setValue(5.0)
+        self.sweep_amp_p.setSuffix("°")
+        self.sweep_amp_p.setMinimumWidth(76)
+        self.sweep_amp_p.setToolTip(
+            "PITCH 幅值（峰）°：只在「双轴正弦」时用；\n"
+            "两轴同相位：roll = 中心 + A_r·sin(2πft)，pitch = 中心 + A_p·sin(2πft)。")
+        r3 = _row_grid()
+        _add(r3, 0, "频率", self.sweep_freq)
+        _add(r3, 1, "幅值 ROLL", self.sweep_amp)
+        _add(r3, 2, "幅值 PITCH", self.sweep_amp_p)
+        tgt_box.addLayout(r3)
+
+        # 行4：三角波速度 + 过零对称
+        self.sweep_speed = QDoubleSpinBox()
+        self.sweep_speed.setRange(0.1, 5.0)
+        self.sweep_speed.setDecimals(1)
+        self.sweep_speed.setValue(0.5)
+        self.sweep_speed.setSuffix("°/s")
+        self.sweep_speed.setMinimumWidth(80)
+        self.sweep_speed.setToolTip("三角波速度（正弦/双轴不用）：标定建议 0.2~0.5°/s（慢到准）")
+        # 2026-11-23 用户要求：现在扫掠大多只在正半轴（中心偏正），要能跑到正负。
+        # 勾「过零」后双轴正弦的中心强制 (0,0)，目标 = ±幅值·sin。
+        self.sweep_center0 = QCheckBox("过零对称")
+        self.sweep_center0.setChecked(True)
+        self.sweep_center0.setToolTip(
+            "双轴正弦专用：勾上后中心强制为 (0,0)，目标在 ±幅值 之间往返（正负都到）。\n"
+            "取消则用两个目标框里的值当中心（可做偏置扫掠，如中心 +5°）。")
+        self.sweep_center0.toggled.connect(lambda _=False: self._sweep_seed())
+        r4 = _row_grid()
+        _add(r4, 0, "三角速度", self.sweep_speed)
+        _add(r4, 1, "", self.sweep_center0)
+        tgt_box.addLayout(r4)
+        cl.addWidget(self._cl_tgt_row_w)
+        self._sync_sweep_widgets()
         self._sweep_val = 0.0
         self._sweep_dir = 1.0
         self._sweep_phase = 0.0     # 正弦相位（勾选时刻起算）
+        self._sweep_center = (0.0, 0.0)   # 双轴正弦的中心（勾选时的目标框）
         self._sweep_timer = QTimer(self)
         self._sweep_timer.setInterval(50)   # 20Hz 推进波形
         self._sweep_timer.timeout.connect(self._sweep_tick)
@@ -2685,74 +3304,117 @@ class ScopeWindow(QMainWindow):
         self._cl_gain_vals = {m: (0.0, 0.0) for m in SERVO_TARGETS}   # (ROLL系数, PITCH系数)
 
         self._cl_par_row_w = QWidget()          # 容器：力控模式下隐藏
-        par_row = QHBoxLayout(self._cl_par_row_w)
-        par_row.setContentsMargins(0, 0, 0, 0)
-        par_row.addWidget(QLabel("Kp"))
+        par_box = QVBoxLayout(self._cl_par_row_w)
+        par_box.setContentsMargins(0, 0, 0, 0)
+        par_box.setSpacing(4)
         self.cl_edits["kp"] = self._cl_edit("比例增益（关节角域，无量纲）", text="0.6")
-        par_row.addWidget(self.cl_edits["kp"])
-        par_row.addWidget(QLabel("Ki"))
         self.cl_edits["ki"] = self._cl_edit(
             "积分增益 1/s（关节角域）。0=纯PD。\n"
             "稳态误差（模型偏差/重力下垂）靠它吃掉；积分项被钳在「限幅°」×1 以内防 windup。",
             text="0")
-        par_row.addWidget(self.cl_edits["ki"])
-        par_row.addWidget(QLabel("Kd"))
         self.cl_edits["kd"] = self._cl_edit(
             "微分增益 s。微分作用在**反馈角速度**上（不是误差跳变），\n"
             "所以拖目标框不会砸出尖峰；反馈已过 76ms EMA，Kd 一般 0~0.05 就够。",
             text="0")
-        par_row.addWidget(self.cl_edits["kd"])
-        par_row.addWidget(QLabel("死区°"))
+        self.cl_ff_check = QCheckBox("前馈")
+        self.cl_ff_check.setChecked(True)
+        self.cl_ff_check.setToolTip(
+            "勾选 = 启用绳长前馈（按右边 k_ff 缩放）；\n"
+            "取消 = 纯 PID（前馈整项不参与，k_ff 框失效）。")
+        self.cl_edits["k_ff"] = self._cl_edit(
+            "绳长前馈系数 0~1：\n"
+            "  1   = 完全按模型给前馈（l(θ*)−l(θ_fb) 全量折 counts）\n"
+            "  0.3 = 只借 30% 的模型量，模型偏差也只放大 30%\n"
+            "  0   = 不用前馈（纯 PID）\n"
+            "模型/标定可信就给 1；不确定先从 0.2~0.3 试，看同样 kp 下\n"
+            "超调/静差是否变好，再逐步往上加。",
+            text="0.3")
+        p1 = _row_grid()
+        _add(p1, 0, "Kp", self.cl_edits["kp"])
+        _add(p1, 1, "Ki", self.cl_edits["ki"])
+        _add(p1, 2, "Kd", self.cl_edits["kd"])
+        par_box.addLayout(p1)
+
         self.cl_edits["deadband"] = self._cl_edit("死区°", text="0.3")
-        par_row.addWidget(self.cl_edits["deadband"])
-        par_row.addWidget(QLabel("限幅°"))
         self.cl_edits["limit"] = self._cl_edit("目标角限幅°", text="25")
-        par_row.addWidget(self.cl_edits["limit"])
-        par_row.addStretch(1)
+        # 2026-11-23 方案 B：分轴每拍限幅（counts/拍）。0 = 不单独限，仍用「每拍限幅」兜底。
+        self.cl_edits["max_step_r"] = self._cl_edit(
+            "ROLL 轴每拍限幅 [counts/拍]：把 ROLL 的前馈+PI 贡献单独钳住。\n"
+            "0 = 不用分轴限幅（仍受下面「每拍限幅」约束）。", text="0")
+        self.cl_edits["max_step_p"] = self._cl_edit(
+            "PITCH 轴每拍限幅 [counts/拍]：pitch 的 J 约为 roll 的 2.4 倍，\n"
+            "同样 counts 下角度更小，可单独给大一点。0 = 不用分轴限幅。", text="0")
+        p2 = _row_grid()
+        _add(p2, 0, "", self.cl_ff_check)
+        _add(p2, 1, "前馈系数", self.cl_edits["k_ff"])
+        _add(p2, 2, "死区°", self.cl_edits["deadband"])
+        par_box.addLayout(p2)
+        p3 = _row_grid()
+        _add(p3, 0, "限幅°", self.cl_edits["limit"])
+        _add(p3, 1, "ROLL每拍", self.cl_edits["max_step_r"])
+        _add(p3, 2, "PITCH每拍", self.cl_edits["max_step_p"])
+        par_box.addLayout(p3)
         cl.addWidget(self._cl_par_row_w)
 
         # 每拍限幅（位置模式与力控三模式共用；所有模式都显示这一行）
+        # 2026-11-20：tooltip 只留"这个框到底是什么"，删掉所有关于舵机速度的历史假设
+        # （曾写"配舵机 2000 steps/s"，而固件常量已经变过 1000→2000→3400，那种说法必然过时）。
         self._cl_step_row_w = QWidget()
-        step_row = QHBoxLayout(self._cl_step_row_w)
-        step_row.setContentsMargins(0, 0, 0, 0)
-        step_row.addWidget(QLabel("每拍限幅"))
+        _step_v = QVBoxLayout(self._cl_step_row_w)
+        _step_v.setContentsMargins(0, 0, 0, 0)
         self.cl_edits["max_step_f"] = self._cl_edit(
-            "每拍最大位置增量 counts，**位置模式与力控三模式共用同一个值**：\n"
-            "· 位置模式：绝对目标换算成每拍变化 ≤ 此值\n"
-            "· 力控/张紧/张力：增量式限速（每拍最多走这么多）\n"
-            "100Hz 下 20 counts/拍 = 2000 counts/s。\n"
-            "**限幅×频率 = 舵机 c/s**：20×100 = 2000（配舵机 2000 steps/s）。\n"
-            "改频率必须同步改这里，否则速度翻倍/减半\n"
-            "（2026-11-14 曾试 200Hz/10c，因舵机总线 10ms 时序做不到，已退回）。",
+            "每拍最大位置增量 [counts/拍]，位置模式与三个力控模式共用。\n"
+            "命令速率 = 本值 × 控制频率（本机 100 Hz → 20×100 = 2000 c/s）。\n"
+            "实际速度还受伺服跟踪与目标值（目标 − 实测）大小限制，不是本值直接决定；\n"
+            "速度天花板在舵机固件里（SERVO_TARGET_SPEED_DEFAULT=3400 c/s），上位机不设。\n"
+            "⚠ 本值是**位置领先量**，不是速度：舵机看到的误差恒等于它，速度 ≈ 13.35×本值\n"
+            "（20→267 c/s，120→1600 c/s，≈255 才打满 3400）。所以\n"
+            "· 想快 → **给大一点**（34 只有 454 c/s，是能力的 13%）\n"
+            "· 过冲大 → 先降 Kp；降本值会同时变慢\n"
+            "━━ 逐缆填写（2026-11-24）：可填 1 个数（三缆共用）或 3 个数"
+            "（逗号分隔，按 C1,C2,C3），例如 `34,34,20`。\n"
+            "原因：某根缆的导管更涩/更松时，允许它单独走快一点。",
             text="20")
-        step_row.addWidget(self.cl_edits["max_step_f"])
-        step_hint = QLabel("counts/拍（100Hz）")
+        s1 = _row_grid()
+        _add(s1, 0, "每拍限幅", self.cl_edits["max_step_f"])
+        step_hint = QLabel("counts/拍（控制频率 100Hz）")
         step_hint.setObjectName("muted")
-        step_row.addWidget(step_hint)
-        step_row.addStretch(1)
+        s1.addWidget(step_hint, 0, 2, 1, 5)
+        _step_v.addLayout(s1)
         cl.addWidget(self._cl_step_row_w)
+        # 2026-11-20 定案：不设「速度上限」框 —— 速度天花板在**舵机固件内部**
+        # （SERVO_TARGET_SPEED_DEFAULT），上位机不发也不该假装能设。
+        # 这里只保留「每拍限幅」这一个旋钮；命令速率 = count/拍 × 频率 由启动自检
+        # `_check_cmd_authority` 在状态行提示（只提示，不改值）。
 
         self._cl_model_row_w = QWidget()        # 容器：力控模式下隐藏
         model_row = QHBoxLayout(self._cl_model_row_w)
         model_row.setContentsMargins(0, 0, 0, 0)
-        self.cl_load_btn = QPushButton("📥 载入标定")
+        self.cl_load_btn = QPushButton("📥 重载标定（可选）")
         self.cl_load_btn.setToolTip(
-            "读取 run_data/scope_exports/wrist_calib.json（识别脚本 --write 生成）")
+            "默认已用内建标定（k=结构常数、符号=−trim方向、δ=0），**不需要按**。\n"
+            "只有换卷筒/换线径，或要用识别脚本生成的 wrist_calib.json 覆盖时才按：\n"
+            "读取 run_data/scope_exports/wrist_calib.json")
         self.cl_load_btn.clicked.connect(lambda: self._load_wrist_calib())
         model_row.addWidget(self.cl_load_btn)
-        # 位置环结构（2026-11-10）：前馈+PID（绝对式）/ 纯PID（增量式）。
-        self.pos_loop_combo = QComboBox()
-        self.pos_loop_combo.addItems(["前馈+PID", "纯PID"])
-        self.pos_loop_combo.setToolTip(
-            "位置环两种结构（同一套 PID，只差基准）：\n"
-            "· 前馈+PID：绝对式。目标 counts = origin + k·[l(目标)−l(启动位姿)] + J·δθ，\n"
-            "  模型算绳长前馈，PID 只补模型误差——到位最快、稳态靠积分。\n"
-            "· 纯PID：增量式。目标 counts = 实测位置 + J·δθ，不做前馈、不用模型绳长，\n"
-            "  只借当前雅可比 J=−k·R 把角度误差折算成 counts（和三个力控模式同一个\n"
-            "  '每拍从实测走一步'语义）。\n"
-            "两者都需要载入标定（k 与 R）；运行中切换会先停环。")
-        self.pos_loop_combo.currentIndexChanged.connect(self._on_pos_loop_changed)
-        model_row.addWidget(self.pos_loop_combo, 1)
+        # 位置环结构（2026-11-23 定案：**绳长前馈 + PI，每拍限幅**）：
+        #   ① 前馈 k·[l(θ*)−l(θ_now)]（绳长→counts）
+        #   ② PI   J·δθ（关节角域）
+        #   ③ out = 本拍实测 + (①+②)
+        #   ④ 限幅：本拍步长（out − 实测）最多 ±max_step_f（实测不动目标也不动）
+        pos_loop_label = QLabel("位置环：PID+前馈（绳长前馈 + PI，每拍限幅）")
+        pos_loop_label.setObjectName("muted")
+        pos_loop_label.setToolTip(
+            "每拍：\n"
+            "  ① 前馈：k_ff · k·[l(目标角) − l(当前角)]  → counts（k_ff=0~1，模型可信度）\n"
+            "  ② PI  ：J·δθ，δθ = kp·e + ki∫e + kd·(−dθ_fb/dt)\n"
+            "  ③ 目标 counts = 本拍实测 + ① + ②\n"
+            "  ④ 限幅：每拍步长（目标 − 实测）最多 ±「每拍限幅」；\n"
+            "     实测不动时目标也不动（不会一直累加）\n"
+            "· 前馈当前关闭：等效位置增益 ≈ kp，kp 建议 0.2~0.5\n"
+            "· e 进死区（0.3°）后 PI 不再修正 → 原地保持\n"
+            "· 必须载入标定（k 与 R）")
+        model_row.addWidget(pos_loop_label, 1)
         cl.addWidget(self._cl_model_row_w)
         self.cl_calib_label = QLabel("标定：未载入（模型前馈不可用）")
         self.cl_calib_label.setObjectName("muted")
@@ -2762,59 +3424,257 @@ class ScopeWindow(QMainWindow):
         # ---- 力控参数行 ×3 模式 + 公共行（三力控模式共享方向/限幅/下限）----
         # 力矩模式（v2 论文式：τ_d + 预紧 + 解耦校正 + TDA 分配）
         self._cl_force_row_w = QWidget()
-        force_row = QHBoxLayout(self._cl_force_row_w)
-        force_row.setContentsMargins(0, 0, 0, 0)
-        force_row.addWidget(QLabel("τd(N·m)"))
+        _force_v = QVBoxLayout(self._cl_force_row_w)
+        _force_v.setContentsMargins(0, 0, 0, 0)
+        _force_v.setSpacing(6)
         self.cl_edits["tau_roll"] = self._cl_edit(
             "期望 ROLL 力矩 N·m（正=收ROLL方向）", text="0.0")
-        force_row.addWidget(self.cl_edits["tau_roll"])
         self.cl_edits["tau_pitch"] = self._cl_edit(
             "期望 PITCH 力矩 N·m", text="0.0")
-        force_row.addWidget(self.cl_edits["tau_pitch"])
-        force_row.addWidget(QLabel("预紧N"))
         self.cl_edits["preload"] = self._cl_edit(
-            "沿零空间方向的预紧张力 N（TDA 自动分配到三缆）", text="5.0")
-        force_row.addWidget(self.cl_edits["preload"])
+            "预紧**下限** N（不是设定值）：实际 t = max(该力矩所需最小值, 本值)。\n"
+            "· 填 0 = 完全由力矩反解（等价论文口径）\n"
+            "· 实测 1~2 N 不影响力矩能力；≥10 N 开始压低能力\n"
+            "· 状态行 t=…N↑ 表示被抬起（说明本值不够大）", text="1.0")
+        self.cl_edits["alpha_cap"] = self._cl_edit(
+            "α 上限（安全系数）：力矩最多给「本方向的百分之几」。\n"
+            "· 1.0 = 对齐论文（力矩能出多少就出多少，贴着张力边界跑）\n"
+            "· 0.9 = 留 10% 余量（推荐日常用）\n"
+            "状态行 α=… 是**算出来的**实现比例，本框只封顶。", text="1.0")
+        # 2026-11-24：**力矩修正（慢积分外环）**增益。这是唯一稳定的"力矩闭环"形式。
+        self.cl_edits["tau_ki"] = self._cl_edit(
+            "力矩修正增益 [1/s]（**慢积分外环**，把「τ* − 实测τ」的稳态差补回去）。\n"
+            "· 填 0 = 关闭（纯前馈，推荐先 0 验证，再开）\n"
+            "· 1.0 = 约 1 s 补一个时间常数（推荐起步）\n"
+            "· **不要填大**：τ 误差的响应就是张力内环的响应（10~30 ms），\n"
+            "  外环带 P 或增益太大 → 和内环打架 → 2026-11-18 就是这么振的。\n"
+            "修正量上限 ±" + f"{TAU_TRIM_MAX:g}" + " N·m（常量 TAU_TRIM_MAX）", text="0")
+        f1 = _row_grid()
+        _add(f1, 0, "τd ROLL", self.cl_edits["tau_roll"])
+        _add(f1, 1, "τd PITCH", self.cl_edits["tau_pitch"])
+        _add(f1, 2, "预紧N↓", self.cl_edits["preload"])
+        _force_v.addLayout(f1)
+        f2 = _row_grid()
+        _add(f2, 0, "α上限", self.cl_edits["alpha_cap"])
+        _add(f2, 1, "τ修正", self.cl_edits["tau_ki"])
+        _force_v.addLayout(f2)
+        # 2026-11-23 用户定案：删掉「αmin」框 —— 目标超能力时**始终给到可行最大**，
+        # 只做 1 s 限频告警（状态行 + 安全事件 TORQUE_ALPHA_DERATED），不拒绝启动。
         # 2026-11-19 清理：Kp_τ / Ki_τ 两个框已删除（力矩 PI 外环不存在了，
         # τ_d 直接进 TDA）。内环增益统一用「Kp_f / Ki_f」。
-        force_row.addStretch(1)
         self._cl_force_row_w.setVisible(False)
         cl.addWidget(self._cl_force_row_w)
 
-        # 张力模式（每缆独立张力 PI）
+        # 阻抗模式（2026-11-22 框架）：位置误差 → 力矩 → 复用②整条链
+        # τ* = K(q*−q) + D(q̇*−q̇) + τ_ff；τ_ff 暂为 0（待补重力前馈）。
+        self._cl_imp_row_w = QWidget()
+        _imp_v = QVBoxLayout(self._cl_imp_row_w)
+        _imp_v.setContentsMargins(0, 0, 0, 0)
+        _imp_v.setSpacing(6)
+        self.cl_edits["k_roll"] = self._cl_edit(
+            "ROLL 刚度 [N·m/rad]：偏离目标角就产生回中力矩。\n"
+            "· K=0 → 退化成纯力矩控制（τ=τ_ff）\n"
+            "· 本机力矩能力 ~0.43(roll)/0.50~1.44(pitch) N·m ⟹ K ≲ 1.5 较安全\n"
+            "· 想要更硬请用「位置模式」（缆弹性刚度 4.3/20 N·m/rad）", text="0.5")
+        self.cl_edits["k_pitch"] = self._cl_edit(
+            "PITCH 刚度 [N·m/rad]（同上）", text="0.5")
+        self.cl_edits["d_roll"] = self._cl_edit(
+            "ROLL 阻尼 [N·m/(rad/s)]。框架阶段默认 0（不测角速度）；\n"
+            "接线时要传滤波后的角速度，否则编码器差分噪声会直接进入力矩。",
+            text="0.0")
+        self.cl_edits["d_pitch"] = self._cl_edit(
+            "PITCH 阻尼 [N·m/(rad/s)]（同上）", text="0.0")
+        # 2026-11-23：**直接输入 τ_ff**（常量偏置）—— 你给参数就用这个，
+        # 不用采点。实际 τ_ff = 标定表插值 + 这里两个常量。
+        self.cl_edits["tau_ff_r"] = self._cl_edit(
+            "ROLL 重力力矩幅值 A [N·m]（**90° 处的值**，自动取反）。\n"
+            "模型（串列：roll 是外轴）：\n"
+            "  τ_ff_roll  = −A_r·sin(roll)\n"
+            "  τ_ff_pitch = −A_p·sin(pitch)·cos(roll)   ← roll 转动会削弱 pitch\n"
+            "· roll=±90° 时 pitch 力矩为 0（pitch 轴与重力平行）\n"
+            "· A 填负值 = 翻转方向\n"
+            "例：90° 时实测量得 0.3 N·m → 本框填 0.3", text="0.3")
+        self.cl_edits["tau_ff_p"] = self._cl_edit(
+            "PITCH 重力力矩幅值 A [N·m]（90° 处；自动取反；会乘 cos(roll)）",
+            text="0.3")
+        i1 = _row_grid()
+        _add(i1, 0, "K ROLL", self.cl_edits["k_roll"])
+        _add(i1, 1, "K PITCH", self.cl_edits["k_pitch"])
+        _add(i1, 2, "D ROLL", self.cl_edits["d_roll"])
+        _imp_v.addLayout(i1)
+        i2 = _row_grid()
+        _add(i2, 0, "D PITCH", self.cl_edits["d_pitch"])
+        _add(i2, 1, "τff ROLL", self.cl_edits["tau_ff_r"])
+        _add(i2, 2, "τff PITCH", self.cl_edits["tau_ff_p"])
+        _imp_v.addLayout(i2)
+        _imp_hint = QLabel("K 单位 N·m/rad，D 单位 N·m/(rad/s)，τff 为 90° 重力力矩幅值；目标角用上方「ROLL目标 / PITCH目标」")
+        _imp_hint.setObjectName("muted")
+        _imp_hint.setWordWrap(True)
+        _imp_v.addWidget(_imp_hint)
+        self._cl_imp_row_w.setVisible(False)
+        cl.addWidget(self._cl_imp_row_w)
+
+        # ---- 三力控模式共用的内环增益 + 积分上限（2026-11-24 从张力行里搬出来）----
+        # 这三个框力矩模式**本来就在用**（`_force_params_v2` 读 kp_f / ki_f / i_term_lim），
+        # 之前却被塞在「张力模式专用」行里：切到力矩模式整行隐藏 → 用户看不到、
+        # 也改不了实际生效的积分上限。现在独立成行，张力/张紧/力矩/阻抗四个模式都显示。
+        self._cl_loop_row_w = QWidget()
+        _loop_v = QVBoxLayout(self._cl_loop_row_w)
+        _loop_v.setContentsMargins(0, 0, 0, 0)
+        _PER_CABLE_NOTE = ('\n━━ 逐缆填写（2026-11-24）：本框可填 **1 个数**（三缆共用）或 **3 个数**（逗号分隔，按 C1,C2,C3），例如 `15,15,8`。\n三根缆的摩擦/绳长/预紧不同，一套增益不可能同时最优；个数不是 1/3 或含非法值 → 拒绝开环（不会拿错增益去驱动电机）。')
+        self.cl_edits["kp_f"] = self._cl_edit(
+            "内环P增益 counts/N（三个力控模式共用）：1 N 误差 → Kp counts/拍。\n"
+            "整定依据：Kp ≈ (0.2~0.5)/S，S 由标定 k 与绳刚度 K 换算。"
+            + _PER_CABLE_NOTE, text="15")
+        self.cl_edits["ki_f"] = self._cl_edit(
+            "内环I增益 counts/(N·s)（三个力控模式共用）。积分**允许一直累积**"
+            "（不再按饱和闸门冻结），累积量由右边「积分上限」封顶，"
+            "所以 Ki 只决定攒多快：\n"
+            "Ti=Kp/Ki 属常规区间；给小了反向回不来，给大了抖。"
+            + _PER_CABLE_NOTE, text="20")
+        # 2026-11-20 用户定案：积分**只留一个累积上限**，放界面可调。
+        # 界面上这个数**就是输出上限**（counts），不是状态上限：
+        #   输出上限 = 本值 [counts]
+        #   状态上限 = 本值 / Ki [N·s]（由 _incr_step 自动换算，不需要另外设）
+        # 填 0 = 关闭积分（退化成纯 P）。
+        self.cl_edits["i_term_lim"] = self._cl_edit(
+            "积分**输出**上限 [counts] —— 三个力控模式（力矩/张力/张紧）共用，\n"
+            "阻抗模式走的也是这条内环，同样吃它：\n"
+            "· 填 20 ⟹ 积分最多贡献 20 counts（≈0.93 N 等效偏置）\n"
+            "· ⚠ 这里填的是**输出**，不是累积状态；Ki 不再乘一次\n"
+            "· 内部状态上限自动 = 本值 ÷ Ki（例：20÷20 = 1.0 N·s）\n"
+            "· 填 0 = 关闭积分（纯 P）\n"
+            "积分允许一直累积（含饱和期），只有这个上限在封它。"
+            "（2026-11-24 前它只在「张力控制」模式显示，力矩模式看不到。）"
+            + _PER_CABLE_NOTE,
+            text="20")
+        l1 = _row_grid()
+        _add(l1, 0, "Kp_f", self.cl_edits["kp_f"])
+        _add(l1, 1, "Ki_f", self.cl_edits["ki_f"])
+        _add(l1, 2, "积分上限", self.cl_edits["i_term_lim"])
+        _loop_v.addLayout(l1)
+        self._cl_loop_row_w.setVisible(False)
+        cl.addWidget(self._cl_loop_row_w)
+
+        # 张力模式（每缆独立张力目标；增益/积分上限已挪到上面的公共行）
         self._cl_tension_row_w = QWidget()
-        tens_row = QHBoxLayout(self._cl_tension_row_w)
-        tens_row.setContentsMargins(0, 0, 0, 0)
-        tens_row.addWidget(QLabel("f目标N"))
+        _ten_v = QVBoxLayout(self._cl_tension_row_w)
+        _ten_v.setContentsMargins(0, 0, 0, 0)
+        _ten_v.setSpacing(6)
         self.cl_edits["f1_tgt"] = self._cl_edit(
             "C1 张力目标 N", text="2.0")
-        tens_row.addWidget(self.cl_edits["f1_tgt"])
         self.cl_edits["f2_tgt"] = self._cl_edit(
             "C2 张力目标 N", text="2.0")
-        tens_row.addWidget(self.cl_edits["f2_tgt"])
         self.cl_edits["f3_tgt"] = self._cl_edit(
             "C3 张力目标 N", text="2.0")
-        tens_row.addWidget(self.cl_edits["f3_tgt"])
-        tens_row.addWidget(QLabel("Kp_f"))
-        self.cl_edits["kp_f"] = self._cl_edit(
-            "张力P增益 counts/N。整定依据：Kp ≈ (0.2~0.5)/S，S 由标定 k 与绳刚度 K 换算；"
-            "1 N 误差 → Kp counts/拍", text="15")
-        tens_row.addWidget(self.cl_edits["kp_f"])
-        tens_row.addWidget(QLabel("Ki_f"))
-        self.cl_edits["ki_f"] = self._cl_edit(
-            "张力I增益 counts/(N·s)。**本律 P 已在做积分**，I 只补静摩擦："
-            "积分贡献钳死在 5 counts（≈0.23 N），所以 Ki 只决定攒多快——"
-            "Ti=Kp/Ki=0.75 s 属常规；给小了反而反向回不来", text="20")
-        tens_row.addWidget(self.cl_edits["ki_f"])
-        tens_row.addStretch(1)
+        t1 = _row_grid()
+        _add(t1, 0, "C1目标N", self.cl_edits["f1_tgt"])
+        _add(t1, 1, "C2目标N", self.cl_edits["f2_tgt"])
+        _add(t1, 2, "C3目标N", self.cl_edits["f3_tgt"])
+        _ten_v.addLayout(t1)
+        # ---- 正弦跟随测试（2026-11-24 用户要求）：张力模式下目标 = 基值 + A·sin(2πft+φ)
+        # 用来测**张力内环的动态响应**（幅频/相频/跟随误差）。
+        t2 = _row_grid()
+        self.cl_tension_sine_check = QCheckBox("正弦跟随")
+        self.cl_tension_sine_check.setToolTip(
+            "张力模式专用：把三缆目标改成\n"
+            "    f_target_i = 基值_i + sign_i · A · sin(2π·f·t + φ)\n"
+            "其中 基值 = 上面三个「C目标N」，A/频率/相位/符号见右侧。\n"
+            "· t 从**勾上的那一刻**算起，所以起点在 sin(0)=0，不会跳变\n"
+            "· 共模（sign=1,1,1）测张力环本身；差动（1,−1,−1）测 roll 差分\n"
+            "· 只影响目标，安全闸门（过载/过期/病态）全部照常生效\n"
+            "· 取消勾选立刻回到常数目标（同样不跳变，因为积分状态连续）")
+        self.cl_edits["sine_amp"] = self._cl_edit(
+            "正弦幅度 A [N]：目标在「基值 ±A」之间摆。\n"
+            "注意 A ≤ min(基值−f_min, f_max−基值)，否则会撞界（程序会夹住并提示）。",
+            text="1.0")
+        self.cl_edits["sine_hz"] = self._cl_edit(
+            "正弦频率 f [Hz]：0.05~5。\n"
+            "· 0.1~0.5 Hz 看跟随精度（准静态）\n"
+            "· 1~2 Hz 看相位滞后/幅值衰减（内环带宽）\n"
+            "· >3 Hz 基本只能看趋势（舵机 3400 counts/s 上限）",
+            text="0.5")
+        self.cl_edits["sine_phase"] = self._cl_edit(
+            "相位 φ [deg]：三缆共用的初相。0 = 从 0 开始涨。", text="0")
+        self.cl_edits["sine_sign"] = self._cl_edit(
+            "每缆符号（±1，逗号分隔）——决定共模还是差动：\n"
+            "  1,1,1   = 共模（三缆一起摆，纯张力环测试）\n"
+            "  1,-1,-1 = 差动（C2/C3 反向，产生 roll 力矩摆动）\n"
+            "  1,1,-1  = 部分差动（观察耦合）",
+            text="1,1,1")
+        _add(t2, 0, "幅度N", self.cl_edits["sine_amp"])
+        _add(t2, 1, "频率Hz", self.cl_edits["sine_hz"])
+        _add(t2, 2, "相位°", self.cl_edits["sine_phase"])
+        self.cl_tension_sine_check.toggled.connect(self._on_tension_sine_toggled)
+        t2.addWidget(self.cl_tension_sine_check, 0, 7, 1, 2)
+        _ten_v.addLayout(t2)
+        t3 = _row_grid()
+        _add(t3, 0, "符号", self.cl_edits["sine_sign"])
+        _ten_v.addLayout(t3)
         self._cl_tension_row_w.setVisible(False)
         cl.addWidget(self._cl_tension_row_w)
 
+        self._cl_c1_position_row_w = QGroupBox("混合模式专用参数")
+        self._c1_position_edits = {}
+        c1_grid = QGridLayout(self._cl_c1_position_row_w)
+        c1_grid.setContentsMargins(10, 10, 10, 10)
+        c1_grid.setHorizontalSpacing(10)
+        c1_grid.setVerticalSpacing(6)
+        # 3 组/行 + 固定列宽（标签 76 / 输入 96）：与上面各模式行同一套对齐规则。
+        # 原来是 4 组/行且标签被拉伸 → 标签贴左、输入框贴右，中间一条大缝。
+        for _c in range(3):
+            c1_grid.setColumnMinimumWidth(2 * _c, 76)
+            c1_grid.setColumnMinimumWidth(2 * _c + 1, 96)
+            c1_grid.setColumnStretch(2 * _c + 1, 0)
+        c1_grid.setColumnStretch(6, 1)
+        rows = (
+            (
+                ("roll_tgt", "Roll 目标 °", "", "留空启动时用该轴实测角度。"),
+                ("pitch_tgt", "Pitch 目标 °", "", "留空启动时用该轴实测角度。"),
+                ("c1_pos_target", "C1 目标 N", "5", "C1 张力目标，单位 N。"),
+                ("c1_pos_max_n", "C1 上限 N", "25", "C1 实测张力达到上限时停环。"),
+            ),
+            (
+                ("pos_kp", "角度 Kp", "0.2", "Roll 和 Pitch 共用比例增益，各轴分别计算误差。"),
+                ("pos_ki", "角度 Ki", "0", "角度积分增益，单位 1/s。"),
+                ("pos_kd", "角度 Kd", "0", "角度微分增益，单位 s。"),
+                ("pos_ff", "角度前馈", "0", "C2/C3 绳长前馈系数 0~1，填 0 关闭。"),
+            ),
+            (
+                ("c1_pos_kp", "C1 Kp", "5", "C1 张力比例增益，单位 counts/N。"),
+                ("c1_pos_ki", "C1 Ki", "0", "C1 张力积分增益，单位 counts/(N·s)。"),
+                ("c1_pos_kd", "C1 Kd", "0", "C1 张力反馈微分增益，单位 counts·s/N。"),
+                ("c1_pos_ff", "C1 前馈", "0", "按磁编实测姿态的绳路变化补偿，系数 0~1，填 0 关闭。"),
+            ),
+            (
+                ("pos_step", "C2/C3 步长", "5", "C2/C3 距当前实测位置的单拍增量上限，单位 counts。"),
+                ("c1_pos_step", "C1 步长", "5", "C1 距当前实测位置的单拍增量上限，单位 counts。"),
+                ("c1_pos_travel", "C1 行程 ±c", "3000", "C1 相对启动实测位置的行程，单位 counts。"),
+                ("c1_pos_i_limit", "C1 积分上限", "5", "C1 积分项最大贡献，单位 counts。"),
+            ),
+            (
+                ("pos_deadband", "角度死区 °", "0.3", "混合模式角度误差死区。"),
+                ("pos_limit", "目标限幅 °", "25", "混合模式两轴目标角限幅。"),
+                ("c1_pos_min_n", "C1下限N", "0.2", "用于校验 C1 张力目标。"),
+            ),
+        )
+        _flat = [field for group in rows for field in group]
+        for i, (key, label, default, tooltip) in enumerate(_flat):
+            r, c = divmod(i, 3)
+            lb = QLabel(label)
+            lb.setFixedWidth(76)
+            lb.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            c1_grid.addWidget(lb, r, c * 2)
+            edit = self._cl_edit(tooltip, text=default)
+            self._c1_position_edits[key] = edit
+            c1_grid.addWidget(edit, r, c * 2 + 1)
+        self._cl_c1_position_row_w.setVisible(False)
+        cl.addWidget(self._cl_c1_position_row_w)
+
         # 张紧模式（零空间预紧单旋钮，τ 守恒）
         self._cl_tight_row_w = QWidget()
-        tight_row = QHBoxLayout(self._cl_tight_row_w)
-        tight_row.setContentsMargins(0, 0, 0, 0)
-        tight_row.addWidget(QLabel("张紧N"))
+        _tight_v = QVBoxLayout(self._cl_tight_row_w)
+        _tight_v.setContentsMargins(0, 0, 0, 0)
         # 2026-11-18 合并：与力矩模式的「预紧N」是同一个量（n̂·f）。
         # 这里只做只读镜像，真正读的是 cl_edits["preload"]。
         self.cl_edits["t_tgt"] = self._cl_edit(
@@ -2822,34 +3682,34 @@ class ScopeWindow(QMainWindow):
             "2026-11-18 合并：张紧的 t* 与力矩的 preload_n 是同一个物理量，\n"
             "现在统一在「预紧N」里改，这里只显示。", text="5.0")
         self.cl_edits["t_tgt"].setReadOnly(True)
-        tight_row.addWidget(self.cl_edits["t_tgt"])
         # 镜像联动：改「预紧N」→ 立刻反映到「张紧N」（单向，避免回环）
         self.cl_edits["preload"].textChanged.connect(
             lambda txt: self.cl_edits["t_tgt"].setText(txt))
         self.cl_edits["t_tgt"].setText(self.cl_edits["preload"].text())
         # 2026-11-19 清理：Kp_t / Ki_t 两个框已删除（三个力控模式共用
         # 「Kp_f / Ki_f」，同一根绳、同一个执行器、同一个 S）。
-        tight_row.addStretch(1)
+        _t1 = _row_grid()
+        _add(_t1, 0, "张紧N", self.cl_edits["t_tgt"])
+        _tight_v.addLayout(_t1)
         self._cl_tight_row_w.setVisible(False)
         cl.addWidget(self._cl_tight_row_w)
 
         # 公共行（三力控模式共享：方向符号 / trim 限幅）
         self._cl_force_common_row_w = QWidget()
-        fcommon_row = QHBoxLayout(self._cl_force_common_row_w)
-        fcommon_row.setContentsMargins(0, 0, 0, 0)
-        fcommon_row.addWidget(QLabel("trim方向"))
+        _fc_v = QVBoxLayout(self._cl_force_common_row_w)
+        _fc_v.setContentsMargins(0, 0, 0, 0)
         self.cl_edits["trim_sign"] = self._cl_edit(
             "trim→张力方向，逐电机逗号分隔（+1=counts增大⇒该缆张力增大，−1=反向）。\n"
             "修正口径（2026-10-29 更正）：三台 counts↑=收绳 → 全 +1。\n"
             "三种力控模式共用；换接线后请点动复核（+100c 看该缆张力升/降）；\n"
             "错填=正反馈飞车（上电前务必核对）",
             text="1,1,1")
-        fcommon_row.addWidget(self.cl_edits["trim_sign"])
-        fcommon_row.addWidget(QLabel("trim限幅"))
         self.cl_edits["max_trim"] = self._cl_edit(
             "位置微调限幅 counts", text="3000")
-        fcommon_row.addWidget(self.cl_edits["max_trim"])
-        fcommon_row.addStretch(1)
+        _fc = _row_grid()
+        _add(_fc, 0, "trim方向", self.cl_edits["trim_sign"])
+        _add(_fc, 1, "trim限幅", self.cl_edits["max_trim"])
+        _fc_v.addLayout(_fc)
         self._cl_force_common_row_w.setVisible(False)
         cl.addWidget(self._cl_force_common_row_w)
 
@@ -2857,33 +3717,44 @@ class ScopeWindow(QMainWindow):
         # 留空=0=不启用（t_min/t_max/τr/τp）；fmax 为力控 f_max 唯一来源
         # （观测台守卫框独立服务位置模式观测，互不干扰）。
         self._cl_bound_row_w = QWidget()
-        brow = QHBoxLayout(self._cl_bound_row_w)
-        brow.setContentsMargins(0, 0, 0, 0)
-        brow.addWidget(QLabel("fmin"))
+        _bd_v = QVBoxLayout(self._cl_bound_row_w)
+        _bd_v.setContentsMargins(0, 0, 0, 0)
+        _bd_v.setSpacing(6)
         self.cl_edits["f_min"] = self._cl_edit(
             "逐缆张力下限 N（TDA 分配下界；松绳告警仍由观测台守卫负责）", text="0.5")
-        brow.addWidget(self.cl_edits["f_min"])
-        brow.addWidget(QLabel("fmax"))
         self.cl_edits["fmax_f"] = self._cl_edit(
             "逐缆张力上限 N（力控过载停环阈值，唯一来源；观测台守卫框只管观测）", text="30")
-        brow.addWidget(self.cl_edits["fmax_f"])
-        brow.addWidget(QLabel("tmin"))
         self.cl_edits["t_min"] = self._cl_edit(
             "张紧 t 下限 N，低于则⚠预紧丢失（留空=不启用）", text="")
-        brow.addWidget(self.cl_edits["t_min"])
-        brow.addWidget(QLabel("tmax"))
         self.cl_edits["t_max"] = self._cl_edit(
             "张紧 t 上限 N：超出⚠预紧超限，且张紧目标被钳到此值（留空=不启用）", text="")
-        brow.addWidget(self.cl_edits["t_max"])
-        brow.addWidget(QLabel("τr上限"))
         self.cl_edits["tau_r_max"] = self._cl_edit(
-            "τ ROLL 目标钳制 ±N·m（力矩模式目标框自动压回界内；留空=不启用）", text="")
-        brow.addWidget(self.cl_edits["tau_r_max"])
-        brow.addWidget(QLabel("τp上限"))
+            "τ ROLL 目标钳制 ±N·m（**留空=不启用，推荐留空**）。\n"
+            "⚠ 这是**按轴独立剪制**：剪的是某一个轴 → 会**改变力矩方向**\n"
+            "  （例：请求 (0.3,−1.5) 方向 −78.7°，若本框填 0.2 → 变成 −82.4°）。\n"
+            "「做不做得到」由分配层的 α 统一处理（按比例缩、方向不变），\n"
+            "所以这里**只在你确实要单向硬限幅时才填**。", text="")
         self.cl_edits["tau_p_max"] = self._cl_edit(
-            "τ PITCH 目标钳制 ±N·m（同上）", text="")
-        brow.addWidget(self.cl_edits["tau_p_max"])
-        brow.addStretch(1)
+            "τ PITCH 目标钳制 ±N·m（同上；**留空=不启用**）", text="")
+        self.cl_edits["roll_tau_sign"] = self._cl_edit(
+            "**力矩链的 roll 方向开关**：填 1（默认，按模型）或 −1（整条链翻一次）。\n"
+            "作用范围：下发的 τ_roll 与显示的实测 τ_roll **同时**翻转，两者永远同号。\n"
+            "什么时候要翻：力控里给正 roll 力矩、腕却往反方向走 → 填 −1。\n"
+            "⚠ 只翻力矩，不动角度链路（角度符号由 MODEL_AXIS_SIGN 固定）。",
+            text="1")
+        b1 = _row_grid()
+        _add(b1, 0, "fmin", self.cl_edits["f_min"])
+        _add(b1, 1, "fmax", self.cl_edits["fmax_f"])
+        _add(b1, 2, "tmin", self.cl_edits["t_min"])
+        _bd_v.addLayout(b1)
+        b2 = _row_grid()
+        _add(b2, 0, "tmax", self.cl_edits["t_max"])
+        _add(b2, 1, "τr上限", self.cl_edits["tau_r_max"])
+        _add(b2, 2, "τp上限", self.cl_edits["tau_p_max"])
+        _bd_v.addLayout(b2)
+        b3 = _row_grid()
+        _add(b3, 0, "τ方向", self.cl_edits["roll_tau_sign"])
+        _bd_v.addLayout(b3)
         self._cl_bound_row_w.setVisible(False)
         cl.addWidget(self._cl_bound_row_w)
 
@@ -2897,11 +3768,12 @@ class ScopeWindow(QMainWindow):
         cl.addWidget(self.cl_record_check)
 
         self.cl_btn = QPushButton("▶ 启动闭环")
-        self.cl_btn.setStyleSheet("font-weight: bold; padding: 6px;")
+        self.cl_btn.setStyleSheet("font-weight: bold; padding: 8px;")
         self.cl_btn.clicked.connect(self._toggle_closed_loop)
         cl.addWidget(self.cl_btn)
         self.cl_status = QLabel("未启动（先「载入标定」并勾选「模型前馈」）")
         self.cl_status.setObjectName("muted")
+        self.cl_status.setWordWrap(True)
         cl.addWidget(self.cl_status)
         return box
 
@@ -2910,15 +3782,57 @@ class ScopeWindow(QMainWindow):
         e = QLineEdit(text)
         e.setToolTip(tooltip)
         e.setInputMethodHints(Qt.ImhDigitsOnly | Qt.ImhLatinOnly)
-        e.setMinimumHeight(28)
+        # 2026-11-23：框太小把字裁掉了（数字上下/左右被切）。统一放大到
+        # 能完整显示「-10.00」这类值，并居中显示。
+        # 2026-11-24：宽度也统一（96px），否则每行第一个框的 x 坐标都不一样。
+        e.setFixedWidth(96)
+        e.setAlignment(Qt.AlignCenter)
         return e
 
     def _cl_fval(self, key: str, default: float, lo: float, hi: float):
+        """读闭环参数框 → float（钳到 [lo, hi]）。
+
+        2026-11-20：控制线程独立后，**工作线程不再碰控件** —— 它读 GUI 侧
+        每 50 ms 生成的文本快照 `_cl_snap`；GUI 线程仍直接读控件（测试同路径）。
+        """
+        snap = getattr(self, "_cl_snap", None)
+        text = None
+        if snap is not None and not self._in_gui_thread():
+            text = snap.get(key)
+        if text is None:
+            try:
+                text = self.cl_edits[key].text()
+            except (KeyError, AttributeError):
+                return default
         try:
-            v = float(self.cl_edits[key].text().strip().replace("−", "-"))
-        except ValueError:
+            v = float(text.strip().replace("−", "-"))
+        except (ValueError, AttributeError):
             return default
         return max(lo, min(hi, v))
+
+    def _cl_fval3(self, key: str, default, lo: float, hi: float):
+        """读闭环参数框 → **逐缆 3 值**列表（2026-11-24）。
+
+        支持两种填法（同一框，不用多开三个框）：
+
+            "15"       → [15, 15, 15]
+            "15,15,8"  → [15, 15, 8]      # C1/C2=15, C3=8
+
+        非法（个数不对/非数字/超界）→ 返回 `None`，由调用方拒绝启动
+        （宁可不开环，也不拿错增益去驱动电机）。
+
+        与 `_cl_fval` 同一条"工作线程读快照、GUI 线程读控件"的通道。
+        """
+        snap = getattr(self, "_cl_snap", None)
+        text = None
+        if snap is not None and not self._in_gui_thread():
+            text = snap.get(key)
+        if text is None:
+            try:
+                text = self.cl_edits[key].text()
+            except (KeyError, AttributeError):
+                text = None
+        return parse_per_cable(text, default, lo, hi, name=key)
 
     def _step(self) -> int:
         return int(self.step_combo.currentText())
@@ -2968,6 +3882,8 @@ class ScopeWindow(QMainWindow):
         "腕部调试": ["enc_raw_16", "enc_raw_17", "m27_abs", "m28_abs", "m29_abs",
                      "m27_tgt", "m28_tgt", "m29_tgt",
                      "tension_f1", "tension_f2", "tension_f3", "tension_preload",
+                     # 2026-11-24：三缆目标张力（与实测成对显示）
+                     "tension_f1_tgt", "tension_f2_tgt", "tension_f3_tgt",
                      "force_tau_roll_tgt", "force_tau_pitch_tgt",
                      "force_tau_roll_meas", "force_tau_pitch_meas", "force_alpha",
                      "force_trim_1", "force_trim_2", "force_trim_3"],
@@ -3009,10 +3925,13 @@ class ScopeWindow(QMainWindow):
         self.drain_timer.timeout.connect(self._timed_slot("drain", self._drain_queue))
         self.drain_timer.start(10)  # 100 FPS
         # 绘图与排空解耦：排空只管喂数据，绘图按自己的节拍取最新缓冲。
+        # 绘图帧率（工具栏「帧率」下拉可改；PLOT_HZ 只是启动默认值）
+        self._plot_hz = float(PLOT_HZ)
+        self._plot_interval_ms = int(PLOT_INTERVAL_MS)
         self.plot_timer = QTimer(self)
         self.plot_timer.setTimerType(Qt.PreciseTimer)
         self.plot_timer.timeout.connect(self._timed_slot("plot", self._plot_tick))
-        self.plot_timer.start(PLOT_INTERVAL_MS)
+        self.plot_timer.start(self._plot_interval_ms)
         self.table_timer = QTimer(self)
         self.table_timer.setTimerType(Qt.PreciseTimer)
         self.table_timer.timeout.connect(self._timed_slot("table", self._update_tables))
@@ -3034,13 +3953,33 @@ class ScopeWindow(QMainWindow):
         self._zero_timer.timeout.connect(self._on_zero_poll)
         # 限速斜坡：分步逼近目标。
         self._ramp_timer = QTimer(self)
+        self._ramp_timer.setTimerType(Qt.PreciseTimer)
         self._ramp_timer.timeout.connect(self._on_ramp_tick)
         # 使能准入确认轮询。
         self._admit_timer = QTimer(self)
         self._admit_timer.timeout.connect(self._on_admit_poll)
+        self._enable_delay = QTimer(self)
+        self._enable_delay.setSingleShot(True)
+        self._enable_delay.timeout.connect(self._finish_enable_start)
         # 负反馈闭环 100Hz。
         self._cl_timer = QTimer(self)
         self._cl_timer.timeout.connect(self._cl_tick)
+        # 2026-11-19：控制环改由独立线程驱动（见 _ClLoopThread）。
+        # `_cl_timer` 保留但**不再启动**（外部/测试仍可引用与 .stop()）。
+        self._gui_thread_id = threading.get_ident()
+        self._ui_queue = deque()          # 工作线程 → GUI 线程的 UI 动作队列
+        self._cl_stop_request = None      # 工作线程自停标志（非 None 即停）
+        self._cl_loop = None              # 当前 _ClLoopThread 实例
+        self._cl_tick_count = 0           # 控制拍计数（各模式分支共用，__init__ 就给初值）
+        self._ui_drain_timer = QTimer(self)
+        self._ui_drain_timer.timeout.connect(self._drain_ui_queue)
+        self._ui_drain_timer.start(20)    # GUI 侧每 20ms 执行一次投递动作
+        # 闭环参数快照：GUI 线程 50 ms 一次，工作线程只读（不在工作线程碰控件）
+        self._cl_param_ts = 0.0
+        self._cl_snap = None              # GUI 侧文本/勾选快照（工作线程只读）
+        self._cl_snapshot_timer = QTimer(self)
+        self._cl_snapshot_timer.timeout.connect(self._refresh_cl_param_cache)
+        self._cl_snapshot_timer.start(50)
 
     def _send_heartbeat(self) -> None:
         if self.connected and self.rx_thread is not None:
@@ -3085,6 +4024,11 @@ class ScopeWindow(QMainWindow):
                 self.connect_btn.setEnabled(True)
             return
         self.connected = True
+        self.status_info.clear()
+        self._overload_motors.clear()
+        self._status_rx_at = 0.0
+        self.last_servo_abs_all = None
+        self._set_arm_light()
         self.t0 = None
         # 新会话从空白开始：清曲线缓冲与频率统计，避免跨会话残留。
         for ch in self.channels.values():
@@ -3104,11 +4048,11 @@ class ScopeWindow(QMainWindow):
             self.rx_thread.send(mask_cmd)
 
     def _disconnect(self) -> None:
-        self._stop_closed_loop("断开连接", hold=False, popup=False)
+        was_armed = self.armed or self._admit_timer.isActive() or self._enable_delay.isActive()
+        self._cancel_direct_motion("断开连接")
         if self.rx_thread is not None:
-            if self.armed:
+            if was_armed:
                 self.rx_thread.send(build_stop_cmd())
-                self.armed = False
             # 恢复全开，避免官方上位机后续连接时缺遥测流。
             restore = (bytes([PROTOCOL_HEADER, 1 + 1 + 4, CMD_UPLINK_MASK]) +
                        struct.pack(">I", UPLINK_MASK_ALL_PERIODIC) + bytes([0xFF]))
@@ -3118,7 +4062,9 @@ class ScopeWindow(QMainWindow):
             self.rx_thread.join(timeout=0.3)
             self.rx_thread = None
         self.connected = False
-        self.armed = False
+        self.status_info.clear()
+        self._overload_motors.clear()
+        self._set_arm_light()
         self.connect_btn.setText("连接")
         self.connect_btn.setEnabled(True)
         self.bw_label.setText("带宽: 全开")
@@ -3162,7 +4108,14 @@ class ScopeWindow(QMainWindow):
                     for i, m in enumerate(SERVO_TARGETS):
                         self.channels[f"m{m}_{field}"].buf.append(rel, payload[field][i])
             elif kind == "status":
+                previous = self._p4_overload_reason()
                 self.status_info = payload
+                self._status_rx_at = t
+                self._handle_p4_status(previous)
+            elif kind == "overload":
+                previous = self._p4_overload_reason()
+                self._overload_motors = payload
+                self._handle_p4_status(previous)
             elif kind == "ack":
                 # ACK 节流（2026-11-02 张力模式卡死根修）：力控高频命令每条招回
                 # 一帧 ACK，逐条刷状态+写日志会把 GUI 线程刷死（日志一过上限，
@@ -3181,6 +4134,9 @@ class ScopeWindow(QMainWindow):
                     self._ctrl_status(f"⚠ ACK 0x{cmd:02X}: {status_txt}")
             elif kind == "route":
                 self.route_info = payload
+            elif kind == "servo_range":
+                # 2026-11-20：30 路会话逻辑行程（响应 CMD_STATE_SYNC_REQUEST bit2）
+                self.servo_range = payload
             elif kind == "servo_abs_all":
                 self.last_servo_abs_all = payload
         # 数据已进缓冲：只置脏标记，由 plot_timer 按 PLOT_HZ 取最新数据重绘。
@@ -3200,7 +4156,9 @@ class ScopeWindow(QMainWindow):
         checked = item.checkState(0) == Qt.Checked
         if checked and ch.curve is None:
             ch.curve = self.plot.plot(
-                pen=pg.mkPen(ch.color, width=1),
+                # 1.2px：150% 缩放下 1px 线会有一半像素被插值糊掉，1.2 更清楚；
+                # antialias 走全局 pg 配置（见文件头 setConfigOptions）。
+                pen=pg.mkPen(ch.color, width=1.2),
                 name=ch.name,
                 # 点数由 _update_plot 自己保峰抽稀控制（见 peak_decimate）；
                 # 再让 pyqtgraph 自动降采样只会多一遍 O(n) 处理，白花时间。
@@ -3210,6 +4168,9 @@ class ScopeWindow(QMainWindow):
         elif not checked and ch.curve is not None:
             self.plot.removeItem(ch.curve)
             ch.curve = None
+        # 勾/取消通道后立刻重算 Y 范围（否则要等下一个 0.25s 节流窗口，
+        # 刚勾上的第二条曲线会短暂落在量程外）
+        self._y_follow_at = 0.0
         self._update_plot()
 
     def _on_tree_double_click(self, item, col) -> None:
@@ -3233,6 +4194,54 @@ class ScopeWindow(QMainWindow):
                     autoDownsample=False,
                 )
                 self._update_plot()
+
+    def _set_plot_hz(self, hz) -> None:
+        """主图帧率上限：60/75/90（数据源 100Hz，超过 100 没有意义）。
+
+        实测（offscreen，4 条 100Hz 曲线）：17ms→57FPS、13ms→≈70FPS、
+        11ms→73FPS；再压到 8ms/5ms 反而掉回 57FPS（和 drain/表格定时器
+        抢线程）。所以默认 75，90 只在本机 GUI 线程空闲时才吃得下。
+        """
+        try:
+            hz = int(float(hz))
+        except (TypeError, ValueError):
+            return
+        hz = max(5, min(120, hz))
+        self._plot_hz = float(hz)
+        self._plot_interval_ms = max(1, int(round(1000.0 / hz)))
+        timer = getattr(self, "plot_timer", None)
+        if timer is not None:
+            timer.setInterval(self._plot_interval_ms)
+        self._plot_gate = 0
+        if hasattr(self, "_ctrl_status"):
+            self._ctrl_status(f"主图帧率上限 → {hz} FPS（{self._plot_interval_ms} ms/帧）",
+                              log=False)
+
+    def _set_plot_aa(self, on: bool) -> None:
+        """曲线抗锯齿开关（默认关）。
+
+        代价实测（4 条 100Hz 曲线、原生窗口）：paint 7.5ms → 12.9ms（+72%），
+        75FPS 预算 13.3ms 基本被吃光，会掉帧；机器余量大时勾上明显更顺滑。
+        pyqtgraph 的抗锯齿是**建曲线项时**从全局配置取的，所以这里必须重建
+        曲线项（顺带 pyqtgraph 会自动维护图例），不能只改视图开关。
+        """
+        on = bool(on)
+        pg.setConfigOptions(antialias=on)
+        plot = getattr(self, "plot", None)
+        if plot is None:
+            return
+        plot.setAntialiasing(on)
+        for ch in self.channels.values():
+            if ch.curve is None:
+                continue
+            plot.removeItem(ch.curve)
+            ch.curve = plot.plot(
+                pen=pg.mkPen(ch.color, width=1.2),
+                name=ch.name, downsample=1, autoDownsample=False)
+        self._update_plot()
+        if hasattr(self, "_ctrl_status"):
+            self._ctrl_status(f"曲线抗锯齿：{'开（更顺滑，paint +70%）' if on else '关（省 CPU）'}",
+                              log=False)
 
     def _plot_tick(self) -> None:
         """绘图节拍：只在有新数据且未暂停时重绘，空闲时零绘制。
@@ -3269,10 +4278,13 @@ class ScopeWindow(QMainWindow):
         ema = getattr(self.plot, "paint_ema_ms", 0.0)
         if ema <= 0.0:
             return
-        budget = 1000.0 / max(5.0, PLOT_HZ)
+        budget = 1000.0 / max(5.0, getattr(self, "_plot_hz", PLOT_HZ))
         cur = getattr(self, "_pts_per_px", 2.0)
-        if ema > budget * 0.55 and cur > 0.25:
-            cur = max(0.25, cur * 0.85)      # 超预算：更快地降
+        # 2026-11-24：下限从 0.25 提到 1.0。每像素少于 1 个点时曲线会明显"缺峰"、
+        # 看着稀疏发假（0.25 相当于 1000px 只画 250 点）。宁可少降帧也不降到
+        # 看不出原始波形；真正的减压交给帧率上限与峰值抽稀。
+        if ema > budget * 0.55 and cur > 1.0:
+            cur = max(1.0, cur * 0.85)      # 超预算：更快地降
         elif ema < budget * 0.30 and cur < 3.0:
             cur = min(3.0, cur * 1.05)       # 富余：慢慢加回去
         self._pts_per_px = cur
@@ -3281,6 +4293,7 @@ class ScopeWindow(QMainWindow):
         self._plot_frames = getattr(self, "_plot_frames", 0) + 1
         tail = float(self.window_combo.currentText().rstrip("s"))
         self._visible_series = {}
+        self._series_color = {}
         normalize = self.norm_check.isChecked()
         # 先保峰抽稀再 setData：见 peak_decimate 的说明，这是 paint 从 27ms
         # 降到 13ms 的关键（pyqtgraph 自己降采样发生在收数之后的 O(n) 处理）。
@@ -3298,11 +4311,13 @@ class ScopeWindow(QMainWindow):
             # skipFiniteCheck：窗口内无 NaN 时省掉 pyqtgraph 的逐点扫描。
             ch.curve.setData(t, v, skipFiniteCheck=True)
             self._visible_series[ch.name] = (t, v)
+            self._series_color[ch.name] = ch.color
         self.empty_plot_text.setVisible(not self._visible_series)
-        # 每帧重复 enableAutoRange 会反复触发自动量程重算；只在勾选状态变化时开一次。
-        if self.yauto_check.isChecked() and not getattr(self, "_yauto_on", False):
+        # Y 自适应：走自己的带迟滞慢跟随，**不用** pyqtgraph 的 autoRange
+        # （它每帧重算 + 0.02s 动画 → 曲线上下"呼吸"，见 _y_auto_follow 注释）。
+        if self.yauto_check.isChecked():
             self._yauto_on = True
-            self.plot.getViewBox().enableAutoRange(axis=ViewBox.YAxis, x=False)
+            self._y_auto_follow()
         if self.xauto_check.isChecked() and self._latest_t is not None:
             # 示波器滚动：X 锁定为 [最新-窗口, 最新]
             vb = self.plot.getViewBox()
@@ -3310,18 +4325,27 @@ class ScopeWindow(QMainWindow):
             vb.setXRange(max(0.0, self._latest_t - tail), self._latest_t, padding=0)
 
     def _on_plot_mouse_moved(self, pos) -> None:
-        if not hasattr(self, "_visible_series"):
+        """鼠标在图上：十字线 + 每条曲线"最近采样点"高亮 + 贴鼠标的数值浮层。
+
+        2026-11-24 重做：原来只把 5 行文字丢在图区左下角，既看不出是哪个点，
+        也和鼠标位置对不上。现在：
+          · 按 x 二分找最近采样点，画出该点（颜色同曲线）；
+          · 浮层跟着鼠标走（右下 14px，靠近边缘自动翻到另一侧）；
+          · 列出当前所有可见曲线在该 x 上的采样值。
+        """
+        if not hasattr(self, "_visible_series") or not hasattr(self, "_hover_tip"):
             return
         vb = self.plot.getPlotItem().vb
         if not self.plot.sceneBoundingRect().contains(pos):
-            self.cursor_label.setText("")
+            self._hide_hover()
             return
         mouse_pt = vb.mapSceneToView(pos)
         self.vLine.setPos(mouse_pt.x())
         self.hLine.setPos(mouse_pt.y())
-        lines = []
-        for name, (t, v) in list(self._visible_series.items())[:5]:
-            if t.size == 0:
+        rows = []
+        spots = []
+        for name, (t, v) in self._visible_series.items():
+            if t is None or t.size == 0:
                 continue
             # t 已按时间升序：二分定位比 nanargmin 全量扫描快两个数量级。
             idx = int(np.searchsorted(t, mouse_pt.x()))
@@ -3329,13 +4353,118 @@ class ScopeWindow(QMainWindow):
                 idx = t.size - 1
             elif idx > 0 and abs(t[idx - 1] - mouse_pt.x()) < abs(t[idx] - mouse_pt.x()):
                 idx -= 1
-            val = v[idx]
-            if not math.isnan(val):
-                lines.append(f"{name}: {val:.1f}")
-        txt = f"x={mouse_pt.x():.2f}s" + "\n" + "\n".join(lines)
-        self.cursor_label.setText(txt)
-        view_range = vb.viewRange()
-        self.cursor_label.setPos(view_range[0][0], view_range[1][0])
+            val = float(v[idx])
+            if not math.isfinite(val):
+                continue
+            color = self._series_color.get(name, "#cccccc")
+            rows.append((name, float(t[idx]), val, color))
+            spots.append({"pos": (float(t[idx]), val), "brush": pg.mkBrush(color)})
+        if spots:
+            self._hover_dots.setData(spots)
+        else:
+            self._hover_dots.clear()
+        if not rows:
+            self._hide_hover()
+            return
+        head = f"t = {rows[0][1]:.3f} s"
+        body = "\n".join(f"{name}  {val:,.2f}" for name, _t, val, _c in rows[:10])
+        if len(rows) > 10:
+            body += f"\n… 还有 {len(rows) - 10} 条"
+        self._hover_tip.setText(head + "\n" + body)
+        self._hover_tip.adjustSize()
+        # 贴鼠标：默认右下，靠边就翻到另一侧
+        try:
+            at = self.plot.mapFromScene(pos)
+            cx, cy = int(at.x()), int(at.y())
+        except Exception:
+            return
+        tw, th = self._hover_tip.width(), self._hover_tip.height()
+        x = cx + 14
+        y = cy + 14
+        if x + tw > self.plot.width() - 4:
+            x = cx - tw - 14
+        if y + th > self.plot.height() - 4:
+            y = cy - th - 14
+        self._hover_tip.move(max(2, x), max(2, y))
+        self._hover_tip.raise_()
+        self._hover_tip.show()
+
+    def _hide_hover(self) -> None:
+        """鼠标离开图区：收起浮层与高亮点（十字线留着也行，这里一并复位）。"""
+        tip = getattr(self, "_hover_tip", None)
+        if tip is not None:
+            tip.hide()
+        dots = getattr(self, "_hover_dots", None)
+        if dots is not None:
+            dots.clear()
+
+    def _on_plot_double_click(self, ev) -> bool:
+        """双击图区：加一条水平标记线；双击已有标记线（±6px）= 删除它。
+
+        返回 True 表示事件已处理（_TimedPlotWidget 会 accept，不再往下传）。
+        """
+        vb = self.plot.getPlotItem().vb
+        p = ev.position() if hasattr(ev, "position") else ev.pos()
+        try:
+            scene = self.plot.mapToScene(p.toPoint() if hasattr(p, "toPoint") else p)
+        except Exception:
+            return False
+        if not vb.sceneBoundingRect().contains(scene):
+            return False
+        view = vb.mapSceneToView(scene)
+        for ln in list(getattr(self, "_h_markers", [])):
+            try:
+                y_scene = vb.mapViewToScene(QPointF(view.x(), ln.value())).y()
+            except Exception:
+                continue
+            if abs(y_scene - scene.y()) <= 6:
+                self._remove_h_marker(ln)
+                self._ctrl_status(f"标记线已删除（y={ln.value():,.1f}）", log=False)
+                return True
+        self._add_h_marker(view.y())
+        return True
+
+    def _add_h_marker(self, y: float, quiet: bool = False) -> None:
+        """在 y 处加一条水平标记线（虚线 + 左侧数值标签）。
+
+        quiet=True 用于从布局存档恢复（不刷控制日志）。
+        """
+        if len(getattr(self, "_h_markers", [])) >= self._H_MARKER_MAX:
+            if not quiet:
+                self._ctrl_status(
+                    f"标记线最多 {self._H_MARKER_MAX} 条，先双击删掉几条", log=False)
+            return
+        colors = (AT.T("warn"), AT.T("accent2"), AT.T("good"), AT.T("accent"), AT.T("bad"))
+        color = colors[len(self._h_markers) % len(colors)]
+        ln = pg.InfiniteLine(
+            angle=0, pos=float(y), movable=False,
+            pen=pg.mkPen(color, width=1, style=Qt.DashLine),
+            label="{value:,.0f}",
+            # 标签放右侧（左端被图例占了），留出文字宽度别被边界裁掉。
+            labelOpts={"position": 0.90, "color": color,
+                       "fill": pg.mkBrush(30, 30, 30, 170), "movable": False},
+        )
+        ln.setZValue(90)
+        self.plot.addItem(ln, ignoreBounds=True)
+        self._h_markers.append(ln)
+        if not quiet:
+            self._ctrl_status(f"已加标记线 y={y:,.1f}（双击它可删除）", log=False)
+
+    def _remove_h_marker(self, ln) -> None:
+        try:
+            self._h_markers.remove(ln)
+        except ValueError:
+            pass
+        try:
+            self.plot.removeItem(ln)
+        except Exception:
+            pass
+
+    def _clear_h_markers(self) -> None:
+        """清掉所有标记线（「清空」按钮与布局恢复前共用）。"""
+        for ln in list(getattr(self, "_h_markers", [])):
+            self._remove_h_marker(ln)
+        self._h_markers = []
 
     def _on_abstime_toggled(self, checked: bool) -> None:
         RelativeTimeAxis.absolute = checked
@@ -3353,12 +4482,61 @@ class ScopeWindow(QMainWindow):
 
     def _on_yauto_toggled(self, checked: bool) -> None:
         vb = self.plot.getViewBox()
+        # 2026-11-24：不再把 Y 轴交给 pyqtgraph 的 autoRange（逐帧重算 + 动画 =
+        # 曲线上下呼吸）。关掉它，自己在 _y_auto_follow 里带迟滞地跟。
+        vb.disableAutoRange(axis=ViewBox.YAxis)
+        self._yauto_on = bool(checked)
+        self._y_applied = None
+        self._y_follow_at = 0.0
         if checked:
-            self._yauto_on = True
-            vb.enableAutoRange(axis=ViewBox.YAxis, x=False)
-        else:
-            self._yauto_on = False
-            vb.disableAutoRange(axis=ViewBox.YAxis)
+            self._y_auto_follow()
+
+    def _y_auto_follow(self) -> None:
+        """Y 自适应：带迟滞的慢跟随（≤4Hz），替代 pyqtgraph 的逐帧 autoRange。
+
+        为什么换（2026-11-24 实测）：autoRange 每帧按可见数据重算，并在 0.02s
+        内插值动画到新目标；目标每帧都在变 → 动画永远追不上，整条曲线上下
+        "呼吸"。同一段正弦 + 1‰ 噪声的 4 s 里，可见 Y 跨度在 **294~1098**
+        之间来回跳（273%，48 个不同值），肉眼就是"一直在抖、很难看"。
+
+        新策略：
+          · 目标 = 可见曲线 min/max + 8% 余量；
+          · 数据出界 → 立刻扩；当前跨度 > 目标 1.4 倍 → 才收（防抖）；
+          · 最多 4Hz 更新一次，且不做动画（padding=0）。
+        """
+        if not getattr(self, "_visible_series", None):
+            return
+        applied = getattr(self, "_y_applied", None)
+        now = time.monotonic()
+        # 首次（还没有应用过范围）不受节流限制，否则刚勾上通道时量程会停在旧值
+        if applied is not None and now - getattr(self, "_y_follow_at", 0.0) < 0.25:
+            return
+        vmin, vmax = math.inf, -math.inf
+        for _t, v in self._visible_series.values():
+            if v is None or not len(v):
+                continue
+            try:
+                lo = float(np.nanmin(v))
+                hi = float(np.nanmax(v))
+            except (ValueError, TypeError):
+                continue
+            if math.isfinite(lo) and math.isfinite(hi):
+                vmin = min(vmin, lo)
+                vmax = max(vmax, hi)
+        if not (math.isfinite(vmin) and math.isfinite(vmax)) or vmax <= vmin:
+            return
+        pad = (vmax - vmin) * 0.08
+        tgt = (vmin - pad, vmax + pad)
+        applied = getattr(self, "_y_applied", None)
+        if applied is not None:
+            cur_lo, cur_hi = applied
+            outside = tgt[0] < cur_lo or tgt[1] > cur_hi
+            too_wide = (cur_hi - cur_lo) > (tgt[1] - tgt[0]) * 1.4
+            if not (outside or too_wide):
+                return
+        self._y_applied = tgt
+        self._y_follow_at = now
+        self.plot.getViewBox().setYRange(tgt[0], tgt[1], padding=0)
 
     def _set_baseline_from_current(self, j: int) -> None:
         """基准取滤波值（解绕+中值5+EMA），不取 raw 单帧。
@@ -3378,16 +4556,17 @@ class ScopeWindow(QMainWindow):
 
     def _set_angle_baseline_now(self, axis=None) -> None:
         """axis: 16=仅ROLL, 17=仅PITCH, None=双轴。落盘：重启后自动恢复零位。"""
+        if self.cl_enabled and self._cl_mode == "c1_position":
+            self._stop_closed_loop("混合模式角度基准已更改", popup=False)
         for j in ((axis,) if axis in (16, 17) else (16, 17)):
             self._set_baseline_from_current(j)
         if self.cl_enabled and self._cl_mode == "position":
-            # 运行中重新归零：读数平移了，前馈参考与 origin 必须一起跟（否则
-            # 稳态按 s/(1−kp) 偏出去）。等价于"从现在这个姿态重新起算"。
+            # 运行中重新归零：读数平移了，origin 必须跟着走（软限幅的基准）。
+            # 位置环本身是"每拍从实测出发"的增量式，不需要额外的参考位姿。
             for m in SERVO_TARGETS:
                 v = self.channels[f"m{m}_abs"].buf.last()
                 if v is not None and not math.isnan(v):
                     self._motor_origin[m] = int(v)
-            self._cl_ref_pose = self._wrist_pose_now()
         self._save_layout()   # BUG1 修复：基准随布局持久化，重启免重标
         self._ctrl_status("📐 基准已更新为当前 ROLL/PITCH 角度（已保存，重启自动恢复）", log=False)
 
@@ -3433,7 +4612,8 @@ class ScopeWindow(QMainWindow):
         if self.cl_enabled:
             # 闭环运行中改使能范围 = 改变控制结构：与切控制模式同款，先停再改。
             self._stop_closed_loop("使能范围变更", popup=False)
-        if self.armed:
+        if (self.armed or self._admit_timer.isActive() or self._enable_delay.isActive()
+                or self._zero_timer.isActive()):
             # REVIEW P0-5：P4 的 active scope 是使能时快照——armed 下改勾选
             # 不解除武装，P4 活动域与 UI 永久错位。强制解除，重新使能时重建。
             self._on_stop()
@@ -3470,7 +4650,53 @@ class ScopeWindow(QMainWindow):
             return "等待 ABS 快照…", False
         return None, False
 
+    def _p4_overload_reason(self) -> str:
+        if not (self.status_info.get("faults", 0) & SYSTEM_FAULT_OVERLOAD
+                or self._overload_motors):
+            return ""
+        motors = "、".join(f"M{m}" if load is None else f"M{m}({load:+d})"
+                          for m, load in self._overload_motors.items())
+        return f"P4 舵机过载{(' ' + motors) if motors else ''}，检查负载后重新使能"
+
+    def _cancel_direct_motion(self, reason: str, *, discard_tx: bool = True) -> None:
+        self.armed = False
+        self._stop_closed_loop(reason, hold=False, popup=False)
+        self._ramp_timer.stop()
+        self._ramp_state.clear()
+        self._release_plan = None
+        self._enable_delay.stop()
+        self._admit_timer.stop()
+        self._zero_timer.stop()
+        self._want_closed_loop = self._want_goto_zero = False
+        self._pending_target = None
+        self.targets = dict.fromkeys(SERVO_TARGETS)
+        drop = getattr(self.rx_thread, "drop_pending_tx", None)
+        if discard_tx and drop:
+            drop()
+
+    def _handle_p4_status(self, previous_overload: str) -> None:
+        reason = self._p4_overload_reason()
+        lost_control = self.armed and self.status_info.get("state") == SYSTEM_STATE_UNCONTROLLABLE
+        enabling = self._admit_timer.isActive() or self._enable_delay.isActive() or self._zero_timer.isActive()
+        if lost_control or (reason and (self.armed or (enabling and not previous_overload))):
+            reason = reason or f"P4 不可控，故障位 0x{self.status_info.get('faults', 0):X}"
+            self._cancel_direct_motion(reason)
+        elif reason == previous_overload:
+            return
+        self._set_arm_light()
+        if reason:
+            self._ctrl_status(reason)
+            self._safety("P4_FAULT", reason=reason, **self.status_info)
+
     def _on_enable_direct(self) -> None:
+        # Go / 回零 / 启动闭环都可请求自动使能。保护停机后只能由显式使能恢复。
+        overload = self._p4_overload_reason()
+        if overload and (self._pending_target is not None or self._want_closed_loop
+                         or self._want_goto_zero):
+            self._pending_target = None
+            self._want_closed_loop = self._want_goto_zero = False
+            self._reject("使能直控", overload)
+            return
         reason, clear_pending = self._enable_gate_check()
         if reason:
             if clear_pending:
@@ -3496,6 +4722,7 @@ class ScopeWindow(QMainWindow):
         if not self.connected:
             self._ctrl_status("未连接")
             return
+        self._cancel_direct_motion("复位")
         if self._send_bytes(build_reset_cmd()):
             self.estop_latched = False
             self._set_arm_light()
@@ -3505,8 +4732,16 @@ class ScopeWindow(QMainWindow):
         """使能后确认 P4 真正进入 RUN_DIRECT，否则显示拒绝原因。"""
         self._admit_poll += 1
         info = self.status_info
-        # 直控到位后 P4 会自动 RUN_DIRECT_DONE 回 IDLE，因此以 control_mode 为准。
-        if info.get("control_mode") == 1:
+        # 到位后固件可释放 owner；保护停机也会保留 direct 模式位。
+        applied = info.get("applied_generation")
+        new_command = (applied is None or
+                       (applied == info.get("pending_generation") and
+                        applied != self._prior_applied_generation))
+        direct_state = info.get("state") in (SYSTEM_STATE_RUN_DIRECT, SYSTEM_STATE_IDLE,
+                                             SYSTEM_STATE_READY, SYSTEM_STATE_RECOVERY_REQUIRED)
+        if (self._status_rx_at > self._admit_sent_at and new_command and direct_state
+                and info.get("control_mode") == 1 and not info.get("direct_reject")
+                and not self._p4_overload_reason()):
             # 使能确认前先核对活动域：0xD3 批量帧按它收窄，若只含部分电机，
             # 一键紧绳/松绳/力控会"只有一台动"。不符就重写一次活动域再等。
             missing = self._scope_missing(self._enabled_motors())
@@ -3519,7 +4754,12 @@ class ScopeWindow(QMainWindow):
                 self._send_bytes(build_reset_cmd())
                 self._send_bytes(build_active_scope_cmd(
                     self._enabled_motor_mask(), 0, False))
-                QTimer.singleShot(150, self._finish_enable_start_again)
+                self._admit_timer.stop()
+                self._enable_delay.start(150)
+                return
+            if missing:
+                self._cancel_direct_motion("使能活动域不完整")
+                self._reject("使能直控", f"P4 活动域仍缺少 {self._motor_list_text(missing)}")
                 return
             self._scope_retry = 0
             self._admit_timer.stop()
@@ -3529,11 +4769,7 @@ class ScopeWindow(QMainWindow):
             # 使能不再重标零位（2026-11-02 用户 BUG 报告；10-29 诊断亦指出使能
             # 确认恰逢上电噪声峰值、是最糟的归零时机）：已有基准（📐 设置或
             # 布局恢复）保持不动；仅基准缺失时自动零一次并落盘防重启丢失。
-            auto_zeroed = False
-            for j in (16, 17):
-                if self.angle_baseline[j] is None:
-                    self._set_baseline_from_current(j)
-                    auto_zeroed = True
+            auto_zeroed = self._auto_zero_baselines()
             if auto_zeroed:
                 self._save_layout()
             for m in SERVO_TARGETS:
@@ -3552,7 +4788,9 @@ class ScopeWindow(QMainWindow):
             if self._pending_target is not None:
                 motor, rel = self._pending_target
                 self._pending_target = None
-                base = self._soft_limit_base(motor)
+                base = self.targets.get(motor)
+                if base is None:
+                    base = self._motor_pos_now(motor)
                 self._send_motor_target(motor, base + rel)
                 self._ctrl_status(f"自动使能完成，M{motor} 相对 {rel:+d} → 绝对 {base + rel:+d}")
             motors = self._enabled_motors()
@@ -3564,9 +4802,13 @@ class ScopeWindow(QMainWindow):
             return
         if self._admit_poll >= 12:
             self._admit_timer.stop()
+            self._want_closed_loop = self._want_goto_zero = False
+            self._pending_target = None
             reason = info.get("direct_reject", 0)
             state = info.get("state")
-            if state == 0 and self.estop_latched:
+            if self._p4_overload_reason():
+                self._reject("使能直控", self._p4_overload_reason())
+            elif state == 0 and self.estop_latched:
                 self._reject("使能直控",
                              "⛔ 使能被拒：E-STOP 锁存（点「复位」后重试）")
             else:
@@ -3608,11 +4850,12 @@ class ScopeWindow(QMainWindow):
         if not mask:
             self._ctrl_status("⛔ 未勾选任何绳：先在右侧 M27-M29 行勾选要使能的绳")
             return
-        targets = list(self.last_servo_abs_all or [0] * 30)
-        online = self.status_info.get("servo_online", 0)
-        for i in range(len(targets)):
-            if not online >> i & 1:
-                targets[i] = 0
+        if self.armed:
+            self._cancel_direct_motion("重新使能")
+            self._set_arm_light()
+        self._scope_retry = 0
+        self._admit_timer.stop()
+        self._enable_mask = mask
         # P4 语义：CMD_STOP 是锁存式 E-STOP，只有 CMD_RESET 能解锁；使能前一律先
         # STOP+RESET —— 不只为了解锁，更是为了**把 owner/control_enabled 清回 NONE**：
         # 固件的 ACTIVE_SCOPE 只在 owner=NONE、未使能时接受，否则静默拒绝。急停后
@@ -3628,22 +4871,24 @@ class ScopeWindow(QMainWindow):
             self._ctrl_status("使能发送失败：活动域写入未被受理")
             return
         # 活动域要等状态机清空 owner 后才落地：给一拍时间再 START，否则会沿用旧掩码
-        QTimer.singleShot(150, lambda m=mask, t=targets: self._finish_enable_start(m, t))
+        self._enable_delay.start(150)
 
-    def _finish_enable_start(self, mask: int, targets) -> None:
+    def _finish_enable_start(self) -> None:
+        if not self.connected or self.estop_latched or self._enable_mask != self._enabled_motor_mask():
+            return
+        if not self.last_servo_abs_all:
+            return
+        online = self.status_info.get("servo_online", 0)
+        targets = [v if online & (1 << i) else 0 for i, v in enumerate(self.last_servo_abs_all)]
+        self._admit_sent_at = time.monotonic()
+        self._prior_applied_generation = self.status_info.get("applied_generation")
         ok = self._send_bytes(build_start_cmd())
         ok = self._send_bytes(build_motor_pos_abs_cmd(targets)) and ok
         if not ok:
             self._ctrl_status("使能发送失败")
             return
-        self._enable_mask = mask
         self._admit_poll = 0
         self._admit_timer.start(200)
-
-    def _finish_enable_start_again(self) -> None:
-        """活动域重写后的重试 START（沿用当前实测位置，不重算 targets）。"""
-        self._finish_enable_start(self._enabled_motor_mask(),
-                                  list(self.last_servo_abs_all or [0] * 30))
 
     def _set_arm_light(self) -> None:
         self._refresh_motor_rows()
@@ -3653,6 +4898,10 @@ class ScopeWindow(QMainWindow):
             self.arm_light.setText("● 已使能 直控中")
             self.arm_light.setStyleSheet(
                 f"font-size: 13px; font-weight: bold; color: {AT.T('good')}; padding: 2px;")
+        elif self._p4_overload_reason():
+            self.arm_light.setText("⛔ " + self._p4_overload_reason())
+            self.arm_light.setStyleSheet(
+                f"font-size: 13px; font-weight: bold; color: {AT.T('bad')}; padding: 2px;")
         elif self.estop_latched:
             self.arm_light.setText("⛔ E-STOP 锁存（点「复位」后重新使能）")
             self.arm_light.setStyleSheet(
@@ -3680,12 +4929,19 @@ class ScopeWindow(QMainWindow):
         off_txt = "--"
         if origin is not None and not math.isnan(cur):
             off_txt = f"{int(cur) - origin:+d}"
+        # 2026-11-20：显示舵机自报的实时速度（遥测通道，单位 counts/s）
+        ch_spd = self.channels.get(f"m{motor}_speed")
+        spd = ch_spd.buf.last() if ch_spd is not None else None
+        spd_txt = ""
+        if spd is not None and not math.isnan(spd):
+            spd_txt = f"  速度 {spd:+.0f}c/s"
         if not self._motor_enabled(motor):
             text = f"实际 {cur_txt}（☐ 未勾选，不下发命令）"
         elif self.armed:
-            text = f"起点 {origin_txt}  实际 {cur_txt}  目标 {tgt_txt}  累计 {off_txt}"
+            text = (f"起点 {origin_txt}  实际 {cur_txt}  目标 {tgt_txt}"
+                    f"  累计 {off_txt}{spd_txt}")
         else:
-            text = f"实际 {cur_txt}（未使能）"
+            text = f"实际 {cur_txt}（未使能）{spd_txt}"
         cache = getattr(self, "_motor_info_cache", None)
         if cache is None:
             cache = self._motor_info_cache = {}
@@ -3727,25 +4983,42 @@ class ScopeWindow(QMainWindow):
             return
         cur = self.targets.get(motor)
         start = cur if cur is not None else self._soft_limit_base(motor)
-        if not self.ramp_check.isChecked() or abs(tgt - start) <= self._step() * 2:
-            if self._send_bytes(build_motor_pos_abs_one_cmd(motor, tgt)):
-                self.targets[motor] = tgt
-                self._safety("DIRECT", motor=motor, target=tgt, delta=tgt - start)
+        if not self.ramp_check.isChecked():
+            self._ramp_state.pop(motor, None)
+            # 2026-11-23：单电机也走 0xD3 批量帧。
+            # 固件提升直控命令时会把 active_motor_mask 覆盖成本帧的
+            # pending_direct_motor_mask；0xDE 的 mask 只有这一台，于是"直控一次，
+            # 活动域只剩一台"，闭环/一键操作随后被门禁拒并要求重新使能。
+            # 批量帧的 mask = 当前活动域∩有效，不收缩。
+            #
+            # 批量帧会带上 30 路目标，所以**其余两缆必须显式写成"原地保持"**：
+            # 在跑的斜坡沿用它的当前步，其余用实测位置——不能沿用 self.targets，
+            # 否则手推过之后的下一次点动会把别的绳拽回旧目标。
+            outs = {m: self._motor_pos_now(m) for m in SERVO_TARGETS}
+            for m in list(self._ramp_state):
+                v = self.targets.get(m)
+                if v is not None:
+                    outs[m] = v
+            outs[motor] = tgt
+            self._send_direct_targets(
+                outs, "DIRECT",
+                motor=motor, target=tgt, delta=tgt - start,
+                # 记下发送瞬间的实测，便于区分"发了没执行"还是"目标没变"
+                meas={m: self._motor_pos_now(m) for m in SERVO_TARGETS})
             return
-        self._ramp_state[motor] = {"target": tgt, "next_due": 0.0}
+        self._ramp_state[motor] = {"target": tgt}
         if not self._ramp_timer.isActive():
+            self._ramp_first_tick = True
             self._ramp_timer.start(50)
 
     # ---------- 多电机直控统一出口 ----------
-    def _send_direct_targets(self, outs: dict[int, int], why: str) -> bool:
-        """多电机直控统一出口：**一帧 0xD3 批量下发**，绝不逐电机连发 0xDE。
+    def _send_direct_targets(self, outs: dict[int, int], why: str, **detail) -> bool:
+        """直控统一出口：**一帧 0xD3 批量下发**。0xDE 已在 2026-11-23 从协议删除。
 
-        根因（2026-11-03 实机"松绳只有一根动"）：固件
-        upperApplySingleMotorTarget() 每帧都 pending_direct_generation+1 并把
-        pending_direct_motor_mask 覆盖成**单电机位**；状态机处理排队事件时用
-        pendingDirectCommandMatches(generation) 过滤，只有**最新代际**那帧被接受。
-        上位机在同一毫秒连发 3 帧 0xDE → 前两帧代际已过期被丢弃 → 只有一根绳动。
-        批量帧一帧含全部目标，天然原子，力控/闭环本来就走这条路。
+        历史根因（2026-11-03 实机"松绳只有一根动"）：旧的单电机帧每帧都
+        pending_direct_generation+1 并把 pending_direct_motor_mask 覆盖成单机位；
+        状态机按代际过滤，同一毫秒连发 3 帧只有最后一帧被接受。批量帧一帧含全部
+        目标，天然原子。
         """
         clean = {int(m): int(v) for m, v in outs.items() if self._motor_enabled(m)}
         if not clean:
@@ -3755,7 +5028,7 @@ class ScopeWindow(QMainWindow):
             return False
         for m, out in clean.items():
             self.targets[m] = out
-        self._safety(why, outs=clean)
+        self._safety(why, outs=clean, **detail)
         return True
 
     # ---------- 安全保护总开关（只剩闭环相关项） ----------
@@ -3801,23 +5074,31 @@ class ScopeWindow(QMainWindow):
         info.update(fields)
         safety_log(action, **info)
 
+    def _auto_zero_baselines(self) -> bool:
+        """角度基准缺失时以当前角自动归零（已有基准不动），返回是否归零过。
+
+        两处调用：使能确认、启动闭环。归零后由调用方决定是否立即落盘
+        （使能处落盘防重启丢失；启动处也落盘）。
+        """
+        zeroed = False
+        for j in (16, 17):
+            if self.angle_baseline[j] is None:
+                self._set_baseline_from_current(j)
+                zeroed = True
+        return zeroed
+
     def _on_ramp_tick(self) -> None:
         """50ms 一拍推进斜坡：**一拍一帧批量**（多电机逐帧 0xDE 会被固件
         代际合并，只有最后一台生效——"只有一根绳动"的另一个来源）。
 
         2026-11-03 用户定案：直控斜坡**不做张力检测**（张力保护只在闭环）。
         """
-        now = time.monotonic()
         step = max(1, int(self.ramp_rate_spin.value() * 0.05))
-        active = False
         outs = {}
         done = []
         for motor, st in list(self._ramp_state.items()):
             if not self._motor_enabled(motor):   # 中途取消勾选：剩余分步作废
                 del self._ramp_state[motor]
-                continue
-            if now < st["next_due"]:
-                active = True
                 continue
             cur = self.targets.get(motor)
             pos = cur if cur is not None else self._soft_limit_base(motor)
@@ -3825,13 +5106,15 @@ class ScopeWindow(QMainWindow):
             move = max(-step, min(step, delta))
             nxt = pos + move
             outs[motor] = nxt
-            st["next_due"] = now + 0.05
-            st["_next"] = nxt
-            if abs(st["target"] - nxt) < 1:
+            if st["target"] == nxt:
                 done.append(motor)
-            else:
-                active = True
         if outs:
+            if self._ramp_first_tick:
+                # 批量帧也带其余绳：启动斜坡时按实测保持，之后沿用已发目标。
+                for m in SERVO_TARGETS:
+                    if m not in outs:
+                        outs[m] = self._motor_pos_now(m)
+                self._ramp_first_tick = False
             if not self._send_direct_targets(outs, "RAMP"):
                 self._ramp_state.clear()
                 self._ramp_timer.stop()
@@ -3840,8 +5123,14 @@ class ScopeWindow(QMainWindow):
                 self._update_motor_info(motor)
         for motor in done:
             self._ramp_state.pop(motor, None)
-        if not active and not self._ramp_state:
+        if not self._ramp_state:
             self._ramp_timer.stop()
+
+    def _relative_target_base(self, motor: int) -> int:
+        if motor in self._ramp_state:
+            return self._ramp_state[motor]["target"]
+        sent = self.targets.get(motor)
+        return sent if sent is not None else self._motor_pos_now(motor)
 
     def _jog(self, motor: int, delta: int) -> None:
         if self.cl_enabled:
@@ -3859,15 +5148,17 @@ class ScopeWindow(QMainWindow):
                          recheck=lambda: (None if self.armed
                                           else "先点上方「使能直控」"))
             return
-        base_val = self.channels[f"m{motor}_abs"].buf.last()
-        base = self.targets[motor] if base_val is None or math.isnan(base_val) else int(base_val)
-        cur = self.targets[motor] if self.targets[motor] is not None else base
-        tgt = cur + delta
+        tgt = self._relative_target_base(motor) + delta
         self._send_motor_target(motor, tgt)
         self._ctrl_status(f"M{motor} → {tgt:+d} (Δ{delta:+d})", log=False)
 
     def _send_manual_target(self, motor: int, edit) -> None:
-        """输入语义：整数 N = 从【当前位置】相对走 N（无软件限位，仅斜坡限速）。"""
+        """输入语义：整数 N = 从【上次下发的目标】相对走 N。
+
+        首次（还没下发过目标）用当前实测位置做基准。这样连按同一次序会累加，
+        与 ± 点动的语义一致；否则第一次还没走完时，第二次按"实测位置"算出来的
+        目标可能还是同一个，看起来"没反应"。
+        """
         if self.cl_enabled:
             self._reject("手动目标", "闭环运行中：先停止闭环再手动",
                          recheck=lambda: ("闭环运行中：先停止闭环再手动"
@@ -3876,7 +5167,8 @@ class ScopeWindow(QMainWindow):
         text = edit.text().strip().replace("−", "-").replace("＋", "+")
         if not text:
             self._reject("手动目标",
-                         f"M{motor}：请输入相对当前位置的位移（如 500 或 -300）")
+                         f"M{motor}：请输入相对位移（基准=上次目标，首次=当前位置；"
+                         f"如 500 或 -300）")
             return
         if text.startswith("+"):
             text = text[1:]
@@ -3901,9 +5193,9 @@ class ScopeWindow(QMainWindow):
             self._ctrl_status(f"未使能 → 自动使能中，随后 M{motor} 相对 {rel:+d}")
             self._on_enable_direct()
             return
-        base = self._motor_pos_now(motor)
+        base = self._relative_target_base(motor)
         self._send_motor_target(motor, base + rel)
-        self._ctrl_status(f"M{motor} 当前 {base:+d} 相对 {rel:+d} → {base + rel:+d}")
+        self._ctrl_status(f"M{motor} 基准 {base:+d} 相对 {rel:+d} → {base + rel:+d}")
 
     # ---------- 张力链（ZNSV 变送器直连：观测台 = 唯一 UI，驱动直持串口） ----------
     def _toggle_tension_port(self) -> None:
@@ -3961,6 +5253,10 @@ class ScopeWindow(QMainWindow):
         """停轮询、关串口、复位按钮与状态行。观测台未开时控件为 None，须防 AttributeError。"""
         self._tension_poll_timer.stop()
         sensor, self._tension_sensor = self._tension_sensor, None
+        if self.rt_window is not None:
+            self.rt_window.estimate_panel.invalidate_reference()
+        if self._cl_mode == "c1_position":
+            self._tension_last = None
         if sensor is not None:
             sensor.disconnect()
         if self.tension_btn is not None:
@@ -3977,6 +5273,13 @@ class ScopeWindow(QMainWindow):
                      for i, ch in enumerate(self._tension_ch_map)]
         except IndexError:
             return   # 映射越界：丢帧保运行（映射来自 UI 下拉，1..8 恒合法，防御性保留）
+        # 2026-11-23 晚**撤销**"混合模式把 C2/C3 置 NaN"（原为本地未提交改动）。
+        # 初衷是"C2/C3 不参与该模式控制，别显示假数"，但代价是：
+        #   · τ=R·f 与张紧 t 是三缆加权和 → 两路 NaN 把 C1 的好数据一起毒成 NaN；
+        #   · 缆卡 / 力状态曲线 / calib 记录 / 诊断 CSV 只能看到 C1；
+        #   · 用户要求"所有模式都能看到三缆张力"。
+        # 控制侧并不使用 C2/C3：混合模式在 `_cl_tick` 提前 return、`_tension_guard`
+        # 不参与，`_c1_position_feedback` 只读 f1。故显示真值不改任何控制/安全行为。
         self._tension_raws_last = tuple(raws)
         zero = self._tension_zero
         self._tension_feed_count += 1
@@ -4021,7 +5324,13 @@ class ScopeWindow(QMainWindow):
             return
         if self._tension_ch_map[cable_idx] == ch:
             return
+        if cable_idx == 0 and self._cl_mode == "c1_position":
+            if self.cl_enabled:
+                self._stop_closed_loop("C1 张力通道已更改")
+            self._tension_last = None
         self._tension_ch_map[cable_idx] = ch
+        if self.rt_window is not None:
+            self.rt_window.estimate_panel.channel_changed(cable_idx)
         self._save_layout()
         if self.tension_status is not None:
             chs = "/".join(f"CH{c}" for c in self._tension_ch_map)
@@ -4040,6 +5349,7 @@ class ScopeWindow(QMainWindow):
                 QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
             return
         sensor.submit_channel_command(ch, 1, f"CH{ch} 零点校准")
+        self._tension_observer_zero_changed(ch)
         self.tension_status.setText(f"张力：已排队 CH{ch} 零点校准（须空载，帧间隙发送）")
 
     def _tension_tare_ch(self, ch: int) -> None:
@@ -4048,6 +5358,7 @@ class ScopeWindow(QMainWindow):
             self.tension_status.setText("张力：请先连接变送器")
             return
         sensor.submit_channel_command(ch, 2, f"CH{ch} 去皮")
+        self._tension_observer_zero_changed(ch)
         self.tension_status.setText(f"张力：已排队 CH{ch} 去皮")
 
     def _tension_all_tare(self) -> None:
@@ -4062,7 +5373,12 @@ class ScopeWindow(QMainWindow):
                 QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
             return
         sensor.submit_all_tare()
+        self._tension_observer_zero_changed()
         self.tension_status.setText("张力：已排队 全部去皮归零")
+
+    def _tension_observer_zero_changed(self, channel: int | None = None) -> None:
+        if self.rt_window is not None and (channel is None or channel == self._tension_ch_map[0]):
+            self.rt_window.estimate_panel.invalidate_reference()
 
     def _tension_status_refresh(self) -> None:
         """链路状态 ~1Hz + 连接按钮文字同步；含最近一条写命令回执。"""
@@ -4192,11 +5508,21 @@ class ScopeWindow(QMainWindow):
         except ValueError:
             return None, "⚠阈值非法（需 fmin<fmax）→ 守卫未启用"
         ev = tension_evaluate(fvals, age_ms, cfg,
-                              math.radians(roll_deg + dr),
+                              # 2026-11-23：和 `_force_geo` 用同一套模型角换算
+                              # （原来漏了 roll 换号 → 守卫算 R 用的是镜像位姿，
+                              #  与力控实际 R 不同号，τ 显示跟着乱）
+                              math.radians(MODEL_AXIS_SIGN[0] * roll_deg + dr),
                               math.radians(pitch_model_deg(pitch_deg) + dp))
         if ev.flags & TENSION_OVERLOAD:
-            cables = "+".join(f"C{i+1}" for i, v in enumerate(ev.overload) if v)
-            self._stop_closed_loop(f"张力过载 {cables} ≥ {cfg.f_max_n:g}N")
+            # 过载去抖（2026-11-23）：目标贴着 f_max 时，内环一次正常超调
+            # （实测 25.06~26.05）就会把环停掉，表现为"跑一会就自动停"。
+            # 连续 OVERLOAD_STOP_TICKS 拍（30 ms）都超限才真停，单拍毛刺放过。
+            self._overload_streak = getattr(self, "_overload_streak", 0) + 1
+            if self._overload_streak >= OVERLOAD_STOP_TICKS:
+                cables = "+".join(f"C{i+1}" for i, v in enumerate(ev.overload) if v)
+                self._stop_closed_loop(f"张力过载 {cables} ≥ {cfg.f_max_n:g}N")
+        else:
+            self._overload_streak = 0
         return ev, f"f=[{fvals[0]:.1f},{fvals[1]:.1f},{fvals[2]:.1f}]N"
 
     # ---------- 标定数据记录（被动，不驱动电机） ----------
@@ -4279,7 +5605,7 @@ class ScopeWindow(QMainWindow):
             rec["omega_p"].append(math.nan)
         self._rec_prev = (now, roll, pitch)
         rec["mode"].append({"position": 0, "tension": 1,
-                            "tight": 2, "force": 3}.get(self._cl_mode, -1))
+                            "tight": 2, "force": 3, "c1_position": 5}.get(self._cl_mode, -1))
         rec["flags"].append(flags)
 
     def _finalize_calib_rec(self) -> None:
@@ -4318,19 +5644,45 @@ class ScopeWindow(QMainWindow):
             f"💾 标定记录 {len(rec['t'])} 行 → {name}；"
             f"识别：python -m tools.identify_wrist_calib run_data/scope_exports/{name}")
 
-    def _load_wrist_calib(self, quiet: bool = False) -> None:
-        """载入 wrist_calib.json -> self.wrist_calib；失败显式提示原因。
+    def _default_wrist_calib(self) -> WristCalib:
+        """内建默认标定：k 幅值 = 结构常数，符号 = −trim方向；δ = 0。
 
+        k 的**幅值**不是拟合结果：`4096 counts/圈 ÷ (2π·绕线半径)`，逐路不同
+        （M27 r=6.0mm、M28/M29 r=5.5mm，见 `K_NOMINAL_ABS`）。
+        k 的**符号**是硬件方向，与力控共用同一条约定：
+
+            sign(k_i) = −sign(trim_sign_i)
+
+        这样只需要维护「trim方向」一处；trim方向非法时退回三路收绳（当前台架结论）。
+        """
+        ts = self._force_trim_sign()
+        if ts and len(ts) == 3 and all(s in (-1, 1) for s in ts):
+            signs = [-float(s) for s in ts]
+        else:
+            signs = [-1.0, -1.0, -1.0]
+        return WristCalib([s * n for s, n in zip(signs, K_NOMINAL_ABS)],
+                          [0.0, 0.0])
+
+    def _load_wrist_calib(self, quiet: bool = False) -> None:
+        """载入 wrist_calib.json；文件不存在/无效时用**内建默认**（不再要求手点）。
+
+        `wrist_calib.json` 现在是**可选覆盖**：k 的幅值是结构常数、符号由
+        「trim方向」反推、δ 默认 0 —— 正常机器不需要任何文件。
         quiet=True 供启动自动载入：不写状态行，免得盖掉开机提示。
         """
         data = load_named_json("wrist_calib.json")
         if not data:
-            self.cl_calib_label.setText("标定：读取失败/不存在（先跑识别脚本 --write 生成）")
+            self.wrist_calib = self._default_wrist_calib()
+            k = self.wrist_calib.k_counts_per_m
+            self.cl_calib_label.setText(
+                f"标定：内建默认 k=[{k[0]:+.6g},{k[1]:+.6g},{k[2]:+.6g}] c/m"
+                f"  δ=[+0.00,+0.00]°（结构常数，无需载入文件）")
             return
         calib, err = parse_wrist_calib(data)
         if calib is None:
-            self.wrist_calib = None
-            self.cl_calib_label.setText(f"标定：无效 — {err}")
+            self.wrist_calib = self._default_wrist_calib()
+            self.cl_calib_label.setText(
+                f"标定：文件无效（{err}）→ 用内建默认（结构常数 + trim方向反号）")
             return
         self.wrist_calib = calib
         k = calib.k_counts_per_m
@@ -4361,8 +5713,8 @@ class ScopeWindow(QMainWindow):
             self._ctrl_status(f"⚠ 符号自检：{warn}")
         if not quiet:
             self._ctrl_status(
-                "📥 已载入腕部标定：位置环两种结构都可用（%s）；"
-                "需与「trim方向」满足 sign(trim_sign)=−sign(k)" % sign_txt)
+                "📥 已载入腕部标定（%s）；需与「trim方向」满足 "
+                "sign(trim_sign)=−sign(k)" % sign_txt)
 
     def _wrist_pose_now(self):
         """当前腕部反馈位姿 (roll_deg, pitch_deg) | None（J16/J17 缺数据或未归零）。"""
@@ -4376,10 +5728,14 @@ class ScopeWindow(QMainWindow):
         return vals
 
     def _r_at_current(self):
-        """当前位姿的几何 R 求值。
+        """当前位姿的几何 R 求值（**模型系**，与 `_force_geo` 同一套换算）。
 
         返回 (roll_deg, pitch_deg, WristModelOut, roll_rad, pitch_rad) | None——
         rad 为 θ_model（已加 δ），供 positive_null_direction 等复用。
+
+        2026-11-23 修正：原来这里**漏了 `MODEL_AXIS_SIGN[0]`**（roll 换号），
+        于是观测台的 R 矩阵表用的是"镜像 roll"的几何，和力控实际用的 R 不一致
+        （同一时刻两处显示的 R 不同号 → 越看越乱）。现在与 `_force_geo` 对齐。
         """
         pose = self._wrist_pose_now()
         if pose is None:
@@ -4387,7 +5743,7 @@ class ScopeWindow(QMainWindow):
         roll_deg, pitch_deg = pose
         dr, dp = (self.wrist_calib.zero_offset_deg
                   if self.wrist_calib is not None else (0.0, 0.0))
-        rr = math.radians(roll_deg + dr)
+        rr = math.radians(MODEL_AXIS_SIGN[0] * roll_deg + dr)
         pr = math.radians(pitch_model_deg(pitch_deg) + dp)
         out = wrist_eval(rr, pr)
         if not out.math_valid:
@@ -4396,20 +5752,30 @@ class ScopeWindow(QMainWindow):
 
     # ---------- 自动慢扫掠（闭环目标三角波；标定录数用） ----------
     def _sweep_key(self) -> str:
-        return "roll_tgt" if self.sweep_axis.currentIndex() == 0 else "pitch_tgt"
+        idx = self.sweep_axis.currentIndex()
+        return "roll_tgt" if idx == 0 else "pitch_tgt"
+
+    def _sweep_seed(self) -> None:
+        """按当前两个目标框播种：中心=当前目标，单轴也用它做起点。"""
+        def _f(key: str) -> float:
+            try:
+                return float(self.cl_edits[key].text().strip().replace("−", "-"))
+            except ValueError:
+                return 0.0
+        self._sweep_center = (_f("roll_tgt"), _f("pitch_tgt"))
+        idx = self.sweep_axis.currentIndex()
+        if idx == 2 and self.sweep_center0.isChecked():
+            self._sweep_center = (0.0, 0.0)   # 过零对称：正负都扫到
+        self._sweep_val = self._sweep_center[idx] if idx in (0, 1) else 0.0
+        self._sweep_dir = 1.0 if self._sweep_val <= 0 else -1.0
+        self._sweep_phase = 0.0
+        self._sweep_ts = None
 
     def _on_sweep_toggled(self, on: bool) -> None:
         if not on:
             self._ctrl_status("扫掠已停（目标保持当前值）")
             return
-        try:
-            self._sweep_val = float(
-                self.cl_edits[self._sweep_key()].text().strip().replace("−", "-"))
-        except ValueError:
-            self._sweep_val = 0.0
-        self._sweep_dir = 1.0 if self._sweep_val <= 0 else -1.0
-        self._sweep_phase = 0.0   # 正弦从相位 0 重新起算
-        self._sweep_ts = None     # 下一拍按标称步长起算
+        self._sweep_seed()
         if not self.cl_enabled:
             self._ctrl_status("扫掠已就绪：启动闭环后开始走波形（三角=录标定 / 正弦=跟随测试）")
         else:
@@ -4417,14 +5783,23 @@ class ScopeWindow(QMainWindow):
 
     def _on_sweep_axis_changed(self, _index: int) -> None:
         """扫掠中切轴：按新轴目标框重新播种 + 相位归零（2026-11-10 修复）。"""
-        try:
-            self._sweep_val = float(
-                self.cl_edits[self._sweep_key()].text().strip().replace("−", "-"))
-        except ValueError:
-            self._sweep_val = 0.0
-        self._sweep_dir = 1.0 if self._sweep_val <= 0 else -1.0
-        self._sweep_phase = 0.0
-        self._sweep_ts = None
+        self._sweep_seed()
+        self._sync_sweep_widgets()
+
+    def _sync_sweep_widgets(self) -> None:
+        """按 轴/波形 禁用无关控件，避免"填了不生效"的困惑。
+
+        · 双轴正弦：波形下拉失效（固定正弦）、三角速度失效、PITCH 幅值生效；
+        · 单轴 + 三角波：速度生效、频率失效、PITCH 幅值失效；
+        · 单轴 + 正弦波：频率生效、速度失效、PITCH 幅值失效。
+        """
+        idx = self.sweep_axis.currentIndex()
+        dual = idx == 2
+        sine = dual or self.sweep_wave_combo.currentIndex() == 1
+        self.sweep_wave_combo.setEnabled(not dual)
+        self.sweep_freq.setEnabled(sine)
+        self.sweep_speed.setEnabled(not sine)
+        self.sweep_amp_p.setEnabled(dual)
 
     def _sweep_tick(self, dt: float | None = None) -> None:
         """20Hz：闭环运行且勾选扫掠时推进所选轴目标波形（±幅值内）。
@@ -4447,6 +5822,19 @@ class ScopeWindow(QMainWindow):
             # 首拍按标称 50ms；卡顿/挂起时钳到 0.2s，别让相位一次跳半圈
             dt = 0.05 if last is None else min(max(now - last, 0.001), 0.2)
         lim = self._cl_fval("limit", 25.0, 1.0, 90.0)
+        idx = self.sweep_axis.currentIndex()
+        if idx == 2:                                     # 双轴正弦（同相位）
+            self._sweep_phase = (self._sweep_phase
+                                 + 2.0 * math.pi * self.sweep_freq.value() * dt)
+            self._sweep_phase %= 2.0 * math.pi
+            s = math.sin(self._sweep_phase)
+            ar = min(self.sweep_amp.value(), lim)
+            ap = min(self.sweep_amp_p.value(), lim)
+            r = max(-lim, min(lim, self._sweep_center[0] + ar * s))
+            p = max(-lim, min(lim, self._sweep_center[1] + ap * s))
+            self.cl_edits["roll_tgt"].setText(f"{r:+.2f}")
+            self.cl_edits["pitch_tgt"].setText(f"{p:+.2f}")
+            return
         amp = min(self.sweep_amp.value(), lim)
         if self.sweep_wave_combo.currentIndex() == 1:      # 正弦波
             self._sweep_phase = (self._sweep_phase
@@ -4484,25 +5872,36 @@ class ScopeWindow(QMainWindow):
                 v = self.channels[f"enc_raw_{j}"].buf.last()
                 if math.isnan(v):
                     return "闭环启动失败：J16/J17 无数据"
-        if self._cl_mode == "position" and self.wrist_calib is None:
-            # 2026-11-10：位置环两种结构都要标定——前馈+PID 用 k·Δl 做前馈，
-            # 纯PID 也要 k 与 R 当"角度→counts"的换算（J = −k·R）。
-            # 没有标定时输出恒等于基准，启动时 targets 也等于基准，变更抑制会把
-            # 每一帧都滤掉——现象就是「点了启动，一动不动」。宁可直接拒绝。
-            return ("位置模式需要标定：先点「📥 载入标定」"
-                    "（前馈与角度→counts 换算都要 k 和 R）")
-        if self._cl_mode in ("force", "tension", "tight"):
+        if self._cl_mode in ("position", "c1_position") and self.wrist_calib is None:
+            # 防御：正常情况下 `_default_wrist_calib()` 保证不为 None
+            # （k 幅值=结构常数、符号=−trim方向）。这里只兜住人为清空的路径。
+            return ("位置模式缺少 k/R 换算参数：标定对象被清空 → "
+                    "点「📥 重载标定（可选）」或重启上位机恢复内建默认")
+        if self._cl_mode in ("force", "tension", "tight", "impedance"):
             last = self._tension_last
             if last is None or (time.monotonic() - last[0]) > 0.5:
                 return "力控启动失败：无新鲜张力数据（先在观测台连接张力串口）"
             # 参数合法性按模式各自校验（(0,0) 占位快检；逐拍还有真位姿检查）
             pre = {"force": lambda: self._force_params_v2(0.0, 0.0),
                    "tension": lambda: self._tension_params(),
+                   "impedance": lambda: self._impedance_params(0.0, 0.0),
                    "tight": lambda: self._tight_params(0.0, 0.0, quiet=True)}[
                 self._cl_mode]()
             if pre is None:
                 return "力控启动失败：力控参数非法（含 trim方向格式）"
+        if self._cl_mode == "c1_position":
+            params = self._read_c1_position_params()
+            if params is None:
+                return "混合模式：专用参数无效，请检查目标、增益和限幅"
+            _, _, reason = self._c1_position_feedback(params.c1.max_n)
+            if reason is not None:
+                return f"混合模式：{reason}"
+            pose = self._wrist_pose_now()
+            if pose is not None and self._c1_position_geometry(*pose) is None:
+                return "混合模式：姿态无效或 C2/C3 无法独立控制双轴"
         motors = self._enabled_motors()
+        if self._cl_mode == "c1_position" and not set(MOTOR_FOR_CABLE).issubset(motors):
+            return "混合模式：C1、C2、C3 对应的电机都需勾选"
         if not motors:
             return "闭环启动失败：未勾选任何绳"
         # 0xD3 批量帧在固件里按 active_motor_mask 收窄：活动域缺电机时启动闭环，
@@ -4525,16 +5924,11 @@ class ScopeWindow(QMainWindow):
         self._ramp_state.clear()
         # 角度基准未设时以当前角为零点，避免相对基准为 None。
         # （数据可用性已在门禁确认：无基准且无数据早被拒，此处必能设上。）
-        auto_zeroed = False
-        for j in (16, 17):
-            if self.angle_baseline[j] is None:
-                self._set_baseline_from_current(j)
-                auto_zeroed = True
         # 这次启动做了自动归零 → 立即落盘，保证重启可恢复（BUG1）；
         # 已有基准（含 _load_layout 恢复的）不动、不覆盖。
-        if auto_zeroed:
+        if self._auto_zero_baselines():
             self._save_layout()
-        if self._cl_mode == "position":
+        if self._cl_mode in ("position", "c1_position"):
             # 2026-11-10 修复①：origin 记的是「使能那一刻」的位置。使能后点动过
             # （或重力下沉），启动闭环会先朝旧起点跳一段。位置模式的起点改用
             # 启动时的实测位置；无数据的电机保留原值。
@@ -4546,19 +5940,29 @@ class ScopeWindow(QMainWindow):
                     # 旧指令（点动目标/使能位置）向实测 slews 追，纯PID 尤其明显
                     # （它的输出基准就是实测，会被旧 targets 往回拽 100+ counts）。
                     self.targets[m] = int(v)
-            # 2026-11-10 修复①续：前馈参考必须和 origin 同一个姿态（启动瞬间的读数）。
-            # 否则前馈按"零位→目标"算、origin 却在别的姿态，稳态偏 −θ_e/(1+kp)。
-            self._cl_ref_pose = self._wrist_pose_now()
-            # 2026-11-10 修复②：空框=走默认值（死区 0.3° 等），界面上看不出来。
-            # 启动时把生效值写回框里，所见即所算。
-            for key, default in (("kp", 0.6), ("ki", 0.0), ("kd", 0.0),
-                                 ("deadband", 0.3), ("limit", 25.0),
-                                 ("max_step_f", 20.0)):
-                e = self.cl_edits.get(key)
-                if e is not None and not e.text().strip():
-                    e.setText(f"{default:g}")
-            self._pos_pid_state.reset()     # PID 状态每轮从零起（积分/微分不跨轮）
-        if self._cl_mode in ("force", "tension", "tight"):
+            if self._cl_mode == "c1_position":
+                pose = self._wrist_pose_now()
+                if pose is not None:
+                    for key, value in zip(("roll_tgt", "pitch_tgt"), pose):
+                        edit = self._c1_position_edits[key]
+                        if not edit.text().strip():
+                            edit.setText(f"{value:.2f}")
+                self._c1_position_state.reset()
+                self._c1_angle_state.reset()
+                self._c1_diag_rows.clear()
+            else:
+                for key, default in (("kp", 0.2), ("ki", 0.05), ("kd", 0.05),
+                                     ("k_ff", 0.3), ("deadband", 0.3),
+                                     ("limit", 25.0), ("max_step_f", 20.0)):
+                    e = self.cl_edits.get(key)
+                    if e is not None and not e.text().strip():
+                        e.setText(f"{default:g}")
+                self._pos_pid_state.reset()
+        # 2026-11-23 修复：**impedance 也要走这段初始化**。原来只列了
+        # force/tension/tight，阻抗模式启动时 `_force_base` 保持 None，
+        # `_apply_force_step` 里 `base - max_trim` 直接 TypeError →
+        # 工作线程每拍抛异常 → 现象就是"点了启动，完全没反应"。
+        if self._cl_mode in ("force", "tension", "tight", "impedance"):
             # 位置基准 = 电机**实测**当前位置（不是上次指令）；按缆序映射
             # （与 _apply_force_step 同序，MOTOR_FOR_CABLE 换序时基准跟着换）。
             # 旧实现取 targets（上次指令），但力控下发不写 targets，重启会把
@@ -4567,10 +5971,19 @@ class ScopeWindow(QMainWindow):
             self._force_state.reset()
             self._tension_state.reset()
             self._force_trim = [0.0, 0.0, 0.0]
+            self._tau_trim = [0.0, 0.0]        # 力矩修正积分：每轮从零起
             self._force_need_send = True   # 首拍把 base+0 发下去，先按住当前位置
+            # 正弦跟随：起环就等于重新开始一次测试（相位归零 + 新记录文件）。
+            # 必须放在这里：`_stop_closed_loop_now` 会关闭记录文件，若只在勾选时
+            # 开文件，用户"先勾再启动"就会得到一个立刻被关掉的文件。
+            if (self.cl_tension_sine_check is not None
+                    and self.cl_tension_sine_check.isChecked()):
+                self._sine_t0 = None
+                self._sine_log_open()
         # 本轮闭环实际驱动的电机快照（运行中改勾选会先停闭环，见 _on_cable_enable_toggled）
         motors = self._enabled_motors()
         self._cl_motor_on = frozenset(motors)
+        self._overload_streak = 0        # 过载去抖计数每轮从零起
         self.cl_enabled = True
         self.cl_btn.setText("■ 停止闭环")
         self.cl_btn.setStyleSheet(
@@ -4579,20 +5992,39 @@ class ScopeWindow(QMainWindow):
         # 起点可能刚被刷新 → 参数缓存（含 origin）必须立刻失效，否则首拍仍用旧起点，
         # 会先朝旧位置走几拍（≤5 拍 × max_step）再被拉回来。
         self._cl_param_cache = None
-        self._cl_timer.start(10)  # 100Hz（与 P4 内环 100Hz、队列排空对齐；200Hz 受舵机总线 10ms 限制做不到）
+        # 2026-11-19：控制环改由**独立线程**驱动（不再用 GUI 线程的 QTimer）。
+        # 100 Hz；与 P4 内环、舵机总线 10 ms 周期对齐（200 Hz 被总线卡住做不到）。
+        self._cl_stop_request = None
+        old = self._cl_loop
+        if old is not None and old.isRunning():
+            old.stop()
+            old.wait(500)
+        self._cl_loop = _ClLoopThread(self, CL_LOOP_PERIOD_S)
+        # 先把参数快照生成好（GUI 线程），再放工作线程跑，避免首拍拿不到参数
+        self._refresh_cl_param_cache()
+        # 启动自检：命令能力 = max_step × 频率，超过伺服能力时有饱和/振荡风险
+        self._check_cmd_authority()
+        self._cl_tick_ts = None   # 首拍 dt 用默认 0.01
+        self._cl_loop.start()
         # 诊断记录（2026-11-19）：每次启动都清空 → 「一次运行 = 一份 diag CSV」。
         # 这样导出时不会把上一次运行的残留混进来。
-        self._diag_rows.clear()
+        if self._cl_mode != "c1_position":
+            self._diag_rows.clear()
+            self._pos_diag_rows.clear()
         self._apply_run_prio()    # 跑环即降档：主图 3:1、表格/观测台 15Hz
-        self._cl_tick_ts = None   # 首拍 dt 用默认 0.01
+        self._cl_tick_count = 0   # 每轮从零起（diag 抽样相位、状态行刷新都靠它）
         if self._cl_mode == "force":
             mode = "力矩控制"
+        elif self._cl_mode == "impedance":
+            mode = "阻抗控制"
         elif self._cl_mode == "tension":
             mode = "张力控制"
         elif self._cl_mode == "tight":
             mode = "张紧控制"
+        elif self._cl_mode == "c1_position":
+            mode = "C1 张力 + ROLL/PITCH 角度"
         else:
-            # 手填系数行已删（2026-11-03）：位置模式 = 前馈+PID 或 纯PID
+            # 位置模式只有一种结构：PID+前馈（绳长前馈 + PI，每拍限幅）
             mode = "位置·" + self._pos_loop_name()
         off = [m for m in SERVO_TARGETS if m not in self._cl_motor_on]
         scope_note = f"，驱动 {self._motor_list_text(motors)}"
@@ -4600,10 +6032,21 @@ class ScopeWindow(QMainWindow):
             scope_note += f"，未勾选 {self._motor_list_text(off)} 不下发"
             if self._cl_mode == "position":
                 scope_note += "（缺绳纠偏不全，盯紧软限位）"
-        sign_warn = self._sign_invariant_note()
+        if self._cl_mode == "position":
+            # 前馈(k_ff) + PI(kp)：等效位置增益 ≈ k_ff+kp。
+            # kp 沿用旧的"纯 P 增益"口径会偏大：只提示，不改用户的数。
+            kp_now = self._cl_fval("kp", 0.3, 0.0, 5.0)
+            k_ff_now = self._cl_fval("k_ff", 0.3, 0.0, 1.0)
+            if kp_now > 0.5:
+                scope_note += (f"（等效增益≈{k_ff_now + kp_now:.2f}，偏大时先降 kp 到 0.2~0.5）")
+        sign_warn = "" if self._cl_mode == "c1_position" else self._sign_invariant_note()
         self._ctrl_status(f"✅ 闭环运行（{mode}{scope_note}）：改目标框实时跟踪，停止请按急停或停止闭环"
                           + (f"  ⚠ {sign_warn}" if sign_warn else ""))
-        _fmn, _fmx, _ = self._effective_flimits()
+        if self._cl_mode == "c1_position" and self._c1_position_params is not None:
+            _fmn = self._c1_position_params.c1.min_n
+            _fmx = self._c1_position_params.c1.max_n
+        else:
+            _fmn, _fmx, _ = self._effective_flimits()
         # origins 落进安全日志：位置环的绝对目标 = origin + k·Δl，出问题先查这三个起点
         _log = dict(mode=self._cl_mode, motors=list(motors),
                     origins={m: self._motor_origin.get(m) for m in SERVO_TARGETS},
@@ -4611,7 +6054,7 @@ class ScopeWindow(QMainWindow):
         if sign_warn:
             _log["sign_warn"] = sign_warn
         if self._cl_mode == "position":
-            _log["pos_loop"] = "ff_pid" if self._pos_loop_is_ff() else "pid_only"
+            _log["pos_loop"] = "pid_incr"
         self._safety("CL_START", **_log)
 
     def _send_hold_now(self) -> bool:
@@ -4644,8 +6087,9 @@ class ScopeWindow(QMainWindow):
             self._safety("CL_HOLD", targets={m: base[m] for m in SERVO_TARGETS})
         return bool(ok)
 
-    def _stop_closed_loop(self, reason: str, *, hold: bool = True,
-                          popup: bool = True) -> None:
+    def _stop_closed_loop_now(self, reason: str, *, hold: bool = True,
+                              popup: bool = True) -> None:
+        """真正执行停环（必须在 GUI 线程）。外部一律用 `_stop_closed_loop`。"""
         """停止闭环。默认当场"刹住"（hold=True）：丢队列 + 抢占下发保持当前位。
 
         急停/断开时传 hold=False：那两条路径自己会发 0xCD（断力矩），
@@ -4655,6 +6099,15 @@ class ScopeWindow(QMainWindow):
         用户主动路径（手动停止/急停/切模式/勾选变更/断开/紧绳回滚）传
         popup=False——操作者已知原因，不再打扰；回滚有自己的专属弹窗。
         """
+        self._cl_stop_request = reason or "停止"
+        self._sine_log_close()               # 停环就把正弦记录收口（2026-11-24）
+        loop = self._cl_loop
+        self._cl_loop = None
+        if loop is not None:
+            loop.stop()
+            if not loop.wait(500):
+                self._ctrl_status("控制线程未在 0.5s 内退出（会自行停止）",
+                                  log=False)
         self._cl_timer.stop()
         if hold and self.cl_enabled:
             self._send_hold_now()            # 先刹住，再做 UI/落盘记账
@@ -4669,7 +6122,6 @@ class ScopeWindow(QMainWindow):
                 self.cl_edits[key].setText(
                     f"{pose[0] if key == 'roll_tgt' else pose[1]:+.2f}")
         self._force_recovery = False         # 恢复态随停环清除（PLAN D1）
-        self._cl_ref_pose = None             # 前馈参考只在本轮有效（下次启动重取）
         self._recovery_ok_since = None       # REVIEW P0-3：计时器一并清防秒清
         if not self.cl_enabled:
             self._tighten_cl_active = False
@@ -4680,6 +6132,7 @@ class ScopeWindow(QMainWindow):
         # 停止弹窗的复查行会自相矛盾——R2 自查 Finding A）。
         was_tighten = self._tighten_cl_active and popup
         self._tighten_cl_active = False
+        self._overload_streak = 0        # 停环清去抖计数
         self.cl_enabled = False
         self._apply_run_prio()       # 停环恢复全速（主图 33FPS、表格 30Hz、观测台 20Hz）
         self._want_closed_loop = False
@@ -4687,11 +6140,25 @@ class ScopeWindow(QMainWindow):
         self.cl_btn.setStyleSheet("font-weight: bold; padding: 6px;")
         self._refresh_motor_rows()   # 输入框/Go/点动按勾选×使能恢复
         self._finalize_calib_rec()   # 闭环停止即收尾落盘（若在记录）
-        self.cl_status.setText(f"已停止（{reason}）")
+        self._cl_status_set(f"已停止（{reason}）")
         self._ctrl_status(f"闭环已停止：{reason}")
         self._safety("CL_STOP", reason=reason)
         if was_tighten:
             self._notify_cl_stop(reason)     # 记账完毕、状态已收敛，再弹窗
+
+    def _stop_closed_loop(self, reason: str, *, hold: bool = True,
+                          popup: bool = True) -> None:
+        """停环入口（跨线程安全）。
+
+        从工作线程调用时：只置 `_cl_stop_request`（工作线程下一拍自己退出循环），
+        真正的 UI/落盘/弹窗投递到 GUI 线程执行（`_stop_closed_loop_now`）。
+        从 GUI 线程调用时：当场执行，行为与旧版逐位一致。
+        """
+        if self._in_gui_thread():
+            self._stop_closed_loop_now(reason, hold=hold, popup=popup)
+            return
+        self._cl_stop_request = reason
+        self._ui_call(self._stop_closed_loop_now, reason, hold=hold, popup=popup)
 
     def _notify_cl_stop(self, reason: str) -> None:
         """一键紧绳会话的故障停环弹窗（复用 RejectDialog，动词=已停止）。
@@ -4707,7 +6174,7 @@ class ScopeWindow(QMainWindow):
 
     # ---------- 控制模式：位置 / 张力·力控 ----------
     def _on_cl_mode_changed(self, index: int) -> None:
-        mode = ("position", "tension", "tight", "force")[index]
+        mode = self.cl_mode_combo.itemData(index) or "position"
         if mode == self._cl_mode:
             return
         if self.cl_enabled:
@@ -4718,57 +6185,78 @@ class ScopeWindow(QMainWindow):
 
     def _apply_cl_mode_visibility(self) -> None:
         """分模式显示切换。力控三模式隐藏角度目标/参数/标定/手填行，
-        各自显示专属参数行 + 共用 trim方向/限幅/fmin 行。"""
-        force = self._cl_mode in ("force", "tension", "tight")
+        各自显示专属参数行 + 共用 trim方向/限幅/fmin 行。
+
+        2026-11-22：阻抗模式属"力控家族"（它输出力矩，走同一条②链），
+        所以与三力控模式共用公共行，额外显示 K/D 行。
+
+        2026-11-23 修复：**阻抗模式必须显示「目标角」行** —— 那一行就是 `q*`，
+        是阻抗的输入。之前按"力控家族"整行隐藏，导致阻抗模式看不到、也改不了
+        目标角，`_cl_fval("roll_tgt")` 只能读到看不见的旧值：
+        现象就是"点了启动，腕完全没反应"（因为 q* 恰好≈当前角 → τ*=0）。
+        """
+        force = self._cl_mode in ("force", "tension", "tight", "impedance")
+        c1_position = self._cl_mode == "c1_position"
+        # 目标角行：张力/张紧/力矩不需要（目标就是 f_d / t / τ），阻抗需要。
+        wants_tgt = self._cl_mode not in ("force", "tension", "tight")
         if getattr(self, "_cl_tgt_row_w", None) is None:
             return
-        self._cl_tgt_row_w.setVisible(not force)
-        self._cl_par_row_w.setVisible(not force)
+        self._cl_tgt_row_w.setVisible(wants_tgt and not c1_position)
+        self._cl_par_row_w.setVisible(not force and not c1_position)
+        self._cl_step_row_w.setVisible(not c1_position)
         self._cl_model_row_w.setVisible(not force)
         self.cl_calib_label.setVisible(not force)
         self._cl_force_row_w.setVisible(self._cl_mode == "force")
+        # 内环增益 Kp_f/Ki_f + 积分上限：四个力控模式都在用，就都显示
+        # （2026-11-24 之前它们被藏在张力专用行里，力矩/阻抗模式看不到也改不了）
+        loop_row = getattr(self, "_cl_loop_row_w", None)
+        if loop_row is not None:
+            loop_row.setVisible(force)
+        imp_row = getattr(self, "_cl_imp_row_w", None)
+        if imp_row is not None:
+            imp_row.setVisible(self._cl_mode == "impedance")
         self._cl_tension_row_w.setVisible(self._cl_mode == "tension")
+        self._cl_c1_position_row_w.setVisible(c1_position)
+        self.cl_roll_check.setVisible(not c1_position)
+        self.cl_pitch_check.setVisible(not c1_position)
         self._cl_tight_row_w.setVisible(self._cl_mode == "tight")
         self._cl_force_common_row_w.setVisible(force)
         self._cl_bound_row_w.setVisible(force)
-        if force:
+        if force or c1_position:
             self.sweep_check.setChecked(False)      # 扫掠是位置模式专属
             self.sweep_check.setEnabled(False)
         else:
             self.sweep_check.setEnabled(True)
 
-    # ---------- 位置环两种结构（2026-11-10） ----------
-    def _pos_loop_is_ff(self) -> bool:
-        """当前位置环是不是「前馈+PID」（False = 纯PID 增量式）。"""
-        combo = getattr(self, "pos_loop_combo", None)
-        return True if combo is None else combo.currentIndex() == 0
+    # ---------- 位置环结构（2026-11-23 定案：绳长前馈 + PI，每拍限幅） ----------
+    POS_LOOP_NAME = "PID+前馈"
 
     def _pos_loop_name(self) -> str:
-        return "前馈+PID" if self._pos_loop_is_ff() else "纯PID"
-
-    def _on_pos_loop_changed(self, index: int) -> None:
-        """切换位置环结构：运行中先停环（要换的是控制结构，不能热切）。"""
-        if self.cl_enabled:
-            self._stop_closed_loop("切换位置环结构", popup=False)
-        self._pos_pid_state.reset()
-        self._cl_param_cache = None        # origin/增益快照跟着失效
-        self._ctrl_status(
-            "位置环 = 前馈+PID（模型绳长前馈 + 关节 PID，绝对式）"
-            if index == 0 else
-            "位置环 = 纯PID（无前馈，增量式：基准=实测位置）")
-        self._save_layout()
+        """状态行/日志里的位置环结构名（唯一结构，保留方法供调用点不变）。"""
+        return self.POS_LOOP_NAME
 
     def _force_geo(self, roll, pitch):
         """当前位姿的 (wrist_eval, n̂)，带 0.1° 网格缓存（三力控模式共用）。
 
-        角度加 δ（与张力守卫/τ 观测同一条 θ_model 链）。R 无效返回 None。"""
+        角度加 δ（与张力守卫/τ 观测同一条 θ_model 链）。R 无效或**该位姿无全正
+        零空间**时返回 None。
+
+        2026-11-23 **改为"用真实位姿、不钳制"**：
+          以前把角度钳进 `clamp_force_closure` 的可行域再算模型（为了不报
+          "无可行预紧区间"）。但钳制等于**拿另一个姿态的 R/n̂ 去算真实机器**，
+          现场后果是"某根绳被单独收到 f_max 还在收"（roll 实测 −18.2° 被钳到
+          −15°，模型力矩与实际几何不对应）。
+          现在如实返回：位姿真在可行域外就返回 None，调用方明确报"该位姿力封闭
+          失败"，让操作者把腕摆回来 —— 而不是拿错模型继续控。
+        """
         dr, dp = (self.wrist_calib.zero_offset_deg
                   if self.wrist_calib is not None else (0.0, 0.0))
         # UI/硬件角 → 模型角（2026-11-19，同位置环）：roll 方向与模型相反。
         rm = MODEL_AXIS_SIGN[0] * roll
         rr = math.radians(rm + dr)
         pr = math.radians(pitch_model_deg(pitch) + dp)
-        key = (round(rm + dr, 1), round(pitch_model_deg(pitch) + dp, 1))
+        self._pose_clamp_delta = (0.0, 0.0)
+        key = (round(math.degrees(rr), 1), round(math.degrees(pr), 1))
         now = time.monotonic()
         cached = getattr(self, "_force_geo_cache", None)
         if (cached is not None and cached[0] == key
@@ -4780,6 +6268,23 @@ class ScopeWindow(QMainWindow):
         pair = (out, positive_null_direction(rr, pr, out_model=out))
         self._force_geo_cache = (key, pair, now)
         return pair
+
+    def _warn_pose_clamped(self, r_raw, p_raw, r_clip, p_clip) -> None:
+        """位姿越出力封闭可行域时的 1 s 节流提示（只提示，不改控制目标）。"""
+        now = time.monotonic()
+        if now - getattr(self, "_pose_clamp_last", 0.0) < 1.0:
+            return
+        self._pose_clamp_last = now
+        self._ctrl_status(
+            f"⚠ 位姿越出力封闭域：模型按最近可行姿态计算"
+            f"（roll {math.degrees(r_raw):+.1f}→{math.degrees(r_clip):+.1f}°, "
+            f"pitch {math.degrees(p_raw):+.1f}→{math.degrees(p_clip):+.1f}°）",
+            log=False)
+        self._safety("FORCE_POSE_CLAMPED",
+                     roll_raw=round(math.degrees(r_raw), 2),
+                     pitch_raw=round(math.degrees(p_raw), 2),
+                     roll_clip=round(math.degrees(r_clip), 2),
+                     pitch_clip=round(math.degrees(p_clip), 2))
 
     def _force_fmax(self) -> float:
         """f_max 唯一来源=有效阈值（_effective_flimits）。"""
@@ -4853,12 +6358,22 @@ class ScopeWindow(QMainWindow):
             return f"⚠预紧丢失 t={t:.2f}<{t_min:g}N"
         return ""
 
+    def _cl_text(self, key: str, default: str = "") -> str:
+        """读参数框文本（跨线程安全）：工作线程读 GUI 快照，GUI 线程读控件。"""
+        snap = getattr(self, "_cl_snap", None)
+        if snap is not None and not self._in_gui_thread():
+            v = snap.get(key)
+            if v is not None:
+                return v
+        w = self.cl_edits.get(key)
+        return w.text() if w is not None else default
+
     def _force_trim_sign(self):
         """trim方向框 → [3]±1 | None（非法 None=参数拒绝启动）。"""
         try:
-            sign_txt = self.cl_edits["trim_sign"].text().strip().replace("，", ",")
+            sign_txt = self._cl_text("trim_sign").strip().replace("，", ",")
             return [int(s.strip()) for s in sign_txt.split(",") if s.strip()]
-        except (ValueError, KeyError, AttributeError):
+        except (ValueError, AttributeError):
             return None
 
     def _sign_invariant_note(self) -> str:
@@ -4891,6 +6406,20 @@ class ScopeWindow(QMainWindow):
         return (f"trim方向 的 {names} 与 k 的反号关系不符（其余路一致）："
                 f"按当前 k 应填 trim方向 = {want}；换线/反向安装后需逐缆点动复核")
 
+    def _capacity_note(self, r_m, nd, t_floor, f_min, f_max) -> str:
+        """四个"顶点方向"的能力 [N·m]（闭式 4×9 次比较，O(1)）。
+
+        2026-11-23 起不再做"按轴钳制"（那是矩形近似，双轴会高估）；
+        这里只用来**显示**"这台机器现在最多能出多少"：
+        `cap(r±a/b p±c/d)`（本机 (0,0) 位姿约 `r±0.43/0.55 p±0.50/1.44`）。
+        """
+        caps = []
+        for d in ((1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)):
+            m = capacity_closed_form(r_m, nd, d[0], d[1],
+                                     t_floor, f_min, f_max)
+            caps.append(m if m is not None and math.isfinite(m) else 0.0)
+        return (f"cap(r±{caps[0]:.2f}/{caps[1]:.2f} p±{caps[2]:.2f}/{caps[3]:.2f})N·m")
+
     def _force_params_v2(self, roll, pitch):
         """读力控 UI + 动态 R(q) → WristForceV2Params | None（力矩模式）。"""
         geo = self._force_geo(roll, pitch)
@@ -4899,18 +6428,30 @@ class ScopeWindow(QMainWindow):
         out, nd = geo
         r_max = self._cl_fval("tau_r_max", 0.0, 0.0, 100.0)
         p_max = self._cl_fval("tau_p_max", 0.0, 0.0, 100.0)
-        tau_r = self._cl_fval("tau_roll", 0.0, -100.0, 100.0)
-        tau_p = self._cl_fval("tau_pitch", 0.0, -100.0, 100.0)
+        imp = getattr(self, "_imp_tau", None)
+        if self._cl_mode == "impedance" and imp is not None:
+            # 2026-11-22：阻抗模式 → τ 由外环算（K·e + D·ė + τ_ff），不读 τ 输入框
+            tau_r, tau_p = imp
+        else:
+            tau_r = self._cl_fval("tau_roll", 0.0, -100.0, 100.0)
+            tau_p = self._cl_fval("tau_pitch", 0.0, -100.0, 100.0)
         if r_max > 0.0:
             tau_r = max(-r_max, min(r_max, tau_r))
         if p_max > 0.0:
             tau_p = max(-p_max, min(p_max, tau_p))
+        # 2026-11-23：**不再在这里钳 τ**。「能不能做」由分配层的 α（沿方向、
+        # 闭式）决定：做不到就按 α 缩，并显示"τ* → ατ* → 实测"。
+        # 旧的 `_clamp_tau_to_capacity` 按轴独立二分，双轴组合会高估能力
+        # （实测 (0.1,-2.0)：pitch 单轴 1.443，叠加 0.1 roll 后真实只有 1.380），
+        # 砍完仍不可行 → 误判停环。函数保留但不再参与分配路径。
         try:
+            mt = self._cl_fval("max_trim", 3000.0, 1.0, 50000.0)
             return WristForceV2Params(
                 tau_d=(tau_r, tau_p),
                 preload_n=self._cl_fval("preload", 5.0, 0.0, 100.0),
-                # 2026-11-18：力矩 PI 外环已移除（纯前馈）。
-                # kp/ki 仍传 0，仅占位；law 里已不再读取它们。
+                # 2026-11-18：力矩 **P** 外环已移除；2026-11-24 加了"慢积分修正"
+                # （见 `tau_trim_step` 与 `tau_ki` 框）。kp/ki 仍是历史占位字段，
+                # law 里不读；真正在用的是内环 kp_inner/ki_inner 与 τ修正 tau_ki。
                 kp=0.0,
                 ki=0.0,
                 trim_sign=self._force_trim_sign(),
@@ -4918,12 +6459,21 @@ class ScopeWindow(QMainWindow):
                 # 旧的 trim_gain=50 是 P=I 单旋钮，S·50=2.32 越界（实测 50Hz 极限环）。
                 kp_inner=self._cl_fval("kp_f", 15.0, 0.0, 10000.0),
                 ki_inner=self._cl_fval("ki_f", 20.0, 0.0, 10000.0),
-                max_trim=self._cl_fval("max_trim", 3000.0, 1.0, 50000.0),
+                max_trim=mt,
                 f_max=self._force_fmax(),
                 f_min=self._effective_flimits()[0],
                 deadband=0.01,
                 r_m=out.r_m, null_dir=nd,
-                max_step=self._cl_fval("max_step_f", 20.0, 0.1, 2000.0))
+                max_step=self._cl_fval("max_step_f", 20.0, 0.1, 2000.0),
+                # 2026-11-20：以前力矩模式**漏接**积分钳制（law 里传的是
+                # max_trim＝不限），这里补上，与张力/张紧同一个口径。
+                i_term_lim=self._tension_i_term_lim(mt),
+                # 2026-11-24：逐缆覆盖（与张力模式同一个"1 个或 3 个"口径）
+                kp3=self._cl_fval3("kp_f", 15.0, 0.0, 10000.0),
+                ki3=self._cl_fval3("ki_f", 20.0, 0.0, 10000.0),
+                max_step3=self._cl_fval3("max_step_f", 20.0, 0.1, 2000.0),
+                i_term_lim3=self._cl_fval3(
+                    "i_term_lim", float(self._tension_i_term_lim(mt)), 0.0, 1e6))
         except (ValueError, KeyError):
             return None
 
@@ -4932,7 +6482,7 @@ class ScopeWindow(QMainWindow):
 
         力控模式每拍增量由 `_incr_step(..., max_step)` 限幅；位置模式的输出是
         绝对目标，所以这里换算成"每拍变化 ≤ max_step_f"，两种模式对舵机的
-        实际限制才一致（100Hz 下 20 counts/拍 = 2000 counts/s）。
+        实际限制才一致。
         """
         if not outs or not self._safety_on():
             return outs
@@ -4944,31 +6494,43 @@ class ScopeWindow(QMainWindow):
         return {m: v for m, v in limited.items() if v != self.targets.get(m)}
 
     def _tension_i_term_lim(self, max_trim: float) -> float:
-        """积分贡献的钳制 [counts]。
+        """积分累积上限 [counts]，三个力控模式共用，**界面上可调**。
 
-        2026-11-14：用户要求先关闭（绳子有松绳/紧绳状态，counts 口径的钳制先不启用）
-        → `tension_i_term_lim_counts()` 返回 0 时退回 `max_trim`（≈不限）；
-        此时积分仍被条件积分兜底（`|kp·e+ki·I| ≥ max_step` 就停，实际 ~20 counts）。
+        2026-11-20 用户定案：积分允许一直累积（不再靠"饱和闸门"冻结），
+        只用一个累积上限封顶；该上限放到界面「积分上限」框，可随时改。
+          · 贡献上限 = 本值（counts）
+          · 状态上限 = 本值 / Ki（N·s）—— 由 `_incr_step` 自动换算
+          · 填 0 = 关闭积分（`lim_state=0` ⟹ 状态恒 0 ⟹ 纯 P）
+        `max_trim` 参数保留只为兼容旧调用点，不再参与回退。
         """
-        lim = tension_i_term_lim_counts()
-        return lim if lim > 0.0 else float(max_trim)
+        return self._cl_fval("i_term_lim", 5.0, 0.0, 2000.0)
 
     def _tension_params(self):
-        """读力控 UI → WristTensionParams | None（张力模式，每缆独立）。"""
+        """读力控 UI → WristTensionParams | None（张力模式，每缆独立）。
+
+        2026-11-24：`kp_f / ki_f / i_term_lim / max_step_f` 支持**逐缆填写**
+        （"15" 或 "15,15,8"，逗号分隔按 C1,C2,C3）。三根缆的摩擦/绳长不同，
+        一套增益不可能同时最优；填错格式直接返回 None（拒绝开环）。
+        """
         try:
             mt = self._cl_fval("max_trim", 3000.0, 1.0, 50000.0)
+            kp3 = self._cl_fval3("kp_f", 15.0, 0.0, 10000.0)
+            ki3 = self._cl_fval3("ki_f", 20.0, 0.0, 10000.0)
+            ms3 = self._cl_fval3("max_step_f", 20.0, 0.1, 2000.0)
+            itl3 = self._cl_fval3(
+                "i_term_lim", float(self._tension_i_term_lim(mt)), 0.0, 1e6)
+            if kp3 is None or ki3 is None or ms3 is None or itl3 is None:
+                return None
             return WristTensionParams(
                 f_target=(self._cl_fval("f1_tgt", 2.0, 0.0, 50.0),
                           self._cl_fval("f2_tgt", 2.0, 0.0, 50.0),
                           self._cl_fval("f3_tgt", 2.0, 0.0, 50.0)),
-                kp=self._cl_fval("kp_f", 15.0, 0.0, 10000.0),
-                ki=self._cl_fval("ki_f", 20.0, 0.0, 10000.0),
-                max_step=self._cl_fval("max_step_f", 20.0, 0.1, 2000.0),
+                kp=kp3[0], ki=ki3[0], max_step=ms3[0], i_term_lim=itl3[0],
                 trim_sign=self._force_trim_sign(),
                 max_trim=mt,
                 f_max=self._force_fmax(),
                 deadband=0.05,
-                i_term_lim=self._tension_i_term_lim(mt))
+                kp3=kp3, ki3=ki3, max_step3=ms3, i_term_lim3=itl3)
         except (ValueError, KeyError):
             return None
 
@@ -5043,39 +6605,231 @@ class ScopeWindow(QMainWindow):
         except (ValueError, KeyError):
             return None
 
-    def _cl_tick_force(self, roll: float, pitch: float) -> None:
-        """100Hz 力矩环：τ 外环 PI → TDA 分配 f_d → 腱张力内环 PI → 位置 trim。
+    def _tau_ff(self, roll: float, pitch: float):
+        """重力前馈 τ_ff [N·m]（2026-11-23 恢复可测：读界面 `τff@90°` 两个框）。
 
-        注意命名（2026-11-10 校正）：这是「TDA + 腱空间力内环 + 关节力矩外环」，
-        **不是**论文 §7 的 P⁻ᵀ 关节空间解耦律；R·Rᵀ 耦合仍在（见 COMPARE 文档 §4.1）。
+        τ_g,roll  = A_r·sin(roll)
+        τ_g,pitch = A_p·sin(pitch)·cos(roll)
+        τ_ff      = −τ_g
+
+        `A` = 90° 处的重力力矩幅值；两框填 0（默认）= 不补偿，行为与之前完全一致。
+        """
+        return gravity_tau_sine(
+            self._cl_fval("tau_ff_r", 0.0, -10.0, 10.0),
+            self._cl_fval("tau_ff_p", 0.0, -10.0, 10.0),
+            roll, pitch)
+
+    def _impedance_params(self, roll: float = 0.0, pitch: float = 0.0):
+        """读阻抗行 → WristImpedanceParams | None（2026-11-22 框架）。
+
+        `τ_ff` 目前恒为 0（2026-11-23 按用户要求注释掉了重力前馈，
+        见 `_tau_ff`）。钳制用「τ 上限」两框（与力矩模式共用）。
+        """
+        try:
+            tau_ff = self._tau_ff(roll, pitch)
+            return WristImpedanceParams(
+                k_roll=self._cl_fval("k_roll", 0.5, 0.0, 100.0),
+                k_pitch=self._cl_fval("k_pitch", 0.5, 0.0, 100.0),
+                d_roll=self._cl_fval("d_roll", 0.0, 0.0, 100.0),
+                d_pitch=self._cl_fval("d_pitch", 0.0, 0.0, 100.0),
+                tau_ff=tau_ff,
+                tau_r_max=self._cl_fval("tau_r_max", 0.0, 0.0, 100.0),
+                tau_p_max=self._cl_fval("tau_p_max", 0.0, 0.0, 100.0),
+                deadband_deg=self._cl_fval("deadband", 0.3, 0.0, 10.0),
+            )
+        except (ValueError, KeyError):
+            return None
+
+    def _cl_tick_impedance(self, roll: float, pitch: float) -> None:
+        """100Hz 阻抗外环：q*−q → τ* → 复用②（分配+张力内环）。
+
+        外环只做"位置→力矩"，其余全部沿用 `_cl_tick_force`：
+        能力钳制 → `allocate_torque_priority` → 三缆张力 PI → trim。
+        所以这里先把 τ* 存到 `self._imp_tau`，再由 `_force_params_v2` 取用。
+        """
+        ip = self._impedance_params(roll, pitch)
+        if ip is None:
+            self._stop_closed_loop("阻抗控制：参数非法")
+            return
+        roll_tgt = self._cl_fval("roll_tgt", 0.0, -90.0, 90.0)
+        pitch_tgt = self._cl_fval("pitch_tgt", 0.0, -90.0, 90.0)
+        tau_r, tau_p, fl = wrist_impedance_torque(
+            ip, roll, pitch, roll_tgt, pitch_tgt, 0.0, 0.0)
+        if fl & IMP_NO_TARGET:
+            self._stop_closed_loop("阻抗控制：位置/目标含非有限值")
+            return
+        # 2026-11-23：阻抗外环的 roll 输出取反（台架实测方向反）。
+        # 弹簧项 K·e、阻尼项 D·ė、前馈 τ_ff_r 一起翻——整条 roll 轴一个符号。
+        # 后续 TDA 还会做一次 `τ_model = s_r·τ_ui`（s_r=−1），叠加后本项不再翻转，
+        # 等价于"阻抗外环按模型系输出"。pitch 保持 UI 口径，不动。
+        tau_r = IMPEDANCE_ROLL_SIGN * tau_r
+        self._imp_tau = (tau_r, tau_p)
+        self._imp_flags = fl
+        # τ_ff 目前只存不用；跟着同一个符号存，避免以后显示时和 τ* 对不上。
+        self._imp_ff = (IMPEDANCE_ROLL_SIGN * ip.tau_ff[0], ip.tau_ff[1])
+        self._cl_tick_force(roll, pitch)
+
+    def _cl_tick_force(self, roll: float, pitch: float) -> None:
+        """100Hz 力控一拍：**τ 目标 → TDA 分配 f_d → 逐缆张力 PI → 位置增量**。
+
+        闭环结构（2026-11-24 定稿，⚠ 旧版此处写"没有力矩闭环"已不成立）：
+          · **主闭环**：每根缆的张力 f（逐缆增量 PI，100 Hz）—— 唯一靠反馈的量
+          · **慢积分修正**：`τ_cmd = τ* + ∫(τ* − R·f)·ki_τ`（`τ修正` 框，默认
+            1.0 /s，修正量上限 `TAU_TRIM_MAX`）。**只积分、不带 P**：τ 误差本身
+            就是内环的响应（10~30 ms），外环带 P 会和内环打架——2026-11-18
+            实测 `Kp=20` 时 51% 的拍 α<1、摆动 0.075 N·m。填 0 = 回到纯前馈。
+          · 该积分**只补"内环到不了 f_d"的稳态差**（积分权限/`max_trim` 打满/
+            摩擦迟滞）。它补不了 R 模型误差，也补不了导管摩擦造成的
+            "关节侧张力 ≠ 传感器侧张力"——因为 `τ_meas` 用的是同一个 R 和
+            电机侧 f 反算（见 `wrist_force_law.tau_trim_step` 与
+            docs/系统数学推导_20261123.md）。
+          · 由 `R·P⁻¹ = [I₂ 0]`：只要 `f → f_d`，`τ → ατ*` 自动成立。
+
+        不是论文 §7 的 `P⁻ᵀ` 关节空间解耦律；`R·Rᵀ` 的动态耦合仍在
+        （本机相关系数仅 3.2%，见 docs/系统数学推导_20261123.md §3）。
         """
         p = self._force_params_v2(roll, pitch)
         if p is None:
-            self._stop_closed_loop("力控：参数非法或该位姿 R(q) 无效")
+            # `_force_geo` 现在用真实位姿（不钳制）：返回 None 就是**该位姿真的
+            # 没有全正零空间**，拿不到 n̂ 就无法做 2 轴力矩分配。
+            self._stop_closed_loop(
+                f"力控：该位姿力封闭失败（无全正零空间） roll={roll:+.1f}° "
+                f"pitch={pitch:+.1f}° → 把腕摆回可行域 "
+                f"roll {FORCE_CLOSURE_ENVELOPE_ROLL_DEG[0]:g}…"
+                f"{FORCE_CLOSURE_ENVELOPE_ROLL_DEG[1]:g}°、"
+                f"pitch {FORCE_CLOSURE_ENVELOPE_PITCH_DEG[0]:g}…"
+                f"{FORCE_CLOSURE_ENVELOPE_PITCH_DEG[1]:g}°")
             return
         if abs(roll) > 30.0 or pitch < -30.0 or pitch > 50.0:
             self._stop_closed_loop(
                 f"力控：关节越界 ROLL{roll:+.1f}° PITCH{pitch:+.1f}°")
+            return
+        # 力封闭**病态**判定（2026-11-23）：某根缆的零空间份额趋近 0 时，它几乎
+        # 无法承载预紧 → 分配无解，或者它"永远收不满"（现场:一直收绳）。
+        # 放在分配**之前**：否则先被分配层的"预紧下限冲突"挡住，报错会指错方向。
+        nmin = min(p.null_dir) if p.null_dir else 1.0
+        if nmin < FORCE_NULL_MIN_SHARE:
+            i = list(p.null_dir).index(nmin)
+            self._stop_closed_loop(
+                f"力控：该位姿力封闭病态 —— C{i+1} 的零空间份额仅 {nmin:.3f}"
+                f"（阈值 {FORCE_NULL_MIN_SHARE:g}）⟹ 这根缆几乎无法承担预紧，"
+                f"分配必然无解或被它拖成一直收绳。\n"
+                f"当前位姿 roll={roll:+.1f}° pitch={pitch:+.1f}°；"
+                f"请把腕摆离力封闭边界（建议 |roll| ≤ 12°、pitch −20…+25°）再试。")
             return
         last = self._tension_last
         if last is None:
             self._stop_closed_loop("力控：张力数据丢失")
             return
         age_ms = (time.monotonic() - last[0]) * 1000.0
+        # 2026-11-23：**α 内生**（沿方向的闭式能力）—— 替代旧的"外部按轴二分钳 τ"。
+        # 旧做法把 3 缆 2 轴的能力当矩形（每轴独立测），双轴组合会高估 → 砍完仍
+        # 不可行 → 误判停环（实测 (0.1,-2.0)）。现在一次算出 α，永远给可行解。
+        acap = self._cl_fval("alpha_cap", 1.0, 0.05, 1.0)
+        alloc = {}
+        # ---- 力矩修正（慢积分外环，2026-11-24）：把"τ* − 实测τ"的**稳态部分**
+        # 用积分补到 τ 命令里。只积分不带 P（见 wrist_force_law.tau_trim_step 说明：
+        # τ 误差本身就是内环的响应，加 P 会和内环打架 → 旧实现 Kp_τ=20 就是这样振的）。
+        tau_meas0 = self._tau_meas(roll, pitch, last[1])
+        tki = self._cl_fval("tau_ki", 0.0, 0.0, 20.0)
+        if not hasattr(self, "_tau_trim"):
+            self._tau_trim = [0.0, 0.0]
+        if tau_meas0 is not None and tki > 0.0:
+            # 能力受限（α<1）时冻结：差距是物理上限，再积分只会把目标推得更不可行
+            _freeze = getattr(self, "_alpha_limited", False)
+            for _i in range(2):
+                self._tau_trim[_i], _ = tau_trim_step(
+                    p.tau_d[_i] - tau_meas0[_i], self._tau_trim[_i],
+                    tki, self._cl_dt, TAU_TRIM_MAX, freeze=_freeze)
+            self._tau_trim_on = True
+        else:
+            self._tau_trim_on = False
+            if tki <= 0.0:
+                self._tau_trim = [0.0, 0.0]
+        tau_cmd = (p.tau_d[0] + self._tau_trim[0],
+                   p.tau_d[1] + self._tau_trim[1])
+
+        def _solve(r_m, nd, tr, tp, tfl, fmin, fmax):
+            # **2026-11-23：roll 力矩换到模型系**（`τ_model = s·τ_ui`）。
+            # s 由 `_roll_tau_sign()` 给出 = `MODEL_AXIS_SIGN[0]`（模型约定）
+            # × 界面「τ方向」开关（±1）—— 实机方向与模型不一致时不用改代码，
+            # 在该框填 −1 即可（会同时翻转下发与显示的实测 τ，两者永远同号）。
+            tr_model = self._roll_tau_sign() * tau_cmd[0]
+            tp_model = tau_cmd[1]
+            # 给 f_max 留超调余量（见 FORCE_FMAX_HEADROOM_N 注释）
+            headroom = min(FORCE_FMAX_HEADROOM_N, 0.1 * fmax)
+            fmax_alloc = max(fmin + 0.1, fmax - headroom)
+            f_d, fl, al, info = allocation_step(
+                r_m, nd, tr_model, tp_model, tfl, fmin, fmax_alloc, alpha_cap=acap)
+            alloc.update(info)
+            # 2026-11-24：留存本拍目标张力，供 `tension_f*_tgt` 曲线
+            if f_d is not None:
+                self._f_d_last = list(f_d)
+            return f_d, fl, al
+
         trim, flags, alpha = wrist_force_v2_step(p, self._force_state, last[1],
-                                                 age_ms, self._cl_dt, tda_solve)
+                                                 age_ms, self._cl_dt, _solve)
+        self._alloc_info = alloc
+        # 供下一拍的力矩修正判断是否"能力受限"（受限时冻结积分，防 windup）
+        self._alpha_limited = alpha < 0.99
         if flags & FORCE_OVERLOAD:
+            # 过载停环统一交给 `_tension_guard`（同一份 f/fmax，且已做去抖）。
+            # 这里只"本拍不发目标"，等守卫连续超限再停。
+            return
+        if flags & FORCE_SENSOR_FAULT:
+            # 2026-11-23：负到物理不可能 = 传感器/通道故障。绝不能再"钳 0 继续控"。
             self._stop_closed_loop(
-                "力控：张力过载 [" + "/".join(f"{v:.1f}" for v in last[1])
-                + f"] N > f_max={p.f_max:g}")
+                "力控：张力读数异常（物理不可能） ["
+                + "/".join(f"{v:.1f}" for v in last[1])
+                + f"] N，阈值 {F_SENSOR_MIN_N:g} N → 检查传感器接线/通道/零点")
+            return
+        if getattr(self, "_pose_clamp_delta", (0.0, 0.0)) and max(self._pose_clamp_delta) > POSE_CLAMP_STOP_DEG:
+            dr, dp = self._pose_clamp_delta
+            self._stop_closed_loop(
+                f"力控：位姿超出力封闭可行域 {max(dr, dp):.1f}°（>{POSE_CLAMP_STOP_DEG:g}°）"
+                f"→ 模型 R/n̂ 已与实际几何不符，继续跑会把某根绳收到过载；"
+                f"先把腕摆回可行域（roll −15…+10°, pitch −25…+30°）")
             return
         if flags & FORCE_TDA_INFEASIBLE:
-            self._stop_closed_loop("力控：TDA 不可行（该位姿无全正预紧或超界）")
+            # 2026-11-23：**按实际 flag 说清楚**。以前一律报"预紧下限冲突"，
+            # 现场 45 次停环全被指错方向（真正原因是力矩在该位姿/该界限下无解）。
+            if flags & TDA_PRELOAD_INFEASIBLE:
+                self._stop_closed_loop(
+                    f"力控：该位姿下预紧无解 —— 预紧下限 {p.preload_n:g} N 与界限 "
+                    f"[{p.f_min:g},{p.f_max:g}] 及当前 n̂ 冲突（t·n̂ 落在界外）"
+                    f"→ 调小「预紧N」、调大「fmax」，或把腕摆离力封闭边界")
+            elif flags & TDA_INFEASIBLE:
+                self._stop_closed_loop(
+                    f"力控：该力矩在本位姿/本界限下不可实现"
+                    f"（τ*=[{p.tau_d[0]:+.3f},{p.tau_d[1]:+.3f}] N·m，"
+                    f"f∈[{p.f_min:g},{p.f_max:g}]，min n̂={min(p.null_dir):.3f}）"
+                    f"→ 减小目标力矩 / 调大 fmax / 摆离边界")
+            elif flags & TDA_NO_NULL:
+                self._stop_closed_loop(
+                    "力控：该位姿无全正零空间（力封闭失败）→ 把腕摆回可行域")
+            else:
+                self._stop_closed_loop(
+                    f"力控：分配失败（flags={flags}）"
+                    f"→ τ*=[{p.tau_d[0]:+.3f},{p.tau_d[1]:+.3f}] N·m")
             return
+        if alpha < 0.5:
+            # 2026-11-23 用户定案：**不拒绝启动** —— 目标超能力就"给到可行最大"。
+            # 这里只做**限频告警**（1 s 一次），把"你填多少、实际只有多少"说清楚；
+            # 真正的安全由 `f > f_max` 过载停环负责。
+            now = time.monotonic()
+            if now - getattr(self, "_alpha_warn_last", 0.0) > 1.0:
+                self._alpha_warn_last = now
+                self._ctrl_status(
+                    f"⚠ 目标超能力：填 |τ|={math.hypot(p.tau_d[0], p.tau_d[1]):.3f} N·m，"
+                    f"本方向能力 {self._alloc_info.get('m_max', float('nan')):.3f} N·m"
+                    f" → 已按能力上限运行（α={alpha:.3f}）", log=False)
+                self._safety("TORQUE_ALPHA_DERATED",
+                             alpha=round(alpha, 4),
+                             m_max=round(self._alloc_info.get("m_max", 0.0), 4))
         if trim is None:
             self._cl_tick_count = getattr(self, "_cl_tick_count", 0) + 1
             if self._cl_tick_count % 6 == 0:
-                self.cl_status.setText("力控：张力数据过期 → 冻结（电机保持）")
+                self._cl_status_set("力控：张力数据过期 → 冻结（电机保持）")
             return
         # 力控曲线通道：α + τ 目标（曲线由样本入口统一推实测 τ）
         now_rel = self._latest_t if self._latest_t is not None else 0.0
@@ -5085,38 +6839,124 @@ class ScopeWindow(QMainWindow):
         tau_p = tau[1] if tau else 0.0
         self.channels["force_tau_roll_tgt"].buf.append(now_rel, p.tau_d[0])
         self.channels["force_tau_pitch_tgt"].buf.append(now_rel, p.tau_d[1])
+        # 2026-11-24：三缆目标张力（f_d，分配结果）推曲线，与实测 `tension_f*` 对比
+        self._push_tension_tgt_curves(getattr(self, "_f_d_last", None))
         self._apply_force_step(trim, p.max_trim)
         self._cl_tick_count = getattr(self, "_cl_tick_count", 0) + 1
         self._record_diag(3, roll, pitch, last[1], tau, p)
         if self._cl_tick_count % 6 == 0:
             fvals = last[1]
             tb = self._t_bound_note()
-            self.cl_status.setText(
-                "力矩控  τ=[%+.4f,%+.4f]→[%+.3f,%+.3f]N·m  f=[%s]N  trim=[%s]c%s"
-                % (tau_r, tau_p, p.tau_d[0], p.tau_d[1],
+            info = getattr(self, "_alloc_info", {}) or {}
+            t_used = float(info.get("t", p.preload_n))
+            t_raised = t_used > p.preload_n + 1e-6
+            m_max = info.get("m_max", float("nan"))
+            # α 乘的是**含修正的命令** tau_cmd（tau* + trim），不是原始 tau*
+            _tc = (p.tau_d[0] + self._tau_trim[0], p.tau_d[1] + self._tau_trim[1])
+            tau_tgt = [alpha * _tc[0], alpha * _tc[1]]
+            trim_txt = ""
+            if (hasattr(self, "_tau_trim_on") and self._tau_trim_on
+                    and (abs(self._tau_trim[0]) > 1e-4 or abs(self._tau_trim[1]) > 1e-4)):
+                trim_txt = f"  τ修=[{self._tau_trim[0]:+.3f},{self._tau_trim[1]:+.3f}]"
+            cap_txt = ""
+            if self._cl_tick_count % 30 == 0:      # 每 0.3 s 刷一次能力显示
+                cap_txt = "  " + self._capacity_note(
+                    p.r_m, p.null_dir, p.preload_n, p.f_min, p.f_max)
+            self._cl_status_set(
+                "力矩控  τ*=[%+.3f,%+.3f]→ατ*=[%+.3f,%+.3f]→实测[%+.3f,%+.3f]N·m"
+                "  α=%.3f  m_max=%.3f  t=%.2fN%s  f=[%s]N  trim=[%s]c%s%s%s"
+                % (p.tau_d[0], p.tau_d[1], tau_tgt[0], tau_tgt[1],
+                   tau_r, tau_p, alpha, m_max, t_used,
+                   ("↑" if t_raised else ""),
                    "/".join(f"{v:.2f}" for v in fvals),
                    "/".join(f"{v:+.0f}" for v in self._force_trim),
-                   ("" if alpha >= 0.999 else f"  α={alpha:.2f}↓")
-                   + (f"  {tb}" if tb else "")))
+                   cap_txt, (f"  {tb}" if tb else ""), trim_txt))
+
+    def _roll_tau_sign(self) -> float:
+        """**力矩链专用的 roll 换号因子**（±1）—— 界面可翻转，2026-11-23。
+
+        背景：角度链路用 `MODEL_AXIS_SIGN[0]`（roll 换号）是确定的；但"力矩 →
+        角度"的方向（即 `R` 的 roll 行符号）在实机上是否与模型一致，**只能靠
+        实验定**（给正力矩看腕往哪转）。为了不再靠改代码/重启来试方向，
+        这里给一个界面开关：
+
+            τ_model = _roll_tau_sign() · τ_ui
+            τ_ui    = _roll_tau_sign() · (R·f)_roll      ← 显示与命令同一个因子
+
+        所以「τ方向」框 = 1（默认，按模型）或 −1（整条力矩链翻一次）。
+        改这个框会**同时**翻转"下发的力矩"和"显示的实测 τ"，两者永远同号。
+        """
+        v = self._cl_fval("roll_tau_sign", 1.0, -1.0, 1.0)
+        return MODEL_AXIS_SIGN[0] if v >= 0.0 else -MODEL_AXIS_SIGN[0]
 
     def _tau_meas(self, roll, pitch, fvals):
         """实测关节力矩 τ=R(q)·f（N·m）——传感器只给张力，真实力矩经 R 换算。
 
-        R 与力控律同一条 θ_model 链（含 δ、0.1° 缓存）；R 无效返回 None。"""
+        R 与力控律同一条 θ_model 链（含 δ、0.1° 缓存）；R 无效返回 None。
+
+        **2026-11-23 统一约定**：力矩的"对外口径"是 **UI 角度约定**（与用户填的
+        `τ_roll` 框、状态行一致）。R 在**模型系**（`q_model = s_r·q_ui`），
+        所以 rollout 分量要乘回 `s_r` 才能和 UI 目标同号比较。
+        （位置环一直是这么换算的，力矩链之前漏了 → 表现为"roll 力矩反了"。）
+        """
         geo = self._force_geo(roll, pitch)
         if geo is None:
             return None
         out, _ = geo
-        return (sum(out.r_m[0][i] * fvals[i] for i in range(3)),
+        s_r = self._roll_tau_sign()
+        return (s_r * sum(out.r_m[0][i] * fvals[i] for i in range(3)),
                 sum(out.r_m[1][i] * fvals[i] for i in range(3)))
 
+    def _cl_flag(self, key: str, widget) -> bool:
+        """跑环标志读取（跨线程安全）：工作线程读快照，GUI 线程读控件。"""
+        snap = getattr(self, "_cl_snap", None)
+        if snap is not None and not self._in_gui_thread():
+            v = snap.get(key)
+            if v is not None:
+                return bool(v)
+        return bool(widget.isChecked())
+
+    def _cl_status_set(self, txt: str) -> None:
+        """闭环状态行写文字（跨线程安全）。"""
+        # 注意：这里用 `setText, txt` 形式（不是 `setText(txt)`），
+        # 避免被后面那次「批量改成 _cl_status_set」的替换命中而递归。
+        self._ui_call(self.cl_status.setText, txt)
+
+    # ---------- 线程解耦（2026-11-19）：控制环搬到独立线程 ----------
+    # 背景：原来 `_cl_timer`(QTimer) 和所有重绘/表格在同一个 GUI 线程里排队，
+    # 实测控制拍周期 22~28 ms（设计 10 ms）→ 只有 36~44 Hz，速度上限打 4.4 折。
+    # 现在 `_ClLoopThread` 用 time.sleep 精确调度跑 `_cl_tick()`，
+    # 一切 UI 写操作经 `_ui_call` 排队，由 GUI 线程的 `_drain_ui_queue` 执行。
+    def _in_gui_thread(self) -> bool:
+        return threading.get_ident() == self._gui_thread_id
+
+    def _ui_call(self, fn, *a, **kw) -> None:
+        """在 GUI 线程执行 fn；若当前在工作线程则排队。"""
+        if self._in_gui_thread():
+            fn(*a, **kw)
+        else:
+            self._ui_queue.append((fn, a, kw))
+
+    def _drain_ui_queue(self) -> None:
+        """GUI 侧定时执行工作线程投递的 UI 动作（20 ms 一次）。"""
+        q = self._ui_queue
+        for _ in range(len(q)):
+            try:
+                fn, a, kw = q.popleft()
+            except IndexError:
+                break
+            try:
+                fn(*a, **kw)
+            except Exception:      # 单个 UI 动作失败不应影响后续
+                pass
+
     def _warn_batch_skip(self, reason: str) -> None:
-        """批量下发被跳过时限频提示，避免静默不动。"""
+        """批量下发被跳过时限频提示，避免静默不动（跨线程安全）。"""
         now = time.monotonic()
         if now - getattr(self, "_batch_warn_t", 0.0) < 1.0:
             return
         self._batch_warn_t = now
-        self._ctrl_status(f"批量下发跳过：{reason}", log=False)
+        self._ui_call(self._ctrl_status, f"批量下发跳过：{reason}", log=False)
 
     def _send_motor_batch(self, outs) -> bool:
         """把本拍要改的电机目标合成一帧 0xD3（30 路）下发。
@@ -5147,19 +6987,28 @@ class ScopeWindow(QMainWindow):
         return ok
 
     def _apply_force_step(self, step, max_trim: float) -> None:
-        """三力控模式统一出口（增量式；2026-11-19 改成"命令可领先实测"）。
+        """三力控模式统一出口（增量式，基准 = **实测当前位置**）。
 
-        out = 基准 + 本拍整数步长，基准取 **上一拍真正下发的目标**（不是实测）。
-        · 目标可以领先实测 → 伺服有跑道加速（原来 `实测+n` 永远只领先 1 拍，
-          伺服一直在起步段，闭环只有 ~96 c/s，而伺服能跑 1000 c/s）
-        · 但目标绝不落在实测的**后方**：若上一拍目标已被实测甩在后面
-          （外力推走/回弹），立刻对齐实测，否则会先"欠账"再猛拉。
-        · max_trim 仍夹"相对进入点的累计行程"，堵转/丢帧时目标不漂。
-        三根绳的目标合并成一帧 0xD3 下发。"""
+        out = 实测当前位置 + 本拍整数步长；max_trim 限制"相对进入点的累计行程"，
+        堵转/丢帧时目标不漂。三根绳的目标合并成一帧 0xD3 下发。
+
+        **历史教训（2026-11-20，别再试）**：11-19 曾把基准改成"上一帧目标"，
+        想让目标值跑在前面给伺服"跑道"加速。结果 `max_step=20` 时目标值以 2000 c/s
+        前进、伺服只能 ~1000 c/s，目标值相对实测越积越远（直到 max_trim=5000），
+        执行器被顶成 bang-bang → **现场剧烈振荡**。
+        要提速应该动伺服的**速度/加速度指令**，或把 `max_step` 降到 ≈ 伺服能力
+        （1000 c/s → 10 counts/帧），**不能**让目标值跑在实测前面。至于"松绳时
+        目标值该不该持续前进"，见 `_apply_force_step` 的收绳阶段方案（有上限、可退出）。
+        """
         origins = [self._motor_origin.get(m) for m in MOTOR_FOR_CABLE]
         if any(o is None for o in origins):
             self._stop_closed_loop("缺少电机起点")
             return
+        # 2026-11-23 防御：`_force_base` 只有在力控族模式启动时才初始化。
+        # 若某条路径漏了（阻抗模式曾经就是这样），这里就地补一个基准，
+        # 而不是让 `base - max_trim` 抛 TypeError 把控制线程打死。
+        if getattr(self, "_force_base", None) is None:
+            self._force_base = [self._motor_pos_now(m) for m in MOTOR_FOR_CABLE]
         need_send = getattr(self, "_force_need_send", False)
         now_rel = self._latest_t if self._latest_t is not None else 0.0
         outs = {}
@@ -5169,12 +7018,7 @@ class ScopeWindow(QMainWindow):
                 continue
             cur = self._motor_pos_now(m)
             base = self._force_base[i]
-            # 基准 = 上一拍目标；若它落在实测后方（按本拍步长方向判），退回实测
-            prev = self.targets.get(m)
-            ref = cur if prev is None else int(prev)
-            if (ref - cur) * n < 0:
-                ref = cur
-            out = ref + n
+            out = cur + n
             # 相对进入点的累计行程夹紧（堵转/丢帧时目标不漂）
             out = max(base - int(max_trim), min(base + int(max_trim), out))
             out = max(origins[i] - MOTOR_SOFT_LIMIT,
@@ -5213,32 +7057,57 @@ class ScopeWindow(QMainWindow):
         """STALE 冻结提示（33Hz 节流），三力控模式共用。"""
         self._cl_tick_count = getattr(self, "_cl_tick_count", 0) + 1
         if self._cl_tick_count % 6 == 0:
-            self.cl_status.setText(f"{name}：张力数据过期 → 冻结（电机保持）")
+            self._cl_status_set(f"{name}：张力数据过期 → 冻结（电机保持）")
 
     def _force_tick_apply(self, name: str, p, trim, flags, last,
-                          roll: float, pitch: float, mode_id: int = 0):
+                          roll: float, pitch: float, mode_id: int = 0,
+                          f_target=None):
         """三个力控模式共用的收尾（2026-11-19 抽出，原来三份重复）。
 
         顺序：过载 → 停环；trim 缺失（过期/无零空间）→ 冻结；否则
         量 τ、下发步长、累加拍数。
+
+        Args:
+            f_target: 本拍三缆的**目标张力** [N]（`f_d`）。给了就推到 `tension_f*_tgt`
+                曲线上，和实测 `tension_f*` 同图对比（2026-11-24 用户要求）。
+                各模式来源不同：力控/阻抗=`f_d`（分配结果），张力=`f_target`，
+                张紧=`t*·n̂`。
 
         Returns:
             (ok: bool, tau | None, tick_count)
             ok=False 时调用方直接 return（停环/冻结已在此处理）。
         """
         if flags & FORCE_OVERLOAD:
-            self._stop_closed_loop(
-                f"{name}：张力过载 [" + "/".join(f"{v:.1f}" for v in last[1])
-                + f"] N > f_max={p.f_max:g}")
+            # 停环由 `_tension_guard` 统一下结论（含 3 拍去抖），这里只本拍不下发。
             return False, None, 0
         if trim is None:
             self._force_tick_freeze(name)
             return False, None, 0
         tau = self._tau_meas(roll, pitch, last[1])   # 状态行用；曲线由样本入口统一推
+        if f_target is not None:
+            self._push_tension_tgt_curves(f_target)
         self._apply_force_step(trim, p.max_trim)
         self._cl_tick_count = getattr(self, "_cl_tick_count", 0) + 1
         self._record_diag(mode_id, roll, pitch, last[1], tau, p)
         return True, tau, self._cl_tick_count
+
+    def _push_tension_tgt_curves(self, f_target) -> None:
+        """把本拍三缆**目标张力**推到 `tension_f*_tgt` 曲线（2026-11-24）。
+
+        只做曲线，不参与控制。与 `tension_f*`（实测）同组「腕部张力」，
+        在曲线窗里可以三缆"目标 vs 实测"成对看。
+        """
+        try:
+            vals = [float(v) for v in f_target][:3]
+        except (TypeError, ValueError):
+            return
+        if len(vals) < 3:
+            return
+        rel = self._latest_t if self._latest_t is not None else 0.0
+        for i, v in enumerate(vals, start=1):
+            ch = self.channels.get(f"tension_f{i}_tgt")
+            if ch is not None and math.isfinite(v):
+                ch.buf.append(rel, v)
 
     # ---- 诊断记录（2026-11-19）：给「🔬 诊断 CSV」用 ----
     # 目的：把「位姿 + 三缆张力 + τ + 预紧 + 下发 trim」写进同一张表，
@@ -5268,7 +7137,52 @@ class ScopeWindow(QMainWindow):
             self._force_trim[0], self._force_trim[1], self._force_trim[2]))
 
     def _export_diag_csv(self) -> None:
-        """导出诊断 CSV：t_s, mode, roll, pitch, f1..f3, t_meas, τ(2), 预紧, trim(3)。"""
+        """导出诊断 CSV。
+
+        位置模式：t_s, roll, pitch, tgt_roll, tgt_pitch, 下发目标 counts, 实测 counts（20 Hz）
+        力控/张力：t_s, mode, roll, pitch, f1..f3, t_meas, τ(2), 预紧, trim(3)（20 Hz）
+        混合模式：同上 + 末列 c2_n / c3_n（C2/C3 不参与本模式控制，仅记录观测值）
+        """
+        if self._cl_mode == "c1_position":
+            rows = list(self._c1_diag_rows)
+            if len(rows) < 2:
+                self._ctrl_status("诊断：先运行混合模式采集数据", log=False)
+                return
+            name = "diag_c1_position_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3] + ".csv"
+            path = dump_csv(
+                name,
+                header=["roll_deg", "pitch_deg", "tgt_roll_deg", "tgt_pitch_deg",
+                        "c1_n", "c1_target_n", "tgt_c1_c", "tgt_c2_c", "tgt_c3_c",
+                        "meas_c1_c", "meas_c2_c", "meas_c3_c", "c1_pid_c", "c1_ff_c",
+                        "angle_ff_gain", "c1_ff_gain", "angle_flags",
+                        "c1_step_limited", "c1_travel_limited", "c23_step_limited",
+                        "c1_age_ms", "command_sent", "c2_n", "c3_n"],
+                t=[row[0] for row in rows],
+                columns=[list(col) for col in zip(*(row[1:] for row in rows))])
+            self._ctrl_status(
+                f"诊断：已导出 {len(rows)} 行 → {name}" if path else "诊断：导出失败",
+                log=False)
+            return
+        if self._cl_mode == "position":
+            rows = list(self._pos_diag_rows)
+            if len(rows) < 2:
+                self._ctrl_status(
+                    "诊断：位置模式还没有数据（先跑一次闭环 ≥1 秒）", log=False)
+                return
+            name = ("diag_pos_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+                    + ".csv")
+            cols = list(zip(*[r[1:] for r in rows]))
+            path = dump_csv(
+                name,
+                header=["roll_deg", "pitch_deg", "tgt_roll_deg", "tgt_pitch_deg",
+                        "tgt27_c", "tgt28_c", "tgt29_c",
+                        "meas27_c", "meas28_c", "meas29_c"],
+                t=[r[0] for r in rows],
+                columns=[list(c) for c in cols])
+            self._ctrl_status(
+                (f"诊断：已导出 {len(rows)} 行 → {name}" if path
+                 else "诊断：导出失败（路径校验不过）"), log=False)
+            return
         rows = list(self._diag_rows)
         if len(rows) < 2:
             self._ctrl_status("诊断：还没有数据（先跑一次闭环 ≥1 秒）", log=False)
@@ -5296,22 +7210,185 @@ class ScopeWindow(QMainWindow):
         last = self._force_tick_prelude(roll, pitch, "张力控制")
         if last is None:
             return
+        # 2026-11-24：正弦跟随测试 —— 把常数目标换成 `基值 + 符号·A·sin(2πft+φ)`
+        sine_txt = ""
+        if (getattr(self, "cl_tension_sine_check", None) is not None
+                and self.cl_tension_sine_check.isChecked()):
+            f_sine, why = self._tension_sine_targets(p.f_target)
+            if f_sine is None:
+                self._stop_closed_loop(f"正弦跟随：{why}")
+                return
+            # ⚠ 必须用 `_retarget` 而不是手写构造：手写会**丢掉逐缆增益**
+            # （kp3/ki3/... = None）→ 三缆全部退回标量（= 列表第一个值），
+            # 表现就是"开了正弦以后三根缆都只看第一个参数"（2026-11-24 实战发现）。
+            p = self._retarget(p, f_sine)
+            sine_txt = (f"  🔁A={self._cl_fval('sine_amp', 1.0, 0.0, 100.0):.2f}N"
+                        f" f={self._cl_fval('sine_hz', 0.5, 0.0, 20.0):.3f}Hz"
+                        f" t={time.monotonic() - (self._sine_t0 or time.monotonic()):.1f}s")
         age_ms = (time.monotonic() - last[0]) * 1000.0
         trim, flags = wrist_tension_step(p, self._tension_state, last[1],
                                          age_ms, self._cl_dt)
         ok, tau, n = self._force_tick_apply("张力控制", p, trim, flags, last,
-                                            roll, pitch, mode_id=1)
+                                            roll, pitch, mode_id=1,
+                                            f_target=getattr(p, "f_target", None))
         if not ok:
             return
+        # 正弦测试数据自动落盘（只在勾选时写；写失败自动关文件，不影响控制）
+        if sine_txt and getattr(self, "_sine_log_fp", None) is not None:
+            self._sine_log_row(roll, pitch, p.f_target, last[1], self._force_trim)
         if n % 6 == 0:
             tb = self._t_bound_note()
-            self.cl_status.setText(
-                "张力控  f=[%s]→[%s]N  τ=R·f=[%+.4f,%+.4f]N·m  trim=[%s]c%s"
+            self._cl_status_set(
+                "张力控  f=[%s]→[%s]N  τ=R·f=[%+.4f,%+.4f]N·m  trim=[%s]c%s%s"
                 % ("/".join(f"{v:.2f}" for v in last[1]),
-                   "/".join(f"{v:.1f}" for v in p.f_target),
+                   "/".join(f"{v:.2f}" for v in p.f_target),
                    tau[0] if tau else 0.0, tau[1] if tau else 0.0,
                    "/".join(f"{v:+.0f}" for v in self._force_trim),
-                   f"  {tb}" if tb else ""))
+                   f"  {tb}" if tb else "", sine_txt))
+
+    # ---------- 正弦跟随的数据记录（2026-11-24） ----------
+    # 目的：用户跑正弦时不用手工导出，数据自动落到 run_data/sine/*.csv，
+    # 频率/幅值/符号写在文件头注释里，事后可离线算幅值比与相位滞后。
+    SINE_LOG_DIR = "sine"
+
+    def _sine_log_open(self) -> None:
+        """开一个新的正弦记录文件（勾上「正弦跟随」时调用）。失败不影响控制。"""
+        self._sine_log_close()
+        try:
+            d = str(REPO_ROOT / "run_data" / self.SINE_LOG_DIR)
+            os.makedirs(d, exist_ok=True)
+            stamp = time.strftime("%Y%m%d_%H%M%S")
+            path = os.path.join(d, f"sine_{stamp}.csv")
+            fp = io.open(path, "w", encoding="utf-8", newline="")
+            amp = self._cl_fval("sine_amp", 1.0, 0.0, 100.0)
+            hz = self._cl_fval("sine_hz", 0.5, 0.0, 20.0)
+            ph = self._cl_fval("sine_phase", 0.0, -360.0, 360.0)
+            sg = (self.cl_edits["sine_sign"].text()
+                  if self.cl_edits.get("sine_sign") is not None else "1,1,1")
+            base = [self._cl_fval(f"f{i}_tgt", 2.0, 0.0, 50.0) for i in (1, 2, 3)]
+            fp.write(f"# 正弦跟随测试 {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            fp.write(f"# 幅度A={amp:g}N 频率f={hz:g}Hz 相位={ph:g}deg "
+                     f"符号={sg} 基值={base}\n")
+            fp.write(f"# kp_f={self._cl_fval('kp_f', 15.0, 0.0, 10000.0):g} "
+                     f"ki_f={self._cl_fval('ki_f', 20.0, 0.0, 10000.0):g} "
+                     f"i_term_lim={self._cl_fval('i_term_lim', 20.0, 0.0, 1e6):g} "
+                     f"max_step_f={self._cl_fval('max_step_f', 20.0, 0.1, 2000.0):g} "
+                     f"f_min={self._cl_fval('f_min', 0.3, 0.0, 200.0):g} "
+                     f"fmax_f={self._cl_fval('fmax_f', 30.0, 1.0, 200.0):g}\n")
+            fp.write("# 注意：t_s 从勾选时刻起算；tgt=目标张力[N]；f=实测张力[N]；"
+                     "trim=本拍位置增量[counts]\n")
+            fp.write("t_s,roll_deg,pitch_deg,"
+                     "f1_tgt,f2_tgt,f3_tgt,f1,f2,f3,"
+                     "trim1,trim2,trim3\n")
+            self._sine_log_fp = fp
+            self._sine_log_path = path
+            self._sine_log_n = 0
+            self._ctrl_status(
+                f"📄 正弦数据记录 → {path}",
+                log=False)
+        except OSError as exc:
+            self._sine_log_fp = None
+            self._sine_log_path = None
+            self._ctrl_status(f"⚠ 正弦记录文件打不开（{exc}）→ 只跑不记", log=False)
+
+    def _sine_log_close(self) -> None:
+        fp = getattr(self, "_sine_log_fp", None)
+        if fp is not None:
+            try:
+                fp.close()
+            except OSError:
+                pass
+            self._ctrl_status(
+                f"📄 正弦数据已存（{getattr(self, '_sine_log_n', 0)} 行）: "
+                f"{os.path.basename(getattr(self, '_sine_log_path', '') or '')}",
+                log=False)
+        self._sine_log_fp = None
+
+    def _sine_log_row(self, roll: float, pitch: float, f_tgt, f_meas,
+                      trim) -> None:
+        """写一行（100 Hz，每 10 行 flush 一次；任何异常都不打断控制）。"""
+        fp = getattr(self, "_sine_log_fp", None)
+        if fp is None:
+            return
+        try:
+            t = time.monotonic() - (self._sine_t0 or time.monotonic())
+            fp.write("%.4f,%.3f,%.3f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.1f,%.1f,%.1f\n"
+                     % (t, roll, pitch,
+                        f_tgt[0], f_tgt[1], f_tgt[2],
+                        f_meas[0], f_meas[1], f_meas[2],
+                        trim[0], trim[1], trim[2]))
+            self._sine_log_n = getattr(self, "_sine_log_n", 0) + 1
+            if self._sine_log_n % 10 == 0:
+                fp.flush()
+        except (OSError, TypeError, ValueError, IndexError):
+            self._sine_log_close()
+
+    def _retarget(self, p, f_target):
+        """**只换目标张力**、其余参数（含逐缆增益）原样保留（2026-11-24）。
+
+        为什么单独一个方法：正弦跟随每拍都要换目标。如果就地手写
+        `WristTensionParams(...)`，很容易漏掉 `kp3/ki3/max_step3/i_term_lim3`
+        —— 一漏就变成"三缆全部退回标量（= 逐缆列表的第一个值）"，
+        现场表现正是"开了正弦以后三根缆都只看第一个参数"。
+
+        用 `__slots__` 全量拷贝 + 只改 `f_target`，从结构上杜绝这种漏项。
+        """
+        new = WristTensionParams.__new__(WristTensionParams)
+        for name in WristTensionParams.__slots__:
+            setattr(new, name, getattr(p, name, None))
+        new.f_target = [float(v) for v in f_target]
+        return new
+
+    def _on_tension_sine_toggled(self, on: bool) -> None:
+        """正弦跟随开/关（2026-11-24）。重开时把相位基准归零 → 从 sin(0)=0 起，不跳变。"""
+        self._sine_t0 = None if on else self._sine_t0
+        if on:
+            self._sine_log_open()          # 每次勾上都开新文件（频率改了就换一份）
+            self._ctrl_status(
+                "🔁 正弦跟随已开：目标 = 基值 + 符号·A·sin(2πft+φ)"
+                "（t 从此刻算起，起点为基值）", log=False)
+        else:
+            self._sine_log_close()
+            self._ctrl_status("⏹ 正弦跟随已关：目标回到常数「C目标N」", log=False)
+
+    def _tension_sine_targets(self, base_target):
+        """张力模式的**正弦目标**（2026-11-24 用户要求，测内环动态响应）。
+
+            f_target_i = base_i + sign_i · A · sin(2π f t + φ)
+
+        · `t` 从勾上「正弦跟随」那一刻算起（`_sine_t0`），所以起点严格等于基值；
+        · 目标先夹到 `[f_min, f_max−余量]` —— 幅度填太大不会撞界停环，只会削顶；
+        · 任何一项非法（幅度/频率/符号）→ 返回 `(None, 说明)` 交给调用方报错。
+
+        Returns:
+            (list[3] | None, str) —— `None` 表示参数非法（带原因）。
+        """
+        try:
+            amp = self._cl_fval("sine_amp", 1.0, 0.0, 100.0)
+            hz = self._cl_fval("sine_hz", 0.5, 0.0, 20.0)
+            phase = math.radians(self._cl_fval("sine_phase", 0.0, -360.0, 360.0))
+        except (TypeError, ValueError):
+            return None, "正弦参数读取失败"
+        raw = (self.cl_edits.get("sine_sign").text()
+               if self.cl_edits.get("sine_sign") is not None else "1,1,1")
+        try:
+            signs = [float(v) for v in raw.replace("，", ",").split(",")]
+            if len(signs) != 3:
+                raise ValueError
+            signs = [1.0 if v >= 0 else -1.0 for v in signs]
+        except (TypeError, ValueError):
+            return None, f"符号需 3 个 ±1（当前 {raw!r}）"
+        now = time.monotonic()
+        if getattr(self, "_sine_t0", None) is None:
+            self._sine_t0 = now
+        t = now - self._sine_t0
+        fmin, fmax, _ok = self._effective_flimits()
+        # 削顶而不是撞界：留 1 N（或 4%）给超调，与分配层的 headroom 口径一致
+        hi = max(fmin + 0.1, fmax - min(FORCE_FMAX_HEADROOM_N, 0.04 * fmax))
+        out = sine_target_step(base_target, amp, hz, phase, t, signs, fmin, hi)
+        if not out:
+            return None, "正弦目标生成失败（参数或基值非法）"
+        return out, ""
 
     def _tight_f_target(self, p) -> list:
         """张紧的三缆目标张力 f_d = f_tau0 + t*·n̂（2026-11-17 改结构）。
@@ -5353,13 +7430,13 @@ class ScopeWindow(QMainWindow):
         trim, flags = wrist_tension_step(tp, self._tension_state, last[1],
                                          age_ms, self._cl_dt)
         ok, tau, n = self._force_tick_apply("张紧控制", p, trim, flags, last,
-                                            roll, pitch, mode_id=2)
+                                            roll, pitch, mode_id=2, f_target=f_d)
         if not ok:
             return
         if n % 6 == 0:
             t_meas = sum(last[1][j] * p.null_dir[j] for j in range(3))
             tb = self._t_bound_note()
-            self.cl_status.setText(
+            self._cl_status_set(
                 "张紧控  f=[%s]→[%s]N  t=%.2f→%.1fN  τ=[%+.4f,%+.4f]N·m  trim=[%s]c%s"
                 % ("/".join(f"{v:.2f}" for v in last[1]),
                    "/".join(f"{v:.1f}" for v in f_d),
@@ -5368,16 +7445,98 @@ class ScopeWindow(QMainWindow):
                    "/".join(f"{v:+.0f}" for v in self._force_trim),
                    f"  {tb}" if tb else ""))
 
+    def _c1_position_targets(self, pose):
+        return tuple(float(self._c1_position_edits[key].text().strip() or value)
+                     for key, value in zip(("roll_tgt", "pitch_tgt"), pose))
+
+    def _read_c1_position_params(self):
+        try:
+            roll, pitch = self._c1_position_targets(self._wrist_pose_now() or (0.0, 0.0))
+            v = {key: float(edit.text()) for key, edit in self._c1_position_edits.items()
+                 if key not in ("roll_tgt", "pitch_tgt")}
+        except ValueError:
+            return None
+        ranges = {
+            "pos_kp": (0, 5), "pos_ki": (0, 100), "pos_kd": (0, 10),
+            "pos_ff": (0, 1), "pos_step": (1, 2000),
+            "pos_deadband": (0, 10), "pos_limit": (1, 90),
+            "c1_pos_kp": (0, 10000), "c1_pos_ki": (0, 10000), "c1_pos_kd": (0, 10000),
+            "c1_pos_ff": (0, 1), "c1_pos_step": (1, 2000),
+            "c1_pos_travel": (1, 50000), "c1_pos_i_limit": (0, 2000),
+            "c1_pos_min_n": (0, 200), "c1_pos_max_n": (1, 200),
+        }
+        if (not all(lo <= v[key] <= hi for key, (lo, hi) in ranges.items())
+                or not all(-90.0 <= a <= 90.0 for a in (roll, pitch))):
+            return None
+        target = v["c1_pos_target"]
+        f_min, f_max = v["c1_pos_min_n"], v["c1_pos_max_n"]
+        if not (0.0 < target < f_max and target >= f_min):
+            return None
+        angles = WristControlParams()
+        angles.kp, angles.ki, angles.kd = v["pos_kp"], v["pos_ki"], v["pos_kd"]
+        angles.k_ff = v["pos_ff"]
+        angles.max_step = int(v["pos_step"])
+        angles.deadband_deg = v["pos_deadband"]
+        angles.target_limit_deg = v["pos_limit"]
+        angles.i_limit_deg = angles.target_limit_deg
+        angles.soft_limit = MOTOR_SOFT_LIMIT
+        angles.origin = [self._motor_origin.get(m) or 0 for m in MOTOR_FOR_CABLE]
+        c1 = C1TensionParams(
+            target_n=target, kp=v["c1_pos_kp"], ki=v["c1_pos_ki"], kd=v["c1_pos_kd"],
+            ff_gain=v["c1_pos_ff"], max_step=int(v["c1_pos_step"]),
+            travel=int(v["c1_pos_travel"]), i_limit=v["c1_pos_i_limit"],
+            min_n=f_min, max_n=f_max)
+        return HybridWristParams(angles, roll, pitch, c1)
+
+    def _c1_position_feedback(self, f_max):
+        last = self._tension_last
+        fresh_s = STALE_MS / 1000.0
+        if last is None or not (0.0 <= time.monotonic() - last[0] <= fresh_s):
+            return None, None, "C1 张力无数据或已过期"
+        f1 = last[1][0]
+        if not math.isfinite(f1) or f1 < F_SENSOR_MIN_N:
+            return None, None, "C1 张力读数无效"
+        if f1 >= f_max:
+            return None, None, f"C1 张力过载 {f1:.2f} N（上限 {f_max:g} N）"
+
+        t0 = self.t0
+        if t0 is None:
+            return None, None, "没有磁编和电机实测位置"
+        names = ("enc_raw_16", "enc_raw_17", *(f"m{m}_abs" for m in MOTOR_FOR_CABLE))
+        samples = [self.channels[name].buf.last_sample() for name in names]
+        age_at = time.monotonic() - t0
+        for name, (sample_t, value) in zip(names, samples):
+            if not math.isfinite(value) or not (0.0 <= age_at - sample_t <= fresh_s):
+                return None, None, f"{name} 反馈无效或已过期"
+        return [int(value) for _, value in samples[2:]], (last[0], f1), None
+
+    def _c1_position_geometry(self, roll, pitch):
+        dr, dp = self.wrist_calib.zero_offset_deg
+        model = wrist_eval(math.radians(MODEL_AXIS_SIGN[0] * roll + dr),
+                           math.radians(pitch_model_deg(pitch) + dp))
+        if not model.math_valid or not model.angle_in_range:
+            return None
+        # C2/C3 必须能独立产生双轴修正。相对判据与力臂的单位无关。
+        (_, a, b), (_, c, d) = model.r_m
+        if abs(a * d - b * c) <= 1e-6 * (a * a + b * b + c * c + d * d):
+            return None
+        return model
+
     def _read_cl_params(self):
         """20Hz 节流读 UI 参数（原 _cl_tick 内联段原样搬移，100Hz→20Hz）。"""
         prm = WristControlParams()
-        prm.kp = self._cl_fval("kp", 0.6, 0.0, 5.0)
-        prm.ki = self._cl_fval("ki", 0.0, 0.0, 100.0)
-        prm.kd = self._cl_fval("kd", 0.0, 0.0, 10.0)
+        prm.kp = self._cl_fval("kp", 0.2, 0.0, 5.0)
+        prm.ki = self._cl_fval("ki", 0.05, 0.0, 100.0)
+        prm.kd = self._cl_fval("kd", 0.05, 0.0, 10.0)
+        prm.k_ff = self._cl_fval("k_ff", 0.3, 0.0, 1.0)
         prm.deadband_deg = self._cl_fval("deadband", 0.3, 0.0, 10.0)
         prm.target_limit_deg = self._cl_fval("limit", 25.0, 1.0, 90.0)
         prm.i_limit_deg = prm.target_limit_deg   # 积分项最多等效"一个满量程角"
         prm.soft_limit = MOTOR_SOFT_LIMIT
+        prm.max_step = self._cl_fval("max_step_f", 20.0, 0.1, 2000.0)
+        # 分轴每拍限幅（0 = 不限，仍由 max_step 兜底）
+        prm.max_step_roll = self._cl_fval("max_step_r", 0.0, 0.0, 2000.0)
+        prm.max_step_pitch = self._cl_fval("max_step_p", 0.0, 0.0, 2000.0)
         for i, m in enumerate(SERVO_TARGETS):
             origin = self._motor_origin.get(m)
             if origin is None:
@@ -5388,12 +7547,150 @@ class ScopeWindow(QMainWindow):
             prm.gain_pitch[i] = kp if self.cl_pitch_check.isChecked() else 0.0
         return prm
 
+    def _check_cmd_authority(self) -> None:
+        """启动自检：`max_step × 频率` 是否超过伺服能力（饱和 → 振荡）。
+
+        力控输出是增量式，命令能力 = max_step[counts/拍] × (1/周期)[Hz]。
+        超过 `SERVO_MAX_COUNTS_PER_S` 时，PI 一旦要求满步长，伺服就跟不上，
+        执行器进入饱和/极限环（2026-11-20 现场事故的机理）。
+        **只提示，不改参数**——要不要降 max_step 由操作者决定。
+        """
+        if self._cl_mode == "c1_position":
+            params = self._c1_position_params
+            if params is None:
+                return
+            ms = max(params.c1.max_step, params.angles.max_step)
+        else:
+            ms = self._cl_fval("max_step_f", 20.0, 0.1, 2000.0)
+        rate = 1.0 / max(1e-3, CL_LOOP_PERIOD_S)
+        cap = ms * rate
+        if cap > SERVO_MAX_COUNTS_PER_S * 1.05:
+            self._ctrl_status(
+                f"⚠ 命令能力 {cap:.0f} c/s > 伺服 {SERVO_MAX_COUNTS_PER_S:.0f} c/s"
+                f"（max_step={ms:g} × {rate:.0f}Hz）→ 若张力抖动，把 max_step 降到"
+                f" {SERVO_MAX_COUNTS_PER_S / rate:.0f}", log=False)
+            self._safety("CL_CMD_OVERCAP", cap_cps=round(cap, 1),
+                         max_step=ms, period_s=CL_LOOP_PERIOD_S)
+
+    def _refresh_cl_param_cache(self) -> None:
+        """GUI 线程每 50 ms 刷新一次闭环参数快照（工作线程只读快照）。
+
+        为什么：Qt 规定控件只能在 GUI 线程访问；控制线程现在独立运行，
+        若在控制线程里读 `QLineEdit.text()` / `isChecked()` 属于未定义行为。
+        顺带把「字符串→float」的解析从 100 Hz 降到 20 Hz。
+        """
+        if not self._in_gui_thread():
+            return
+        if not self.cl_enabled:
+            self._cl_param_cache = None
+            self._cl_snap = None
+            self._c1_position_params = None
+            return
+        if self._cl_mode == "c1_position":
+            self._cl_snap = {"__record_on": self.cl_record_check.isChecked()}
+            self._cl_param_cache = None
+            self._c1_position_params = self._read_c1_position_params()
+            return
+        # 控件状态快照：文本（给 _cl_fval 用）+ 勾选（给 _cl_tick 用）
+        self._cl_snap = {k: w.text() for k, w in self.cl_edits.items()}
+        self._cl_snap["__roll_on"] = self.cl_roll_check.isChecked()
+        self._cl_snap["__pitch_on"] = self.cl_pitch_check.isChecked()
+        self._cl_snap["__ff_on"] = self.cl_ff_check.isChecked()
+        self._cl_snap["__record_on"] = self.cl_record_check.isChecked()
+        self._cl_param_cache = self._read_cl_params()
+
+    def _cl_tick_c1_position(self, roll: float, pitch: float) -> None:
+        params = (self._read_c1_position_params() if self._in_gui_thread()
+                  else self._c1_position_params)
+        calib = self.wrist_calib
+        if params is None or calib is None:
+            self._stop_closed_loop("混合模式：专用参数或标定无效")
+            return
+        base, sample, reason = self._c1_position_feedback(params.c1.max_n)
+        if reason is not None:
+            self._stop_closed_loop(f"混合模式：{reason}")
+            return
+        model = self._c1_position_geometry(roll, pitch)
+        if model is None:
+            self._stop_closed_loop("混合模式：姿态无效或 C2/C3 无法独立控制双轴")
+            return
+
+        roll_target, pitch_target = params.roll_target_deg, params.pitch_target_deg
+        sign = MODEL_AXIS_SIGN[0]
+        angles = params.angles
+        outputs, flags = wrist_control_step_pid(
+            angles, calib, self._c1_angle_state,
+            sign * roll, pitch_model_deg(pitch),
+            sign * roll_target, pitch_model_deg(pitch_target), self._cl_dt,
+            feedforward=False, base_counts=base, chord_from_fb=angles.k_ff > 0.0)
+        if outputs is None:
+            self._stop_closed_loop("混合模式：双轴位置指令无效")
+            return
+
+        force_time, f1 = sample
+        # C2/C3 只作观测（本模式不控它们），但和 C1 同一帧记进诊断 CSV，便于事后对账。
+        _last_f = self._tension_last
+        f2, f3 = ((_last_f[1][1], _last_f[1][2]) if _last_f is not None
+                  else (math.nan, math.nan))
+        c1 = c1_tension_target(
+            params.c1, self._c1_position_state, force_n=f1, force_time=force_time,
+            length_m=model.s_m[ROLL][0] + model.s_m[PITCH][0],
+            counts=base[0], origin=angles.origin[0], spool_k=calib.k_counts_per_m[0],
+            dt=self._cl_dt)
+        if c1 is None:
+            self._stop_closed_loop("混合模式：C1 实测位置超出专用行程")
+            return
+
+        pos_steps = [out - curr for out, curr in zip(outputs[1:], base[1:])]
+        pos_limited = any(abs(step) > angles.max_step for step in pos_steps)
+        targets = [c1.counts] + [
+            curr + max(-angles.max_step, min(angles.max_step, step))
+            for curr, step in zip(base[1:], pos_steps)]
+        outs = {m: target for m, target in zip(MOTOR_FOR_CABLE, targets)
+                if m in self._cl_motor_on and target != self.targets.get(m)}
+        sent = bool(outs) and self._send_motor_batch(outs)
+        if sent:
+            self.targets.update(outs)
+
+        now = time.monotonic()
+        rel = now - self.t0
+        applied = [self.targets.get(m) for m in MOTOR_FOR_CABLE]
+        for m, target in zip(MOTOR_FOR_CABLE, applied):
+            if target is not None:
+                self.channels[f"m{m}_tgt"].buf.append(rel, target)
+        self._c1_diag_rows.append((
+            rel, roll, pitch, roll_target, pitch_target, f1, params.c1.target_n,
+            *applied, *base, c1.pid_counts, c1.ff_counts,
+            angles.k_ff, params.c1.ff_gain, flags,
+            int(c1.step_limited), int(c1.travel_limited), int(pos_limited),
+            (now - force_time) * 1000.0, int(bool(sent)), f2, f3))
+        if self._cl_beat % 6 == 0:
+            notes = []
+            if c1.travel_limited:
+                notes.append("C1 行程限幅")
+            if c1.step_limited:
+                notes.append("C1 步长限幅")
+            if pos_limited:
+                notes.append("C2/C3 步长限幅")
+            notes.extend(name for bit, name in CL_FLAG_NAMES if flags & bit)
+            suffix = f"  ⚠{'、'.join(notes)}" if notes else ""
+            self._cl_status_set(
+                f"混合控制  C1 {f1:.2f}→{params.c1.target_n:.2f} N  "
+                f"ROLL {roll:+.2f}→{roll_target:+.2f}°  "
+                f"PITCH {pitch:+.2f}→{pitch_target:+.2f}°{suffix}")
+
     def _cl_tick(self) -> None:
         """100Hz：读 J16/J17 -> 控制律（wrist_control_law）-> M27-29。
 
         控制数学全部在 wrist_control_law.py（无 UI 依赖，可逐行译成 C）。
         输出有变化抑制：目标不变时不重发，稳态零流量。
         P4 端 MotionControl 也是 100Hz，两者同拍。
+
+        **节拍自检（2026-11-24）**：现场发现正弦数据里 `dt` 中位 15~16 ms、
+        且有 38% 的相邻行时间戳相同 —— 说明控制线程**一拍要 15.6 ms，
+        然后靠"追补"连跑两拍**。追补那两拍用的是**同一个张力样本**，
+        等于把 P 作用了两遍（实测 trim 两次不同），等效增益翻倍 + 相位变差。
+        这里先量：`tick_ms`（本拍自身耗时）、`hz`（实测节拍率）、`late_ms`。
         """
         now_pc = time.perf_counter()
         prev = getattr(self, "_cl_tick_ts", None)
@@ -5402,6 +7699,39 @@ class ScopeWindow(QMainWindow):
         self._cl_beat = getattr(self, "_cl_beat", 0) + 1
         if self._cl_beat % 50 == 0:      # ~2Hz 取证快照（张力+目标+模式），出事可回放
             self._safety("CL_TICK")
+        # 节拍统计：最近 100 拍的间隔 → 实测 Hz / 抖动 / 追补比例
+        try:
+            dts = getattr(self, "_cl_dt_hist", None)
+            if dts is None:
+                dts = self._cl_dt_hist = deque(maxlen=100)
+            if prev is not None:
+                dts.append(self._cl_dt)
+            if self._cl_beat % 100 == 0 and len(dts) >= 20:
+                arr = list(dts)
+                mean = sum(arr) / len(arr)
+                mx = max(arr)
+                burst = sum(1 for v in arr if v < 0.002) / len(arr)
+                self._cl_hz = 1.0 / mean if mean > 0 else 0.0
+                self._safety("CL_RATE", hz=round(1.0 / mean, 2),
+                             dt_med=round(sorted(arr)[len(arr) // 2] * 1000.0, 2),
+                             dt_max=round(mx * 1000.0, 2),
+                             burst_pct=round(burst * 100.0, 1))
+        except Exception:
+            pass
+        t_tick0 = time.perf_counter()
+        try:
+            self._cl_tick_body()
+        finally:
+            cost = (time.perf_counter() - t_tick0) * 1000.0
+            self._cl_cost_ms = cost
+            if self._cl_beat % 100 == 0:
+                try:
+                    self._safety("CL_COST", ms=round(cost, 2))
+                except Exception:
+                    pass
+
+    def _cl_tick_body(self) -> None:
+        """`_cl_tick` 的实体（把计时外壳与逻辑分开，见上面的节拍自检说明）。"""
         if not self.armed or not self.connected:
             self._stop_closed_loop("连接/使能丢失")
             return
@@ -5411,18 +7741,24 @@ class ScopeWindow(QMainWindow):
             self._stop_closed_loop("磁编无数据")
             return
 
-        # 参数解析节流：字符串→float 每拍 13 次是纯浪费（100Hz 下每秒 1300 次）。
-        # 参数框是低频变更对象，20Hz 刷新一次足够；真实输入变化最迟 50ms 生效。
-        now_pc = time.perf_counter()
-        if now_pc - getattr(self, "_cl_param_ts", 0.0) > 0.05 or not hasattr(self, "_cl_param_cache"):
-            self._cl_param_ts = now_pc
-            self._cl_param_cache = self._read_cl_params()
-        prm = self._cl_param_cache
-        if prm is None:
-            self._stop_closed_loop("缺少电机起点")
-            return
         roll = self._angle_delta(self._axis_deg(16, raw16), self.angle_baseline[16])
         pitch = self._angle_delta(self._axis_deg(17, raw17), self.angle_baseline[17])
+        if self._cl_mode == "c1_position":
+            if self._cl_flag("__record_on", self.cl_record_check):
+                self._record_calib_row(roll, pitch)
+            self._cl_tick_c1_position(roll, pitch)
+            return
+
+        # 参数来自 GUI 侧每 50 ms 拍一次的**快照**（`_refresh_cl_param_cache`）。
+        # 2026-11-20：不再在工作线程里读控件（Qt 规定控件只在 GUI 线程碰），
+        # 也省掉每拍 13 次「字符串→float」解析。
+        prm = self._cl_param_cache
+        if prm is None and self._in_gui_thread():
+            # 直接调用（测试/单步）时没有 GUI 定时快照 → 当场生成一份
+            prm = self._cl_param_cache = self._read_cl_params()
+        if prm is None:
+            self._stop_closed_loop("参数未就绪（GUI 快照未生成）")
+            return
         roll_tgt = self._cl_fval("roll_tgt", 0.0, -90.0, 90.0)    # 目标框即时生效（输入路径）
         pitch_tgt = self._cl_fval("pitch_tgt", 0.0, -90.0, 90.0)
         # 界面 pitch 的可用行程（按 PITCH_MODEL_SIGN 镜像）∩ 限幅：先夹一次，
@@ -5431,17 +7767,19 @@ class ScopeWindow(QMainWindow):
         _lo_p = max(_lo_p, -prm.target_limit_deg)
         _hi_p = min(_hi_p, prm.target_limit_deg)
         pitch_tgt = max(_lo_p, min(_hi_p, pitch_tgt))
-        if self.cl_record_check.isChecked():
+        if self._cl_flag("__record_on", self.cl_record_check):
             self._record_calib_row(roll, pitch)
 
-        # 张力守卫（阈值已填且有样本才判定；过载在内部停闭环）
         tens_ev, tens_txt = self._tension_guard(roll, pitch)
         tens_note = ""
         if tens_ev is not None:
             if tens_ev.flags & TENSION_STALE:
                 tens_note = "  τ:样本过期"
             else:
-                tens_note = (f"  τ={tens_ev.tau_roll_nm:+.3f}/{tens_ev.tau_pitch_nm:+.3f}N·m"
+                # roll 分量换回 UI 约定（与 τ 目标框/状态行同号），见 `_tau_meas`
+                _s_r = self._roll_tau_sign()
+                tens_note = (f"  τ={_s_r * tens_ev.tau_roll_nm:+.3f}/"
+                             f"{tens_ev.tau_pitch_nm:+.3f}N·m"
                              + (f" {tens_txt}" if tens_txt else "")
                              + ("  ⚠松绳" if tens_ev.flags & TENSION_SLACK else ""))
             if tens_ev.flags & TENSION_OVERLOAD:
@@ -5449,6 +7787,9 @@ class ScopeWindow(QMainWindow):
         elif tens_txt:
             tens_note = f"  {tens_txt}"   # 阈值非法守卫未启用：显式示警，不再静默
 
+        if self._cl_mode == "impedance":
+            self._cl_tick_impedance(roll, pitch)        # 阻抗外环 → 力矩内环
+            return
         if self._cl_mode == "force":
             self._cl_tick_force(roll, pitch)            # 力矩模式分支
             return
@@ -5460,13 +7801,15 @@ class ScopeWindow(QMainWindow):
             return
 
         if self.wrist_calib is None:
-            self._stop_closed_loop("位置模式：未载入标定（k 与 R 缺失）")
+            self._stop_closed_loop("位置模式：缺少 k/R 换算参数（标定对象被清空）")
             return
-        ff = self._pos_loop_is_ff()
-        ref = self._cl_ref_pose
-        # 纯PID 的基准必须是**本拍实测 counts**（增量式语义，与三个力控模式同款）；
-        # 前馈+PID 用 origin 当基准，不需要实测。
-        base = None if ff else [self._motor_pos_now(m) for m in SERVO_TARGETS]
+        # 位置环结构（2026-11-23）：**可开关的绳长前馈 + PI，目标每拍限幅**。
+        #   ① 前馈：k·[l(θ*) − l(θ_now)]（`chord_from_fb`，当前**关闭**，用户在调 PID）
+        #   ② PI  ：J·δθ（δθ = kp·e + ki∫e + kd·…），关节角域
+        #   ③ 目标：(1)+(2) 算出的"本拍应走多少"，叠加到**本拍实测**上
+        #   ④ 限幅：每拍步长最多 ±max_step_f
+        # 调完 PID 想恢复前馈：把下面 chord_from_fb 改回 True。
+        base = [self._motor_pos_now(m) for m in SERVO_TARGETS]
         # UI/硬件角 → 模型角（2026-11-19）：location 环 roll 方向与模型相反，
         # 统一在这里换算，law 仍是纯模型函数（见 wrist_control_law.MODEL_AXIS_SIGN）。
         s_r = MODEL_AXIS_SIGN[0]
@@ -5475,37 +7818,66 @@ class ScopeWindow(QMainWindow):
             s_r * roll, pitch_model_deg(pitch),
             s_r * roll_tgt, pitch_model_deg(pitch_tgt),
             self._cl_dt,
-            feedforward=ff,
+            feedforward=False,
             base_counts=base,
-            roll_enabled=self.cl_roll_check.isChecked(),
-            pitch_enabled=self.cl_pitch_check.isChecked(),
-            ref_roll_deg=(None if (not ff or ref is None) else s_r * ref[0]),
-            ref_pitch_deg=(None if (not ff or ref is None)
-                           else pitch_model_deg(ref[1])))
+            chord_from_fb=self._cl_flag("__ff_on", self.cl_ff_check),  # 前馈总开关
+            roll_enabled=self._cl_flag("__roll_on", self.cl_roll_check),
+            pitch_enabled=self._cl_flag("__pitch_on", self.cl_pitch_check))
+        max_step = max(1, int(round(prm.max_step)))
         if outputs is not None:
             now_rel = self._latest_t if self._latest_t is not None else 0.0
+            # **限幅加在“本拍走多少”上**（2026-11-23 现场：实测不动时目标一直
+            # 累加）。step = out − 本拍实测，clamp 到 ±max_step 后再加回实测：
+            #   · 实测不动 → step 恒定 → 目标恒定（不再每拍 +max_step 累加）；
+            #   · 实测在走 → 目标跟着实测走，每拍最多领先 max_step。
             raw = {}
-            for m, out in zip(SERVO_TARGETS, outputs):
-                if m in self._cl_motor_on:
-                    raw[m] = out        # 未勾选的缆不推曲线（看着动、实际不下发）
-                    self.channels[f"m{m}_tgt"].buf.append(now_rel, float(out))
-            # 变更抑制 + 逐绳开关 + 与力控共用的每拍限幅
+            for i, (m, out) in enumerate(zip(SERVO_TARGETS, outputs)):
+                if m not in self._cl_motor_on:      # 未勾选的缆不推曲线/不下发
+                    continue
+                step = max(-max_step, min(max_step, out - base[i]))
+                raw[m] = base[i] + step
+            # 变更抑制 + 逐绳开关（绝对目标的斜率限幅已在上面按步长做过）
             outs = self._clamp_per_tick(raw)
             if self._send_motor_batch(outs):
                 for m, out in outs.items():
                     self.targets[m] = out
+            # 曲线记**实际下发**的目标（限幅后），与力控模式的 m_tgt 口径一致。
+            # 以前记的是律的原始绝对目标：限幅生效时曲线会"跳一下就不动"，
+            # 跟真正下发的阶梯对不上（2026-11-23 修）。
+            for m in self._cl_motor_on:
+                v = self.targets.get(m)
+                if v is not None:
+                    self.channels[f"m{m}_tgt"].buf.append(now_rel, float(v))
+            # 2 Hz 取证：下发目标 vs 实测 vs 角度。位置模式"跑一下不动"时，
+            # 看这三个量谁不动就能定位（目标没变=进死区/被限幅；实测没跟=
+            # 舵机/固件没执行；角度没变=绳松/几何）。
+            if self._cl_beat % 50 == 0:
+                self._safety("POS_TICK",
+                             tgt={m: self.targets.get(m) for m in SERVO_TARGETS},
+                             meas={m: self._motor_pos_now(m) for m in SERVO_TARGETS},
+                             ang=(round(roll, 2), round(pitch, 2)),
+                             tgt_ang=(round(roll_tgt, 2), round(pitch_tgt, 2)),
+                             flags=int(flags))
+            # 位置模式诊断（20 Hz）：给「🔬 诊断 CSV」用，调 PID 时看响应
+            if getattr(self, "_cl_tick_count", 0) % 5 == 0:
+                self._pos_diag_rows.append((
+                    now_rel, roll, pitch, roll_tgt, pitch_tgt,
+                    self.targets.get(27), self.targets.get(28), self.targets.get(29),
+                    self._motor_pos_now(27), self._motor_pos_now(28),
+                    self._motor_pos_now(29)))
         # outputs=None（非有限/几何无效/基准缺失）：保持上一目标不发送，本拍跳过
         self._cl_tick_count = getattr(self, "_cl_tick_count", 0) + 1
         if self._cl_tick_count % 6 == 0:
             warns = "".join(name for bit, name in CL_FLAG_NAMES if flags & bit)
             state = ("保持(硬错误)" if outputs is None
                      else "跟踪中" + (f" ⚠{warns}" if warns else ""))
-            both = self.cl_roll_check.isChecked() and self.cl_pitch_check.isChecked()
+            r_on = self._cl_flag("__roll_on", self.cl_roll_check)
+            p_on = self._cl_flag("__pitch_on", self.cl_pitch_check)
+            both = r_on and p_on
             only = ("" if both else
-                    (" [仅ROLL环]" if self.cl_roll_check.isChecked() else
-                     (" [仅PITCH环]" if self.cl_pitch_check.isChecked() else
-                      " [两轴均关：不动]")))
-            self.cl_status.setText(
+                    (" [仅ROLL环]" if r_on else
+                     (" [仅PITCH环]" if p_on else " [两轴均关：不动]")))
+            self._cl_status_set(
                 f"{self._pos_loop_name()} {state}  "
                 f"ROLL {roll:+6.2f}→{roll_tgt:+6.2f}°  "
                 f"PITCH {pitch:+6.2f}→{pitch_tgt:+6.2f}°{only}{tens_note}")
@@ -5624,10 +7996,10 @@ class ScopeWindow(QMainWindow):
                      sign=sign, skipped=skipped)
         self._release_step()
 
-    def _release_step(self) -> None:
+    def _release_step(self, expected_plan=None) -> None:
         """执行一步松绳（一帧 0xD3 批量；不看张力）。"""
         plan = getattr(self, "_release_plan", None)
-        if not plan:
+        if not plan or (expected_plan is not None and plan is not expected_plan):
             return
         outs = {}
         for item in plan["items"]:
@@ -5658,7 +8030,7 @@ class ScopeWindow(QMainWindow):
             self._ctrl_status(f"✅ 一键松绳完成：{moved}")
             self._safety("RELEASE_DONE", moved=moved)
             return
-        QTimer.singleShot(self.RELEASE_STEP_MS, self._release_step)
+        QTimer.singleShot(self.RELEASE_STEP_MS, lambda: self._release_step(plan))
 
     def _tighten_gate_check(self):
         """一键紧绳门禁十三查（纯读，供按钮与拒绝弹窗 1Hz 复查共用）。
@@ -5738,7 +8110,7 @@ class ScopeWindow(QMainWindow):
                   self.cl_edits["preload"].text())
         try:
             self.cl_mode_combo.blockSignals(True)
-            self.cl_mode_combo.setCurrentIndex(3)      # 力矩模式
+            self.cl_mode_combo.setCurrentIndex(self.cl_mode_combo.findData("force"))
             self.cl_mode_combo.blockSignals(False)
             self._cl_mode = "force"
             self._apply_cl_mode_visibility()
@@ -5766,8 +8138,7 @@ class ScopeWindow(QMainWindow):
                 self._stop_closed_loop("一键紧绳失败回滚", popup=False)   # 回滚有自己的弹窗
             m, tr, tp, pl = backup
             self.cl_mode_combo.blockSignals(True)
-            self.cl_mode_combo.setCurrentIndex(
-                {"position": 0, "tension": 1, "tight": 2, "force": 3}[m])
+            self.cl_mode_combo.setCurrentIndex(self.cl_mode_combo.findData(m))
             self.cl_mode_combo.blockSignals(False)
             self._cl_mode = m
             self._apply_cl_mode_visibility()
@@ -5833,6 +8204,7 @@ class ScopeWindow(QMainWindow):
         现在顺序改为：清空待发运动帧 → 抢占通道发 STOP → 再停表/记账。
         """
         dropped = 0
+        stop_in_fifo = False
         if self.connected and self.rx_thread is not None:
             drop = getattr(self.rx_thread, "drop_pending_tx", None)
             if callable(drop):
@@ -5842,20 +8214,24 @@ class ScopeWindow(QMainWindow):
             except TypeError:
                 # 兼容不支持 priority 的旧实现/测试替身；急停路径绝不允许抛异常
                 self.rx_thread.send(build_stop_cmd())
-        self._stop_closed_loop("急停", hold=False, popup=False)
-        self._zero_timer.stop()
-        self._ramp_timer.stop()
-        self._admit_timer.stop()
-        self._ramp_state.clear()
-        self.armed = False
+                stop_in_fifo = True
+        self._cancel_direct_motion("急停", discard_tx=not stop_in_fifo)
         self.estop_latched = True
         self._set_arm_light()
-        for m in SERVO_TARGETS:
-            self.targets[m] = None
         self._safety("ESTOP", dropped_tx=dropped)
         self._ctrl_status(
             f"⛔ 已发送 STOP（抢占下发，丢弃 {dropped} 帧待发指令）："
             f"固件关闭舵机力矩，腕部会松开/下垂")
+
+    def _toggle_servo_info_window(self) -> None:
+        """打开/关闭舵机信息窗（2026-11-20）。"""
+        win = getattr(self, "servo_info_window", None)
+        if win is not None and win.isVisible():
+            win.close()
+            return
+        self.servo_info_window = ServoInfoWindow(self)
+        self.servo_info_window.show()
+        self.servo_info_window.request_range()   # 顺手请求一次逻辑行程
 
     def _toggle_watch_window(self) -> None:
         if self.watch_window is not None and self.watch_window.isVisible():
@@ -5898,6 +8274,26 @@ class ScopeWindow(QMainWindow):
         self.theme_combo.setCurrentIndex(idx)
         self.theme_combo.blockSignals(False)
 
+    def _style_legend(self) -> None:
+        """图例：半透明底 + 小字号（2026-11-24）。
+
+        原来图例是默认的"实底框"，压在曲线区左上角整块挡住波形；改成主题色
+        半透明底（约 70% 不透明）+ 8pt 字，既认得出、又不挡数据。
+        """
+        lg = getattr(self, "legend", None)
+        if lg is None:
+            return
+        try:
+            bg = pg.mkColor(AT.T("panel"))
+            bg.setAlpha(180)
+            lg.setBrush(pg.mkBrush(bg))
+            line = pg.mkColor(AT.T("panel_line"))
+            line.setAlpha(140)
+            lg.setPen(pg.mkPen(line))
+            lg.setLabelTextSize("8pt")
+        except Exception:      # 老版本 pyqtgraph 没有这些方法时保持默认
+            pass
+
     def _apply_theme(self) -> None:
         """全局 QSS + 曲线区背景/轴色 + 曲线色板互换 + 观测台样式即时重建；
         动态着色路径读 AT.T 自动跟随。曲线色仅互换默认色板内的，用户自定不动。"""
@@ -5912,6 +8308,7 @@ class ScopeWindow(QMainWindow):
                 ax = self.plot.getAxis(name)
                 ax.setPen(fg_pen)
                 ax.setTextPen(fg_pen)
+            self._style_legend()      # 图例底色跟主题走
         if AT.curve_palette() is AT.CURVE_LIGHT:
             swap = dict(zip(AT.CURVE_DARK, AT.CURVE_LIGHT))
         else:
@@ -5970,8 +8367,10 @@ class ScopeWindow(QMainWindow):
         self.paused_text.setVisible(self.plot_frozen)
 
     def _clear_buffers(self) -> None:
+        """「清空」：清曲线数据 + 清双击加的标记线（2026-11-24 用户定案）。"""
         for ch in self.channels.values():
             ch.buf.clear()
+        self._clear_h_markers()
         self._update_plot()
 
     # ---------- 表格 ----------
@@ -6062,22 +8461,29 @@ class ScopeWindow(QMainWindow):
 
         if hasattr(self, "cl_roll_now") and hasattr(self, "cl_pitch_now"):
             pose = self._wrist_pose_now()
-            r_tgt = self._cl_fval("roll_tgt", 0.0, -999.0, 999.0)
-            p_tgt = self._cl_fval("pitch_tgt", 0.0, -999.0, 999.0)
+            if self._cl_mode == "c1_position":
+                try:
+                    r_tgt, p_tgt = self._c1_position_targets(pose or (0.0, 0.0))
+                except ValueError:
+                    r_tgt = p_tgt = math.nan
+            else:
+                r_tgt = self._cl_fval("roll_tgt", 0.0, -999.0, 999.0)
+                p_tgt = self._cl_fval("pitch_tgt", 0.0, -999.0, 999.0)
             if pose is not None:
-                c = 16384.0 / 360.0  # counts/°
-                r_raw = self._enc_filt_raw.get(16)
-                p_raw = self._enc_filt_raw.get(17)
-                rb = self._angle_baseline_raw.get(16)
-                pb = self._angle_baseline_raw.get(17)
-                r_traw = (rb if rb is not None else 0) + r_tgt * c
-                p_traw = (pb if pb is not None else 0) + p_tgt * c
-                r_now = f"{r_raw:.0f}" if r_raw is not None else "--"
-                p_now = f"{p_raw:.0f}" if p_raw is not None else "--"
+                # 位置模式只显示角度：目标角 vs 当前角。
+                # （不再换算/显示"目标编码器值"：那是 raw 口径，pitch 的
+                #  AXIS_SIGN[17]=-1 与 roll 不同，写在这里容易看错，见 2026-11-23。）
                 self.cl_roll_now.setText(
-                    f"ROLL  {pose[0]:+6.2f}°→{r_tgt:+6.2f}°  编码器 {r_now}→{r_traw:.0f}")
+                    f"ROLL  {pose[0]:+6.2f}°→{r_tgt:+6.2f}°")
                 self.cl_pitch_now.setText(
-                    f"PITCH {pose[1]:+6.2f}°→{p_tgt:+6.2f}°  编码器 {p_now}→{p_traw:.0f}")
+                    f"PITCH {pose[1]:+6.2f}°→{p_tgt:+6.2f}°")
+            # 位姿曲线：当前角 + 目标角（位置环调参用，和 POS_TICK/诊断 CSV 对齐）
+            rel = self._latest_t
+            if pose is not None and rel is not None:
+                self.channels["pose_roll"].buf.append(rel, pose[0])
+                self.channels["pose_pitch"].buf.append(rel, pose[1])
+                self.channels["pose_roll_tgt"].buf.append(rel, r_tgt)
+                self.channels["pose_pitch_tgt"].buf.append(rel, p_tgt)
         roll_raw = self._enc_filt_raw[16]
         pitch_raw = self._enc_filt_raw[17]
         for axis, j, big, detail in (
@@ -6097,13 +8503,25 @@ class ScopeWindow(QMainWindow):
                 big.setText(f"{axis}   {self._angle_delta(cur, base):+7.2f}°")
                 detail.setText(f"绝对 {cur:+.2f}°  raw {raw:.0f}  基准 {base:+.2f}°")
         servo_online = self.status_info.get("servo_online", 0)
+        # ABS 最小/最大要扫整个 120s 缓冲（12000 点 × 3 台），60Hz 每拍都扫一次
+        # 实测占 _update_tables 的大头（0.93ms/拍）。改成 ~4Hz 重算 + 其余拍复用缓存：
+        # 这两列本来就是"窗口内的极值"，4Hz 刷新肉眼无差别。
+        self._servo_mm_count = getattr(self, "_servo_mm_count", 0) + 1
+        mm_cache = getattr(self, "_servo_mm_cache", None)
+        if mm_cache is None:
+            mm_cache = self._servo_mm_cache = {}
+        refresh_mm = (self._servo_mm_count % 15 == 1) or not mm_cache
         for r, m in enumerate(SERVO_TARGETS):
             buf = self.channels[f"m{m}_abs"].buf
-            _, hist = buf.series(BUFFER_SECONDS)
+            if refresh_mm:
+                _, hist = buf.series(BUFFER_SECONDS)
+                mm_cache[m] = (float(np.nanmin(hist)) if hist.size else math.nan,
+                               float(np.nanmax(hist)) if hist.size else math.nan)
+            mm_lo, mm_hi = mm_cache.get(m, (math.nan, math.nan))
             vals = [
                 buf.last(),
-                float(np.nanmin(hist)) if hist.size else math.nan,
-                float(np.nanmax(hist)) if hist.size else math.nan,
+                mm_lo,
+                mm_hi,
                 self.channels[f"m{m}_raw"].buf.last(),
                 self.channels[f"m{m}_speed"].buf.last(),
                 self.channels[f"m{m}_load"].buf.last(),
@@ -6294,6 +8712,14 @@ class ScopeWindow(QMainWindow):
             for k, v in data.get("cl_params", {}).items():
                 if k in self.cl_edits:
                     self.cl_edits[k].setText(str(v))
+            hybrid = data.get("c1_position_params")
+            if not isinstance(hybrid, dict):
+                # 旧版只有 C1 参数归属混合模式，公用角度参数由专用默认值接替。
+                hybrid = {k: v for k, v in data.get("cl_params", {}).items()
+                          if k in ("c1_pos_target", "c1_pos_kp", "c1_pos_ki", "c1_pos_travel")}
+            for key, edit in self._c1_position_edits.items():
+                if key in hybrid:
+                    edit.setText(str(hybrid[key]))
             # 2026-11-18 合并后：t_tgt 是 preload 的只读镜像，旧布局里可能存着
             # 过时的 t*（如 15）而 preload 是 5 —— 加载完强制以 preload 为准。
             self.cl_edits["t_tgt"].setText(self.cl_edits["preload"].text())
@@ -6325,16 +8751,23 @@ class ScopeWindow(QMainWindow):
             if isinstance(tl, dict):
                 self._tension_link_saved.update(
                     {k: str(v) for k, v in tl.items() if k in ("port", "baud")})
+            estimate_k = data.get("tension_estimate_k_n_mm")
+            if (isinstance(estimate_k, list) and len(estimate_k) == 2
+                    and all(isinstance(value, str) for value in estimate_k)):
+                self._tension_estimate_k = estimate_k
             if isinstance(data.get("tension_trend"), bool):
                 self._tension_trend_on = data["tension_trend"]
             if isinstance(data.get("tension_len_folded"), bool):
                 self._tension_len_folded = data["tension_len_folded"]
             mode = data.get("cl_mode")
-            _MODE_IDX = {"position": 0, "tension": 1, "tight": 2, "force": 3}
-            if mode in _MODE_IDX:
+            # 2026-11-23 修复：漏了 "impedance" ⟹ 存档里的阻抗模式读回时被
+            # 当成未知值忽略，界面静默退回「位置模式」。这正是"重启后阻抗
+            # 模式跑不了"的根因之一（用户以为在阻抗，实际在位置）。
+            mode_index = self.cl_mode_combo.findData(mode) if isinstance(mode, str) else -1
+            if mode_index >= 0:
                 self._cl_mode = mode
                 self.cl_mode_combo.blockSignals(True)
-                self.cl_mode_combo.setCurrentIndex(_MODE_IDX[mode])
+                self.cl_mode_combo.setCurrentIndex(mode_index)
                 self.cl_mode_combo.blockSignals(False)
                 self._apply_cl_mode_visibility()
             ch_map = data.get("tension_ch_map")
@@ -6353,6 +8786,31 @@ class ScopeWindow(QMainWindow):
                 self.ymin_spin.setValue(int(yl[0]))
                 self.ymax_spin.setValue(int(yl[1]))
                 self._loading_layout = False
+            # 绘图偏好（2026-11-24）：帧率上限与抗锯齿，缺省保持启动默认。
+            ph = data.get("plot_hz")
+            if isinstance(ph, (int, float)) and 5 <= ph <= 120:
+                self.plot_hz_combo.blockSignals(True)
+                txt = str(int(ph))
+                if self.plot_hz_combo.findText(txt) < 0:
+                    self.plot_hz_combo.addItem(txt)
+                self.plot_hz_combo.setCurrentText(txt)
+                self.plot_hz_combo.blockSignals(False)
+                self._plot_hz = float(int(ph))
+                self._plot_interval_ms = max(1, int(round(1000.0 / int(ph))))
+                if getattr(self, "plot_timer", None) is not None:
+                    self.plot_timer.setInterval(self._plot_interval_ms)
+            if isinstance(data.get("plot_aa"), bool):
+                self.aa_check.blockSignals(True)
+                self.aa_check.setChecked(data["plot_aa"])
+                self.aa_check.blockSignals(False)
+                self._set_plot_aa(data["plot_aa"])
+            # 双击加的标记线（会话态落盘，重启回到原位）
+            hm = data.get("h_markers")
+            if isinstance(hm, list):
+                self._clear_h_markers()
+                for _y in hm[: self._H_MARKER_MAX]:
+                    if isinstance(_y, (int, float)) and math.isfinite(float(_y)):
+                        self._add_h_marker(float(_y), quiet=True)
             watch_saved = data.get("watch_params") or data.get("watch_last")
             if watch_saved:
                 self._saved_watch_params = [k for k in watch_saved if isinstance(k, str)]
@@ -6360,17 +8818,8 @@ class ScopeWindow(QMainWindow):
                 self.cl_roll_check.setChecked(bool(data["cl_roll_on"]))
             if "cl_pitch_on" in data:
                 self.cl_pitch_check.setChecked(bool(data["cl_pitch_on"]))
-            # 位置环结构：新键 pos_loop（0=前馈+PID / 1=纯PID）；
-            # 旧布局只有 cl_model_on（布尔），按它迁移：True→前馈+PID、False→纯PID。
-            pos_idx = data.get("pos_loop")
-            if isinstance(pos_idx, int) and 0 <= pos_idx <= 1:
-                self.pos_loop_combo.blockSignals(True)
-                self.pos_loop_combo.setCurrentIndex(pos_idx)
-                self.pos_loop_combo.blockSignals(False)
-            elif isinstance(data.get("cl_model_on"), bool):
-                self.pos_loop_combo.blockSignals(True)
-                self.pos_loop_combo.setCurrentIndex(0 if data["cl_model_on"] else 1)
-                self.pos_loop_combo.blockSignals(False)
+            # 位置环结构（2026-11-23 定案：每拍递增 PID，同张力控制）：旧布局里的
+            # `pos_loop` / `cl_model_on` 一律忽略——结构已固定，不再有切换。
             # 逐绳使能开关恢复：blockSignals 防触发 _save_layout 半程写盘
             # （与 cl_mode_combo 恢复同款手法）；恢复后统一刷新行可用性。
             ce = data.get("cable_enable")
@@ -6411,16 +8860,18 @@ class ScopeWindow(QMainWindow):
             "ramp_rate": self.ramp_rate_spin.value(),
             "step": self.step_combo.currentText(),
             "cl_params": {k: e.text() for k, e in self.cl_edits.items()},
-            # 位置环结构随布局持久化（2026-11-10：取代旧的 cl_model_on 勾选）；
-            # 旧键仍写一份（= 是否前馈），老版本读回时不会串味。
-            "pos_loop": self.pos_loop_combo.currentIndex(),
-            "cl_model_on": self._pos_loop_is_ff(),
+            "c1_position_params": {k: e.text() for k, e in self._c1_position_edits.items()},
+            # 位置环结构固定为「每拍递增 PID」。`pos_loop=2` / `cl_model_on=False`
+            # 是给能读这两个键的旧版本看的（它们会落回自己的默认档）。
+            "pos_loop": 2,
+            "cl_model_on": False,
             "cl_mode": self._cl_mode,
             # force_params 已删：力控参数全在 cl_edits，cl_params 一处覆盖。
             # 旧条目引用 f1_tgt 等已删字段，v2 升级后每次保存 KeyError 全局丢档
             # （2026-11-02 修复，用户报"重启都归 0"的真凶）。
             "tension_guard": dict(self._tension_guard_saved),
             "tension_link": dict(self._tension_link_saved),
+            "tension_estimate_k_n_mm": list(self._tension_estimate_k),
             "tension_trend": self._tension_trend_on,
             "tension_len_folded": self._tension_len_folded,
             "tension_ch_map": list(self._tension_ch_map),
@@ -6428,6 +8879,13 @@ class ScopeWindow(QMainWindow):
             "custom_theme": getattr(self, "_custom_theme", None),
             "angle_baseline_raw": {str(j): self._angle_baseline_raw[j] for j in (16, 17)},
             "ylimits": [self.ymin_spin.value(), self.ymax_spin.value()],
+            # 绘图偏好（2026-11-24）：帧率上限 + 抗锯齿
+            "plot_hz": int(getattr(self, "_plot_hz", PLOT_HZ)),
+            "plot_aa": self.aa_check.isChecked(),
+            # 双击加的横线标记（数值，按添加顺序；重启后恢复到原位）
+            "h_markers": [round(float(m.value()), 3)
+                          for m in getattr(self, "_h_markers", ())
+                          if math.isfinite(float(m.value()))],
             "cl_roll_on": self.cl_roll_check.isChecked(),
             "cl_pitch_on": self.cl_pitch_check.isChecked(),
             # 逐绳使能开关（缺省=全勾选；旧布局无此键按全勾处理）
@@ -6449,6 +8907,8 @@ class ScopeWindow(QMainWindow):
             self.watch_window.close()  # Qt.Window 子窗不随父窗级联关闭，需显式关
         if self.rt_window is not None:
             self.rt_window.close()
+        # 正弦记录：无论有没有在跑闭环，关窗都要收口（未武装时 _on_stop 不会执行）
+        self._sine_log_close()
         self._safety("APP_CLOSE")
         if self._tension_sensor is not None:
             self._tension_disconnect("主窗关闭")

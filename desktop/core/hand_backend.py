@@ -773,9 +773,6 @@ class HandBackend:
     def set_motor_positions_absolute(self, motor_abs: List[int]) -> None:
         self._controller.set_motor_positions_absolute(motor_abs)
 
-    def set_single_motor_position_absolute(self, motor_index: int, motor_abs: int) -> None:
-        self._controller.set_single_motor_position_absolute(motor_index, motor_abs)
-
     def request_firmware_calibration(self) -> bool:
         return self._controller.request_firmware_calibration()
 

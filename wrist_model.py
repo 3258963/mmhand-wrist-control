@@ -145,3 +145,43 @@ def positive_null_direction(roll_rad: float, pitch_rad: float,
     if all(x < -_POSITIVE_NULL_EPS for x in n):
         return (-n[0], -n[1], -n[2])
     return None
+
+
+# ---------------------------------------------------------------- 力封闭可行域
+# 2026-11-23 重要澄清：**可行集不是矩形**。
+#   · 轴向实测边界（0.5° 步长扫 `positive_null_direction` 是否存在）：
+#         roll  ∈ [−18.0°, +14.5°]
+#         pitch ∈ [−25.5°, +33.5°]
+#     但`(roll=−18, pitch=−25.5)` 这种"角点"是**不可行**的 —— 可行集是曲边区域。
+#   · 因此这里区分两个量：
+#       `FORCE_CLOSURE_*_DEG`          = **内接矩形**（四角都可行）→ `clamp_force_closure` 用
+#       `FORCE_CLOSURE_ENVELOPE_*_DEG` = **轴向包络**（只用于提示文案，别当矩形用）
+#
+# **2026-11-23 起控制路径不再钳制**：`_force_geo` 用**真实位姿**求 n̂，求不到就
+# 如实报"该位姿力封闭失败"。因为钳制＝拿另一个姿态的 R/n̂ 算真实机器，现场后果是
+# "某根绳被单独收到 f_max 还在收"（用户腕常停 roll=−18.2°，旧盒把它判成越界 3.2°）。
+# 内接矩形保留给"显示/兜底钳制"这类非控制用途。
+FORCE_CLOSURE_ROLL_DEG = (-15.0, 10.0)
+FORCE_CLOSURE_PITCH_DEG = (-25.0, 30.0)
+FORCE_CLOSURE_ENVELOPE_ROLL_DEG = (-18.0, 14.5)
+FORCE_CLOSURE_ENVELOPE_PITCH_DEG = (-25.5, 33.5)
+
+
+def clamp_force_closure(roll_rad: float, pitch_rad: float
+                        ) -> "tuple[float, float, bool]":
+    """把 (roll, pitch) [rad] 钳进力封闭可行域。
+
+    Returns:
+        (钳后 roll_rad, 钳后 pitch_rad, 是否被钳过)
+
+    NaN/Inf 退回区域中心（roll=0, pitch=0）并标记被钳。
+    """
+    lo_r = math.radians(FORCE_CLOSURE_ROLL_DEG[0])
+    hi_r = math.radians(FORCE_CLOSURE_ROLL_DEG[1])
+    lo_p = math.radians(FORCE_CLOSURE_PITCH_DEG[0])
+    hi_p = math.radians(FORCE_CLOSURE_PITCH_DEG[1])
+    if not (math.isfinite(roll_rad) and math.isfinite(pitch_rad)):
+        return 0.0, 0.0, True
+    r2 = min(max(roll_rad, lo_r), hi_r)
+    p2 = min(max(pitch_rad, lo_p), hi_p)
+    return r2, p2, (r2 != roll_rad or p2 != pitch_rad)

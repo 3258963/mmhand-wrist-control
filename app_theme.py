@@ -117,6 +117,16 @@ QWidget {{ background: transparent; color: {c['text']}; font-size: 12px; }}
 QMainWindow, QDialog {{ background: {c['bg']}; }}
 QLabel {{ color: {c['text']}; background: transparent; }}
 QLabel#muted {{ color: {c['muted']}; font-size: 11px; }}
+/* 图区正中提示层（曲线区为空 / 已暂停）：颜色随主题走 */
+QLabel#plotHint {{
+    color: {c['warn']}; font-size: 13px; background: transparent;
+}}
+/* 悬停数值浮层（鼠标跟随）：等宽字 + 半透明底，别挡太多 */
+QLabel#plotTip {{
+    background: {c['panel']}; color: {c['text']};
+    border: 1px solid {c['accent']}; border-radius: 6px;
+    padding: 5px 8px; font-size: 11px; font-family: '{MONO_FAMILY}';
+}}
 QLabel#dataLine {{ color: {c['text']}; font-size: 11px; font-family: '{MONO_FAMILY}'; }}
 QGroupBox {{
     background: {c['panel']}; border: 1px solid {c['panel_line']};
@@ -211,6 +221,29 @@ QToolTip {{ background: {c['panel']}; color: {c['text']};
     border: 1px solid {c['accent']}; padding: 4px; }}
 QMessageBox {{ background: {c['panel']}; }}
 QSplitter::handle {{ background: {c['panel_line']}; }}
+/* ---------- 顶部工具栏：统一行高，复选框与按钮同一基线 ---------- */
+QWidget#toolbar QPushButton {{
+    min-height: 26px; max-height: 26px; padding: 0 12px;
+    font-size: 12px; border-radius: 6px;
+}}
+QWidget#toolbar QComboBox, QWidget#toolbar QSpinBox {{
+    min-height: 26px; max-height: 26px; padding: 1px 6px; font-size: 12px;
+}}
+QWidget#toolbar QCheckBox {{
+    min-height: 26px; max-height: 26px; font-size: 12px; spacing: 5px;
+}}
+QWidget#toolbar QLabel {{ font-size: 12px; padding: 0 2px; }}
+QFrame#toolbarSep {{ background: {c['panel_line']}; border: none; }}
+/* ---------- 右侧控制面板：按钮与输入框同高，行距统一 ---------- */
+QWidget#ctrlPanel QPushButton {{
+    min-height: 30px; padding: 2px 10px; font-size: 12px;
+}}
+QWidget#ctrlPanel QLineEdit, QWidget#ctrlPanel QComboBox,
+QWidget#ctrlPanel QSpinBox, QWidget#ctrlPanel QDoubleSpinBox {{
+    min-height: 26px; max-height: 26px; padding: 1px 6px; font-size: 12px;
+}}
+QWidget#ctrlPanel QCheckBox {{ min-height: 24px; font-size: 12px; spacing: 5px; }}
+QWidget#ctrlPanel QLabel {{ font-size: 12px; }}
 """
 
 

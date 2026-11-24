@@ -1007,7 +1007,9 @@ class ControlPanelStateMixin:
             self._motor_abs_pos[idx] = 0
         targets = self._build_motor_abs_command_list()
         target_abs = int(targets[idx])
-        self.backend.set_single_motor_position_absolute(idx, target_abs)
+        # 2026-11-23：不再发 0xDE 单电机帧（固件会把 active scope 收缩成单机）。
+        # 这里本来就已构建完整 27 路目标，直接走 0xD3 批量，和闭环/一键同一出口。
+        self.backend.set_motor_positions_absolute(targets)
         if 0 <= idx < len(self._motor_last_sent_abs):
             self._motor_last_sent_abs[idx] = target_abs
         # send_command 只说明帧已进入发送队列，不能提前声称下位机已经执行。
