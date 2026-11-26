@@ -37,6 +37,19 @@ def make_p(kp=0.0, limit=25.0):
 CALIB = WristCalib([1e5, 1e5, 1e5], [0.0, 0.0])
 
 
+def test_per_cable_ki_integrates_only_the_selected_axis_and_cable():
+    p = make_p()
+    p.cable_pi = (((0., 0.), (0., 1.)), ((0., 0.), (0., 0.)), ((0., 1.), (0., 0.)))
+    state = WristPidState()
+    out, _ = wrist_control_step_pid(p, CALIB, state, 0., 0., 2., 2., .1,
+                                    feedforward=False, base_counts=p.origin)
+    assert out[0] != p.origin[0] and out[2] != p.origin[2]
+    assert out[1] == p.origin[1]
+    assert state.cable_integ_deg[0] == pytest.approx([0., .2])
+    assert state.cable_integ_deg[1] == pytest.approx([0., 0.])
+    assert state.cable_integ_deg[2] == pytest.approx([.2, 0.])
+
+
 def test_golden_feedforward():
     out, flags = wrist_control_step_model(make_p(), CALIB, 0.0, 0.0, 1.0, 0.0)
     assert out is not None and flags == FLAG_OK

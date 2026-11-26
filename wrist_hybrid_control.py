@@ -1,4 +1,4 @@
-"""混合模式专用参数和 C1 张力 PID。角度 PID 复用现有控制律。"""
+"""混合模式专用参数和复位绳张力 PID。角度 PID 复用现有控制律。"""
 
 from dataclasses import dataclass
 import math
@@ -6,8 +6,8 @@ import math
 from wrist_control_law import WristControlParams
 
 
-def coupling_ratios(null_dir):
-    """C1 与 C2/C3 的**稳态耦合比**（2026-11-26）。
+def coupling_ratios(null_dir, return_cable=0):
+    """复位绳与另外两根绳的稳态耦合比。以下以选择 C1 为例。
 
     ## 从 P 矩阵直接推出来的
 
@@ -33,12 +33,16 @@ def coupling_ratios(null_dir):
 
     Args:
         null_dir: 全正零空间方向 `(n1, n2, n3)`（可未归一化）
+        return_cable: 所选复位绳的索引，0/1/2 对应 C1/C2/C3。
 
     Returns:
-        `(n1, s2, s3)`；`n1` 太小（C1 不含预紧分量）时返回 `None`。
+        所选绳的份额，以及另外两根绳按编号顺序相对所选绳的比值。
+        所选绳的份额太小时返回 `None`。
     """
     try:
-        n1, n2, n3 = (float(null_dir[0]), float(null_dir[1]), float(null_dir[2]))
+        values = tuple(float(null_dir[i]) for i in range(3))
+        n1 = values[return_cable]
+        n2, n3 = (value for i, value in enumerate(values) if i != return_cable)
     except (TypeError, ValueError, IndexError):
         return None
     if not all(math.isfinite(v) for v in (n1, n2, n3)):
@@ -81,7 +85,8 @@ class HybridWristParams:
     angles: WristControlParams
     roll_target_deg: float
     pitch_target_deg: float
-    c1: C1TensionParams
+    c1: C1TensionParams  # 复位绳张力参数，沿用原存档字段口径
+    return_cable: int = 0
 
 
 class C1TensionState:
@@ -138,10 +143,12 @@ def c1_tension_target(params: C1TensionParams, state: C1TensionState, *,
     else:
         state.i_counts = max(-params.i_limit, min(params.i_limit, state.i_counts))
     tighten_sign = -1 if spool_k > 0.0 else 1
-    i_next = max(-params.i_limit, min(params.i_limit, state.i_counts + params.ki * error * dt))
+    i_next = max(-params.i_limit, min(params.i_limit, state.i_counts + params.ki * (error * dt)))
     pd = params.kp * error - params.kd * state.force_rate
     pid_counts = tighten_sign * (pd + i_next)
     raw = pid_counts + ff_counts + state.residual
+    if not math.isfinite(raw):
+        return None
     step_limited = abs(raw) > params.max_step
     travel_limited = not (origin - params.travel <= counts + raw <= origin + params.travel)
 

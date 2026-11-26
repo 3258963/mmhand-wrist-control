@@ -184,7 +184,7 @@ def _stage_runs(stage_col):
     return runs
 
 
-def metrics(data):
+def metrics(data, return_cable=0):
     """按档算指标。
 
     Returns:
@@ -214,10 +214,11 @@ def metrics(data):
             if k2 == KIND_C1_SINE:
                 row["hz"] = float(payload)
 
-        # ---- C1 张力 ----
+        # ---- 所选复位绳张力 ----
         try:
-            tgt = [data["f1_tgt"][k] for k in idx]
-            mea = [data["f1"][k] for k in idx]
+            channel = f"f{return_cable + 1}"
+            tgt = [data[f"{channel}_tgt"][k] for k in idx]
+            mea = [data[channel][k] for k in idx]
         except KeyError:
             tgt = mea = []
         if tgt and mea:
@@ -290,17 +291,17 @@ def _settle_time(tt, yy, target, band):
 # 调参规则
 # ============================================================
 
-# C1 张力环的增益范围（与界面 ranges 对齐，留安全余量）
+# 混合模式的 Kp/Ki 无固定上限，自动调参保留原来的下限。
 C1_BOUNDS = {
-    "kp": (1.0, 200.0),
-    "ki": (0.0, 200.0),
+    "kp": (1.0, math.inf),
+    "ki": (0.0, math.inf),
     "itl": (1.0, 300.0),
     "kd": (0.0, 2.0),
 }
 # 角度环只动 Kp / Ki（Kd 默认 0，不擅自引入微分噪声）
 ANGLE_BOUNDS = {
-    "kp": (0.02, 5.0),
-    "ki": (0.0, 100.0),
+    "kp": (0.02, math.inf),
+    "ki": (0.0, math.inf),
 }
 
 
@@ -346,20 +347,23 @@ def tune(metric_rows, gains, max_rounds_hit=False):
     if ss_worst > 6.0:
         c1["itl"] = _clamp(c1["itl"] * 1.4, C1_BOUNDS["itl"])
         if ss_worst > 10.0:
-            c1["ki"] = _clamp(c1["ki"] * 1.15, C1_BOUNDS["ki"])
+            c1["ki"] *= 1.15
     elif ss_worst < 2.0 and c1["itl"] > 25.0:
         c1["itl"] = _clamp(c1["itl"] * 0.9, C1_BOUNDS["itl"])
     if c1["kd"] > 0.0 and os_worst < 12.0 and r05 < 0.85 and not max_rounds_hit:
         c1["kd"] = _clamp(c1["kd"] * 1.1, C1_BOUNDS["kd"])
     for k in ("kp", "ki", "itl", "kd"):
-        c1[k] = _clamp(c1[k], C1_BOUNDS[k])
+        candidate = c1[k] if math.isfinite(c1[k]) else gains["c1"][k]
+        c1[k] = _clamp(candidate, C1_BOUNDS[k])
     if (abs(c1["kp"] - kp0) / max(1e-9, kp0) > 0.04
+            or abs(c1["ki"] - ki0) / max(1e-9, ki0) > 0.04
             or abs(c1["itl"] - itl0) / max(1e-9, itl0) > 0.08
             or abs(c1["kd"] - kd0) > 0.04):
         converged = False
     notes.append(
         f"C1: 超调{os_worst:+.0f}% 稳态{ss_worst:.0f}% r(0.3)={r03:.2f} r(0.5)={r05:.2f} → "
-        f"kp {kp0:g}→{c1['kp']:g}, itl {itl0:g}→{c1['itl']:g}, kd {kd0:g}→{c1['kd']:g}")
+        f"kp {kp0:g}→{c1['kp']:g}, ki {ki0:g}→{c1['ki']:g}, "
+        f"itl {itl0:g}→{c1['itl']:g}, kd {kd0:g}→{c1['kd']:g}")
 
     # ---- 角度环：只看角度阶跃的超调 ----
     ang_steps = [r for r in metric_rows if r["kind"] == KIND_ANGLE_STEP]
@@ -381,9 +385,10 @@ def tune(metric_rows, gains, max_rounds_hit=False):
     elif os_a_worst < 10.0 and not max_rounds_hit:
         ang["kp"] *= 1.10
     if ss_a_worst > 8.0:
-        ang["ki"] = _clamp(ang["ki"] + 0.05, ANGLE_BOUNDS["ki"])
+        ang["ki"] += 0.05
     for k in ("kp", "ki"):
-        ang[k] = _clamp(ang[k], ANGLE_BOUNDS[k])
+        candidate = ang[k] if math.isfinite(ang[k]) else gains["ang"][k]
+        ang[k] = _clamp(candidate, ANGLE_BOUNDS[k])
     if (abs(ang["kp"] - akp0) / max(1e-9, akp0) > 0.04
             or abs(ang["ki"] - aki0) > 1e-9):
         converged = False

@@ -106,7 +106,8 @@ def _mk_rows(dur_s, hz, fn_c1, fn_roll, fn_pitch):
     return t, [fn_c1(x) for x in t], [fn_roll(x) for x in t], [fn_pitch(x) for x in t]
 
 
-def test_metrics_step_overshoot():
+@pytest.mark.parametrize("return_cable", [0, 1, 2])
+def test_metrics_step_overshoot(return_cable):
     """构造一个 40% 超调的阶跃 → metrics 要量出来。"""
     dt = 0.01
     n = 600
@@ -132,7 +133,11 @@ def test_metrics_step_overshoot():
         "c1_tgt_n": tgt,
         "stage": ["1"] * n, "kind": ["c1_step"] * n,
     }
-    rows = ha.metrics(data)
+    if return_cable:
+        channel = f"f{return_cable + 1}"
+        data[channel], data["f1"] = data["f1"], data[channel]
+        data[f"{channel}_tgt"], data["f1_tgt"] = data["f1_tgt"], data[f"{channel}_tgt"]
+    rows = ha.metrics(data, return_cable)
     assert len(rows) == 1
     assert rows[0]["kind"] == KIND_C1_STEP
     assert rows[0]["c1"]["ok"] is True
@@ -203,6 +208,20 @@ def test_tune_respects_bounds():
     assert new["c1"]["kp"] >= ha.C1_BOUNDS["kp"][0]
     assert new["c1"]["itl"] >= ha.C1_BOUNDS["itl"][0]
     assert new["c1"]["kd"] <= ha.C1_BOUNDS["kd"][1]
+
+
+def test_tune_adjusts_pi_gains_above_former_ceilings():
+    rows = [{"kind": KIND_C1_STEP, "hz": 0.0,
+             "c1": {"ok": True, "overshoot": 0.0, "ss_err": 15.0}},
+            {"kind": KIND_C1_SINE, "hz": 0.3, "c1": {"ratio": 0.8}},
+            {"kind": KIND_ANGLE_STEP, "hz": 0.0,
+             "roll": {"ok": True, "overshoot": 0.0, "ss_err": 10.0}}]
+    new, _notes, converged = ha.tune(rows, _gains(kp=250, ki=300, akp=6, aki=110))
+    assert new["c1"]["kp"] == pytest.approx(275)
+    assert new["c1"]["ki"] == pytest.approx(345)
+    assert new["ang"]["kp"] == pytest.approx(6.6)
+    assert new["ang"]["ki"] == pytest.approx(110.05)
+    assert not converged
 
 
 def test_tune_angle_kp_reacts_to_angle_overshoot():

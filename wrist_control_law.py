@@ -109,7 +109,7 @@ class WristControlParams:
         "origin", "gain_roll", "gain_pitch", "kp", "ki", "kd",
         "deadband_deg", "target_limit_deg", "soft_limit",
         "i_limit_deg", "d_filter_alpha", "max_step", "k_ff",
-        "max_step_roll", "max_step_pitch",
+        "max_step_roll", "max_step_pitch", "cable_pi", "ff_axes", "ff_axis_gains",
     )
 
     def __init__(self):
@@ -128,6 +128,9 @@ class WristControlParams:
         self.k_ff = 1.0                # 绳长前馈系数 0~1（只对 chord_from_fb 生效）
         self.max_step_roll = 0.0       # 分轴每拍限幅 [counts]，0=不限（用 max_step 兜底）
         self.max_step_pitch = 0.0
+        self.cable_pi = None          # 可选，每缆按 Roll/Pitch 保存 (kp, ki)
+        self.ff_axes = (True, True)   # 仅开关几何前馈，角度反馈仍工作
+        self.ff_axis_gains = None     # 可选，增量式前馈的 (Roll 系数, Pitch 系数)
 
 
 def clampf(v: float, lo: float, hi: float) -> float:
@@ -167,16 +170,14 @@ class WristPidState:
     - prev_fb_deg / primed：上一拍反馈，首拍无微分。
     """
 
-    __slots__ = ("integ_deg", "d_filt_deg_s", "prev_fb_deg", "primed")
+    __slots__ = ("integ_deg", "cable_integ_deg", "d_filt_deg_s", "prev_fb_deg", "primed")
 
     def __init__(self) -> None:
-        self.integ_deg = [0.0, 0.0]
-        self.d_filt_deg_s = [0.0, 0.0]
-        self.prev_fb_deg = [0.0, 0.0]
-        self.primed = False
+        self.reset()
 
     def reset(self) -> None:
         self.integ_deg = [0.0, 0.0]
+        self.cable_integ_deg = [[0.0, 0.0] for _ in range(MOTOR_COUNT)]
         self.d_filt_deg_s = [0.0, 0.0]
         self.prev_fb_deg = [0.0, 0.0]
         self.primed = False
@@ -370,10 +371,7 @@ def wrist_control_step_pid(p: WristControlParams,
 
     # ---- 关节角域 PID → 虚拟角修正 δθ（deg）----
     # state=None：旧接口，退化为纯 P（不读 ki/kd、不写状态）。
-    if state is None:
-        dth_r = p.kp * e_roll
-        dth_p = p.kp * e_pitch
-    else:
+    if state is not None:
         # 微分作用在**反馈**上：−dθ_fb/dt，改目标框不会砸出微分尖峰。
         if state.primed and dt > 0.0:
             raw_d_r = -(rf - state.prev_fb_deg[0]) / dt
@@ -391,42 +389,49 @@ def wrist_control_step_pid(p: WristControlParams,
         state.prev_fb_deg = [rf, pf]
         state.primed = True
 
-        # 积分：轴启用才累加；按等效角上限 ±i_limit_deg 钳制（防 windup）。
-        i_cap = max(0.0, p.i_limit_deg)
-        for ax, e_ax, enabled in ((ROLL, e_roll, roll_enabled),
-                                  (PITCH, e_pitch, pitch_enabled)):
-            if not enabled or p.ki <= 0.0:
+    # 共用档只积一次；逐缆档各存两个积分，互相调整 Ki 不会改写另一缆的积分。
+    gain_rows = p.cable_pi if p.cable_pi is not None else (((p.kp, p.ki),) * 2,)
+    corrections = []
+    i_cap = max(0.0, p.i_limit_deg)
+    for i, gains in enumerate(gain_rows):
+        integral = None
+        if state is not None:
+            integral = state.integ_deg if p.cable_pi is None else state.cable_integ_deg[i]
+        correction = [0.0, 0.0]
+        for axis, error, enabled in ((ROLL, e_roll, roll_enabled),
+                                     (PITCH, e_pitch, pitch_enabled)):
+            if not enabled:
                 continue
-            state.integ_deg[ax] += e_ax * dt
-            cap = i_cap / p.ki
-            if state.integ_deg[ax] > cap:
-                state.integ_deg[ax] = cap
-                flags |= FLAG_I_CLAMPED
-            elif state.integ_deg[ax] < -cap:
-                state.integ_deg[ax] = -cap
-                flags |= FLAG_I_CLAMPED
-
-        dth_r = (p.kp * e_roll + p.ki * state.integ_deg[ROLL]
-                 + p.kd * state.d_filt_deg_s[ROLL])
-        dth_p = (p.kp * e_pitch + p.ki * state.integ_deg[PITCH]
-                 + p.kd * state.d_filt_deg_s[PITCH])
-    if not roll_enabled:
-        dth_r = 0.0
-    if not pitch_enabled:
-        dth_p = 0.0
+            kp, ki = gains[axis]
+            correction[axis] = kp * error
+            if integral is not None:
+                if ki > 0.0:
+                    proposed = integral[axis] + error * dt
+                    cap = i_cap / ki
+                    integral[axis] = clampf(proposed, -cap, cap)
+                    if integral[axis] != proposed:
+                        flags |= FLAG_I_CLAMPED
+                elif p.cable_pi is not None:
+                    integral[axis] = 0.0
+                correction[axis] += ki * integral[axis] + p.kd * state.d_filt_deg_s[axis]
+        corrections.append(correction)
 
     out = [0] * MOTOR_COUNT
     d2r = math.pi / 180.0
+    ff_roll = roll_enabled and p.ff_axes[ROLL]
+    ff_pitch = pitch_enabled and p.ff_axes[PITCH]
+    k_ff_roll, k_ff_pitch = p.ff_axis_gains or (p.k_ff, p.k_ff)
     for i in range(MOTOR_COUNT):
         k_i = calib.k_counts_per_m[i]
+        dth_r, dth_p = corrections[0 if p.cable_pi is None else i]
         # 分轴开关（2026-11-10）：关掉的轴从「前馈 + 校正」里整体剔除。
         # 旧实现只在 v1 把系数置零，模型路径照样用整张 R 和整段绳长，
         # 勾掉 ROLL环/PITCH环 毫无作用。
         if feedforward:
             dl = 0.0
-            if roll_enabled:
+            if ff_roll:
                 dl += out_t.s_m[ROLL][i] - out_ref.s_m[ROLL][i]
-            if pitch_enabled:
+            if ff_pitch:
                 dl += out_t.s_m[PITCH][i] - out_ref.s_m[PITCH][i]
             base = p.origin[i] + k_i * dl
             delta_c = 0.0
@@ -442,10 +447,10 @@ def wrist_control_step_pid(p: WristControlParams,
             dr = 0.0
             dp = 0.0
             if chord_from_fb:
-                if roll_enabled:
-                    dr += p.k_ff * k_i * (out_t.s_m[ROLL][i] - out_fb.s_m[ROLL][i])
-                if pitch_enabled:
-                    dp += p.k_ff * k_i * (out_t.s_m[PITCH][i] - out_fb.s_m[PITCH][i])
+                if ff_roll:
+                    dr += k_ff_roll * k_i * (out_t.s_m[ROLL][i] - out_fb.s_m[ROLL][i])
+                if ff_pitch:
+                    dp += k_ff_pitch * k_i * (out_t.s_m[PITCH][i] - out_fb.s_m[PITCH][i])
             if roll_enabled:
                 dr += -k_i * out_fb.r_m[ROLL][i] * (dth_r * d2r)
             if pitch_enabled:
@@ -458,13 +463,13 @@ def wrist_control_step_pid(p: WristControlParams,
         elif chord_from_fb:
             # 变体 C：每拍从**当前位姿**重算弦（不是从起环的 ref），
             # 基准同样是本拍实测。e=0 时 dl=0，输出就是实测（原地保持）。
-            # k_ff ∈ [0,1]：模型可信就给 1，怕模型偏就给 0.2~0.5 只借一部分。
-            dl = 0.0
-            if roll_enabled:
-                dl += out_t.s_m[ROLL][i] - out_fb.s_m[ROLL][i]
-            if pitch_enabled:
-                dl += out_t.s_m[PITCH][i] - out_fb.s_m[PITCH][i]
-            base = float(base_counts[i]) + p.k_ff * k_i * dl
+            dl_r = out_t.s_m[ROLL][i] - out_fb.s_m[ROLL][i] if ff_roll else 0.0
+            dl_p = out_t.s_m[PITCH][i] - out_fb.s_m[PITCH][i] if ff_pitch else 0.0
+            if k_ff_roll == k_ff_pitch:
+                ff_counts = k_ff_roll * k_i * (dl_r + dl_p)
+            else:
+                ff_counts = k_i * (k_ff_roll * dl_r + k_ff_pitch * dl_p)
+            base = float(base_counts[i]) + ff_counts
             delta_c = 0.0
             if roll_enabled:
                 delta_c += -k_i * out_fb.r_m[ROLL][i] * (dth_r * d2r)
@@ -479,6 +484,8 @@ def wrist_control_step_pid(p: WristControlParams,
             if pitch_enabled:
                 delta_c += -k_i * out_fb.r_m[PITCH][i] * (dth_p * d2r)
             value = base + delta_c
+        if not math.isfinite(value):
+            return None, flags | FLAG_NONFINITE
         out[i] = clampi(int(round(value)),
                         p.origin[i] - p.soft_limit,
                         p.origin[i] + p.soft_limit)
