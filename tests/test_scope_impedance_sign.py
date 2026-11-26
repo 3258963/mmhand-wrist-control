@@ -14,6 +14,22 @@ from types import SimpleNamespace
 import mmhand_scope as scope
 
 
+class _FakeRate:
+    """替身 RateFilter：不依赖真实时钟，直接返回设定角速度。"""
+
+    def __init__(self, out=(0.0, 0.0)):
+        self.out = out
+        self.updates = []
+        self.resets = 0
+
+    def update(self, roll, pitch, now):
+        self.updates.append((roll, pitch))
+        return self.out
+
+    def reset(self):
+        self.resets += 1
+
+
 class _Stub:
     """只提供 `_cl_tick_impedance` 用到的成员，不碰 Qt。"""
 
@@ -21,10 +37,14 @@ class _Stub:
         self._imp_tau = None
         self._imp_flags = None
         self._imp_ff = None
+        self._imp_rate = _FakeRate()
+        self._imp_omega = (0.0, 0.0)
+        self._imp_d_tau = (0.0, 0.0)
         self.force_calls = []
 
     def _impedance_params(self, roll, pitch):
-        return SimpleNamespace(tau_ff=(0.0, 0.0))
+        return scope.WristImpedanceParams(k_roll=0.5, k_pitch=0.5,
+                                          d_roll=0.0, d_pitch=0.0)
 
     def _cl_fval(self, key, default, lo, hi):
         return 0.0
@@ -59,3 +79,30 @@ def test_impedance_no_target_still_stops(monkeypatch):
     scope.ScopeWindow._cl_tick_impedance(d, 0.0, 0.0)
     assert stopped and "非有限" in stopped[0]
     assert d.force_calls == []
+
+def test_impedance_passes_negated_omega_to_law(monkeypatch):
+    """D 项接线：`RateFilter` 的角速度必须**取负**（约定 q̇*−q̇）传进律。
+
+    2026-11-25：`_cl_tick_impedance` 原来把 ω 硬编码成 0，D 项是死的。
+    """
+    seen = {}
+
+    def _fake(ip, roll, pitch, rtgt, ptgt, droll, dpitch):
+        seen.update(droll=droll, dpitch=dpitch)
+        return 0.0, 0.0, scope.IMP_OK
+
+    monkeypatch.setattr(scope, "wrist_impedance_torque", _fake)
+    d = _Stub()
+    d._imp_rate = _FakeRate((10.0, -20.0))       # 实测角速度 +10 / −20 °/s
+    scope.ScopeWindow._cl_tick_impedance(d, 1.0, -2.0)
+    assert seen["droll"] == -10.0
+    assert seen["dpitch"] == 20.0
+    assert d._imp_omega == (10.0, -20.0)         # 存原始 ω 供状态行显示
+
+
+def test_impedance_zero_d_still_zero_omega_effect(monkeypatch):
+    """D=0 时行为不变（ω 算出来但系数为 0 → D·ė=0）。"""
+    d = _Stub()
+    d._imp_rate = _FakeRate((50.0, 50.0))
+    scope.ScopeWindow._cl_tick_impedance(d, 0.0, 0.0)
+    assert d._imp_d_tau == (0.0, 0.0)

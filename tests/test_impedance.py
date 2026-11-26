@@ -15,8 +15,8 @@ import math
 import pytest
 
 from wrist_impedance import (IMP_NO_TARGET, IMP_OK, IMP_TAU_CLAMPED,
-                             WristImpedanceParams, gravity_tau_sine,
-                             wrist_impedance_torque)
+                             RateFilter, WristImpedanceParams,
+                             gravity_tau_sine, wrist_impedance_torque)
 
 
 def _p(**kw):
@@ -182,3 +182,57 @@ def test_gravity_sine_bad_input_zero():
     tr, tp = gravity_tau_sine(float("nan"), 0.3, 90.0, 90.0)
     assert tr == pytest.approx(0.0)
     assert tp == pytest.approx(0.0)          # cos(90°)=0
+
+# ---------------- RateFilter（2026-11-25：阻抗 D 项原料） ----------------
+
+def test_rate_first_call_is_zero():
+    """首拍没有基准 → 输出 0（不能拿历史的 0 当上一个角度）。"""
+    f = RateFilter(tau_s=0.0)
+    assert f.update(1.0, 2.0, 100.0) == (0.0, 0.0)
+
+
+def test_rate_plain_difference_when_tau_zero():
+    """tau_s=0 → 不滤波，就是纯差分。"""
+    f = RateFilter(tau_s=0.0)
+    f.update(0.0, 0.0, 0.0)
+    w = f.update(1.0, -2.0, 0.01)          # 1deg/10ms, -2deg/10ms
+    assert w[0] == pytest.approx(100.0)
+    assert w[1] == pytest.approx(-200.0)
+
+
+def test_rate_lowpass_converges_to_true_rate():
+    """一阶低通最终收敛到真实斜率（匀速 100 deg/s）。"""
+    f = RateFilter(tau_s=0.03)
+    f.update(0.0, 0.0, 0.0)
+    w = (0.0, 0.0)
+    for i in range(1, 80):
+        w = f.update(1.0 * i, 0.0, 0.01 * i)
+    assert w[0] == pytest.approx(100.0, rel=0.02)
+
+
+def test_rate_clamped_to_max_dps():
+    """单拍跳变先限幅，再进滤波。"""
+    f = RateFilter(tau_s=0.0, max_dps=50.0)
+    f.update(0.0, 0.0, 0.0)
+    assert f.update(10.0, 0.0, 0.01)[0] == pytest.approx(50.0)
+
+
+def test_rate_long_gap_returns_zero():
+    """间隔超过 dt_max（停环/线程卡顿）→ 不差分、输出 0，防止力矩尖峰。"""
+    f = RateFilter(tau_s=0.0)
+    f.update(0.0, 0.0, 0.0)
+    assert f.update(100.0, 0.0, 0.2) == (0.0, 0.0)
+
+
+def test_rate_rejects_nonfinite():
+    f = RateFilter()
+    assert f.update(float("nan"), 0.0, 0.0) == (0.0, 0.0)
+    assert f.update(0.0, float("inf"), 0.0) == (0.0, 0.0)
+
+
+def test_rate_reset_clears_baseline():
+    f = RateFilter(tau_s=0.0)
+    f.update(0.0, 0.0, 0.0)
+    f.update(1.0, 0.0, 0.01)
+    f.reset()
+    assert f.update(5.0, 0.0, 0.02) == (0.0, 0.0)

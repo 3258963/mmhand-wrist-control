@@ -37,7 +37,8 @@
 ## 未实现的接线（下一步）
 
 * `τ_ff`：起环静止时锁一次 `τ_ff = R(q0)·f_meas0`（不需要知道腕质量）
-* 阻尼用的 `q̇`：编码器差分噪声大，接线时应先过 `wrist_filter`
+* ~~阻尼用的 `q̇`~~ —— **2026-11-25 已接线**：上位机用 `RateFilter`
+  （差分 + 一阶低通）从 J16/J17 磁编算角速度，传 `q̇* − q̇` 进来。
 """
 from __future__ import annotations
 
@@ -129,6 +130,85 @@ class WristImpedanceParams:
         self.tau_r_max = float(tau_r_max)
         self.tau_p_max = float(tau_p_max)
         self.deadband_deg = float(deadband_deg)
+
+
+class RateFilter:
+    """角度序列 → 角速度 [deg/s]：差分 + 一阶低通（**纯状态机，可单测**）。
+
+    为什么需要：阻抗的 D 项要 `q̇`，而编码器只给角度。直接差分噪声太大
+    （14 bit 磁编量化 0.022°，100 Hz 下每 1 count 就是 2.2 °/s），所以
+    先差分、再按时间常数 `tau_s` 过一阶 EMA。
+
+    两个安全点：
+      · `dt` 超出 `[dt_min, dt_max]`（首拍 / 停环 / 线程卡顿）→ 本次不更新、
+        输出 0，并把基准重置到当前角度。否则一次 200 ms 的卡顿会被算成
+        "巨大角速度"，D 项会瞬间给一个反方向力矩尖峰。
+      · 差分结果先按 `±max_dps` 限幅再进 EMA —— 编码器偶发跳变不会穿到力矩。
+
+    用法（上位机每拍调一次）：:
+
+        f = RateFilter(tau_s=0.03)
+        w_roll, w_pitch = f.update(roll, pitch, time.perf_counter())
+        ...
+        f.reset()          # 起环 / 停环 / 换模式时清状态
+    """
+
+    __slots__ = ("tau_s", "max_dps", "dt_min", "dt_max",
+                 "_prev", "_prev_t", "_rate")
+
+    def __init__(self, tau_s: float = 0.03, max_dps: float = 500.0,
+                 dt_min: float = 0.002, dt_max: float = 0.05):
+        if not _finite(tau_s) or tau_s < 0.0:
+            raise ValueError("tau_s 需为非负有限数 [s]")
+        if not _finite(max_dps) or max_dps <= 0.0:
+            raise ValueError("max_dps 需为正有限数 [deg/s]")
+        if not (_finite(dt_min) and _finite(dt_max)) or not (0.0 < dt_min < dt_max):
+            raise ValueError("需要 0 < dt_min < dt_max")
+        self.tau_s = float(tau_s)
+        self.max_dps = float(max_dps)
+        self.dt_min = float(dt_min)
+        self.dt_max = float(dt_max)
+        self.reset()
+
+    def reset(self) -> None:
+        """清空基准与滤波状态（下一次 `update` 只记基准、输出 0）。"""
+        self._prev = None
+        self._prev_t = None
+        self._rate = [0.0, 0.0]
+
+    def update(self, roll_deg: float, pitch_deg: float,
+               now_s: float) -> tuple:
+        """喂一拍角度，返回这一拍的角速度 `(droll, dpitch)` [deg/s]。
+
+        Args:
+            roll_deg, pitch_deg: 当前实测角（与调用方同一口径，本类不做换号）
+            now_s: 单调时基（`time.perf_counter()`）。用调用方给的时刻，
+                   而不是内部取时，便于单测与跨线程一致。
+
+        Returns:
+            (droll_dps, dpitch_dps)；非法输入 / 首拍 / 间隔越界 → (0, 0)。
+        """
+        if not (_finite(roll_deg) and _finite(pitch_deg) and _finite(now_s)):
+            return 0.0, 0.0
+        prev, prev_t = self._prev, self._prev_t
+        self._prev = (float(roll_deg), float(pitch_deg))
+        self._prev_t = float(now_s)
+        if prev is None or prev_t is None:
+            return 0.0, 0.0
+        dt = float(now_s) - prev_t
+        if not (self.dt_min <= dt <= self.dt_max):
+            # 首拍/停顿/卡顿：不做差分（大间隔会被当成巨大速度）
+            self._rate = [0.0, 0.0]
+            return 0.0, 0.0
+        lim = self.max_dps
+        raw_r = (float(roll_deg) - prev[0]) / dt
+        raw_p = (float(pitch_deg) - prev[1]) / dt
+        raw_r = max(-lim, min(lim, raw_r))
+        raw_p = max(-lim, min(lim, raw_p))
+        a = dt / (self.tau_s + dt) if self.tau_s > 0.0 else 1.0
+        self._rate[0] += (raw_r - self._rate[0]) * a
+        self._rate[1] += (raw_p - self._rate[1]) * a
+        return self._rate[0], self._rate[1]
 
 
 def wrist_impedance_torque(p: WristImpedanceParams,
