@@ -274,9 +274,11 @@ MOTOR_FOR_CABLE = (27, 28, 29)
 # × 现系数（逐缆各自校）。每缆独立元组架构保留——下次极性有变只改对应位。
 TENSION_N_PER_RAW = (-0.00980665, -0.00980665, -0.00980665)
 TENSION_MODBUS_ADDRESS = 1   # 变送器出厂默认从站地址
-TENSION_POLL_HZ = 250.0      # 重量帧目标频率：RTT~2ms+帧间隙1ms 的硬件地板之上留裕量（实测可稳定 250Hz）；
-                             # 设备刷新 1280Hz、波特率 600000（见 znsv_app/rate_upgrade.py）；依赖 FTDI LatencyTimer=1，
-                             # 未修复的机器上 RTT 16ms 自动降速 ~55Hz，无超时风暴。闭环 100Hz 下每拍都有新张力。
+TENSION_POLL_HZ = 200.0     # 2026-11-25 晚 用户定案：**200 Hz**（250→100→200）。
+                            # 周期 5 ms，样本年龄 ≤5 ms（平均 2.5 ms）；控制环 100 Hz
+                            # 每拍必有新值。比 250 Hz 留 20% 余量（早先 250 Hz 下曾
+                            # 出现回复被下一轮冲掉而丢帧），又不牺牲内环带宽。
+                            # 一帧事务 0.75 ms @600000，带宽占用约 15%，余量充足。
 # J16/J17 角度显示方向（-1 = 与磁编原始方向相反，按用户实测约定）。
 AXIS_SIGN = {16: 1.0, 17: -1.0}   # J16=ROLL / J17=PITCH 方向（2026-11-23 用户要求改回）
 # 界面 pitch ↔ 模型 pitch（+X 右手定则）的换算。
@@ -407,7 +409,10 @@ def CHC(i: int) -> str:
     return AT.T("channels")[i]
 from wrist_tension import (TENSION_OVERLOAD, TENSION_SLACK, TENSION_STALE,
                            TensionConfig, tension_evaluate)
-from wrist_force_law import (F_SENSOR_MIN_N, FORCE_OK, FORCE_NO_NULL,
+import wrist_autotune as wrist_autotune
+import wrist_hybrid_autotune as hybrid_autotune
+from wrist_force_law import (D_TERM_MAX_FRAC, F_SENSOR_MIN_N, FORCE_OK,
+                              FORCE_NO_NULL,
                               FORCE_OVERLOAD, FORCE_SENSOR_FAULT,
                               FORCE_STALE, FORCE_TDA_INFEASIBLE, STALE_MS,
                               WristForceV2Params, WristForceV2State,
@@ -417,11 +422,11 @@ from wrist_force_law import (F_SENSOR_MIN_N, FORCE_OK, FORCE_NO_NULL,
                               tau_trim_step, tension_i_term_lim_counts,
                               wrist_force_v2_step, wrist_tension_step)
 from wrist_hybrid_control import (C1TensionParams, C1TensionState, HybridWristParams,
-                                  c1_tension_target)
+                                  c1_tension_target, coupling_ratios)
 from wrist_tension_observer import TensionEstimatePanel
 from wrist_impedance import (IMP_NO_TARGET, IMP_OK, IMP_TAU_CLAMPED,
-                             WristImpedanceParams, gravity_tau_sine,
-                             wrist_impedance_torque)
+                             RateFilter, WristImpedanceParams,
+                             gravity_tau_sine, wrist_impedance_torque)
 from wrist_tda import (TDA_INFEASIBLE, TDA_NO_NULL, TDA_PRELOAD_INFEASIBLE,
                        allocation_step, capacity_closed_form, preload_window,
                        tda_solve, torque_capacity)
@@ -2332,6 +2337,118 @@ class _ClLoopThread(QThread):
                 time.sleep(gap)
 
 
+class _TensionPollThread(QThread):
+    """同一线程串行执行采集和重开；只有通过校验的重量帧才能确认恢复。"""
+
+    _no_frame_s = 2.0
+    _retry_initial_s = 0.5
+    _retry_max_s = 5.0
+
+    def __init__(self, win, sensor, port="", baud=600000):
+        super().__init__(win if isinstance(win, QObject) else None)
+        self._win = win
+        self._sensor = sensor
+        self._port_name = str(port or "")
+        self._baud = int(baud or 600000)
+        self._stop_event = threading.Event()
+        self._reconnects = 0
+        self.link_status = "等待首帧"
+        self.stop_reason = ""
+
+    def stop(self) -> None:
+        self._stop_event.set()
+
+    def _log(self, state, **detail):
+        safety_log("TENSION_LINK", port=self._port_name, baud=self._baud,
+                   state=state, **detail)
+
+    def run(self) -> None:
+        sys.setswitchinterval(0.001)
+        try:
+            self._poll_loop()
+        except Exception as exc:
+            self.stop_reason = f"采集线程退出：{exc!r}"
+            self._log("worker_failed", error=repr(exc))
+        finally:
+            try:
+                self._sensor.disconnect()
+            except Exception as exc:
+                self._log("close_failed", error=repr(exc))
+
+    def _poll_loop(self) -> None:
+        sensor = self._sensor
+        last_frame = time.perf_counter()
+        healthy_since = None
+        delay = self._retry_initial_s
+        attempt = 0
+        fault = ""
+        last_feed_error = None
+        self._log("opened")
+        while not self._stop_event.is_set():
+            if fault:
+                if not self._port_name:
+                    self.stop_reason = fault
+                    return
+                attempt += 1
+                self.link_status = f"第 {attempt} 次重连，{delay:g} 秒后重试 · {fault}"
+                self._log("retry", attempt=attempt, wait_s=delay, reason=fault)
+                try:
+                    sensor.disconnect()
+                except Exception as exc:
+                    self._log("close_failed", error=repr(exc))
+                if self._stop_event.wait(delay):
+                    return
+                delay = min(self._retry_max_s, 2 * delay)
+                try:
+                    sensor.connect(self._port_name, self._baud)
+                except Exception as exc:
+                    fault = f"打开串口失败：{exc!r}"
+                    continue
+                self.link_status = f"第 {attempt} 次重连，串口已打开，等待有效重量帧"
+                healthy_since = None
+                last_frame = time.perf_counter()
+                fault = ""
+                continue
+
+            try:
+                raws = sensor.poll()
+            except Exception as exc:
+                fault = f"采集异常：{exc!r}"
+                continue
+            now = time.perf_counter()
+            if raws is None:
+                silence = now - last_frame
+                if silence >= self._no_frame_s:
+                    fault = (f"{silence:.1f} 秒无有效重量帧，超时 {sensor.timeouts}，"
+                             f"错帧 {sensor.protocol_errors}，{sensor.error or '无响应'}")
+                    continue
+                # 传输中让出 CPU，避免无字节时持续查询 Windows 串口。
+                time.sleep(max(0.00025, min(sensor.next_poll_delay(), 0.002)))
+                continue
+
+            if self._stop_event.is_set():
+                return
+            last_frame = now
+            if healthy_since is None:
+                healthy_since = now
+                if attempt:
+                    self._reconnects += 1
+                self._log("streaming", attempt=attempt, recoveries=self._reconnects)
+                self.link_status = ""
+                attempt = 0
+            elif delay != self._retry_initial_s and now - healthy_since >= 3.0:
+                delay = self._retry_initial_s
+            try:
+                self._win._tension_feed(raws)
+                last_feed_error = None
+            except Exception as exc:
+                # 与串口故障分开记录，避免数据处理异常被静默丢掉。
+                error = repr(exc)
+                if error != last_feed_error:
+                    self._log("feed_error", error=error)
+                    last_feed_error = error
+
+
 class ScopeWindow(QMainWindow):
     exportFinished = Signal()
     # 双击加的横线标记：上限（同时也限制写进布局存档的条数）
@@ -2401,9 +2518,11 @@ class ScopeWindow(QMainWindow):
         self._tension_sensor = None     # ZnsvTransmitter（连接后非 None，观测台直接持有）
         self._tension_port_name = ""
         self._tension_ch_map = list(TENSION_CH_FOR_CABLE)   # C1/C2/C3 ← CHn（观测台可改）
+        # 2026-11-25：轮询搬进独立线程（`_TensionPollThread`）。实测裸串口 249.9 Hz、
+        # 而原来的 GUI-QTimer 方案只有 ~15 Hz —— 张力环的等效延迟主要就是它造成的。
+        self._tension_thread = None
+        # 旧的 QTimer 保留但**不再启动**（`tools/perf` 与测试仍引用这个属性）。
         self._tension_poll_timer = QTimer(self)
-        # 初始 1ms；连接后由 _tension_poll 按 driver.next_poll_delay() 自适应：
-        # 传输中 1ms，空闲期排到下一个请求时隙（唤醒约减半，采样率不变）。
         self._tension_poll_timer.setInterval(1)
         self._tension_poll_timer.setTimerType(Qt.PreciseTimer)
         self._tension_poll_timer.timeout.connect(
@@ -2415,6 +2534,7 @@ class ScopeWindow(QMainWindow):
         # 避免 60Hz×3 卡 ×O(7500) 切片（2026-11-02 张力模式卡死的次因）。
         self._tension_hist_disp = [deque(maxlen=1500) for _ in range(3)]
         self._tension_feed_count = 0
+        self._tension_arrivals = deque(maxlen=512)  # 高于支持的 250 Hz，供界面统计近一秒
         self._tension_raws_last = None  # 最近一帧 8 通道 raw（观测台 CH 条）
         # 张力 UI 控件在张力·R 观测台打开时才创建；此前置空防 AttributeError。
         self.tension_btn = None
@@ -2627,7 +2747,8 @@ class ScopeWindow(QMainWindow):
         bar2.addWidget(self.abstime_check)
         bar2.addWidget(QLabel("预设"))
         self.preset_combo = QComboBox()
-        self.preset_combo.addItems(["自定义", "腕部调试", "全磁编raw", "M27-29遥测", "全清"])
+        self.preset_combo.addItems(["自定义", "腕部调试", "混合调试", "全磁编raw",
+                                    "M27-29遥测", "全清"])
         self.preset_combo.currentIndexChanged.connect(self._apply_preset)
         bar2.addWidget(self.preset_combo)
         self.only_online_check = QCheckBox("只显示在线")
@@ -3172,6 +3293,13 @@ class ScopeWindow(QMainWindow):
         self._force_base = None             # 进入力控时刻的电机位置基准
         self._force_trim = [0.0, 0.0, 0.0]  # 上次发送的 trim（变更抑制用）
         self._tau_trim = [0.0, 0.0]         # 力矩修正（慢积分外环）的修正量 [N·m]
+        # 阻抗 D 项（2026-11-25）：角度差分 + 一阶低通 → 角速度 [deg/s]。
+        # 与张力环的 `Kd_f`（误差微分）同一设计口径：**D 作用在测量上**，
+        # 目标角阶跃不产生微分kick。`_imp_omega`/`_imp_d_tau` 只供状态行显示。
+        self._imp_rate = RateFilter(tau_s=0.03)
+        self._imp_omega = (0.0, 0.0)
+        self._imp_d_tau = (0.0, 0.0)
+        self._auto_t0_pc = None             # 自动调参起点（perf_counter）
         self._force_need_send = False       # 重入首拍强制下发 base（防目标跳变）
 
         self.cl_roll_now = QLabel("ROLL  --.--°→--.--°")
@@ -3242,8 +3370,11 @@ class ScopeWindow(QMainWindow):
         self.sweep_freq.setSuffix(" Hz")
         self.sweep_freq.setMinimumWidth(84)
         self.sweep_freq.setToolTip(
-            "正弦频率（三角波不用）。0.05~0.2Hz 看低频跟随；\n"
-            "0.5Hz 以上逐步逼近带宽极限（幅度会缩、相位会滞后）")
+            "**正弦频率**（Hz）。⚠ 只有「波形 = 正弦波」或「轴 = 双轴正弦」时才生效；\n"
+            "波形是「三角波」时本框是**禁用**的（灰掉，只保留上次的值），\n"
+            "此时生效的是下面那行的「速度 °/s」。\n"
+            "· 0.05~0.2 Hz 看低频跟随；\n"
+            "· 0.5 Hz 以上逐步逼近带宽极限（幅度会缩、相位会滞后）。")
         self.sweep_amp = QDoubleSpinBox()
         self.sweep_amp.setRange(0.5, 90.0)
         self.sweep_amp.setDecimals(1)
@@ -3266,6 +3397,16 @@ class ScopeWindow(QMainWindow):
         _add(r3, 0, "频率", self.sweep_freq)
         _add(r3, 1, "幅值 ROLL", self.sweep_amp)
         _add(r3, 2, "幅值 PITCH", self.sweep_amp_p)
+        # 2026-11-26：**哪个旋钮在生效**直接写出来。
+        # 起因：波形默认是「三角波」，此时频率框被禁用、只显示上次的值（0.2），
+        # 看起来像"频率锁死改不了"。这里动态显示当前生效的是频率还是速度，
+        # 并明说"改频率要先把波形切正弦"。
+        self.sweep_active_label = QLabel("")
+        self.sweep_active_label.setObjectName("muted")
+        self.sweep_active_label.setWordWrap(False)
+        r3.addWidget(self.sweep_active_label, 0, 6, 1, 4)
+        # 值一变就把「生效：…」刷新一下（只改文字，不回写数值，无递归）
+        self.sweep_freq.valueChanged.connect(lambda _=0: self._sync_sweep_widgets())
         tgt_box.addLayout(r3)
 
         # 行4：三角波速度 + 过零对称
@@ -3276,6 +3417,7 @@ class ScopeWindow(QMainWindow):
         self.sweep_speed.setSuffix("°/s")
         self.sweep_speed.setMinimumWidth(80)
         self.sweep_speed.setToolTip("三角波速度（正弦/双轴不用）：标定建议 0.2~0.5°/s（慢到准）")
+        self.sweep_speed.valueChanged.connect(lambda _=0: self._sync_sweep_widgets())
         # 2026-11-23 用户要求：现在扫掠大多只在正半轴（中心偏正），要能跑到正负。
         # 勾「过零」后双轴正弦的中心强制 (0,0)，目标 = ±幅值·sin。
         self.sweep_center0 = QCheckBox("过零对称")
@@ -3479,8 +3621,12 @@ class ScopeWindow(QMainWindow):
         self.cl_edits["k_pitch"] = self._cl_edit(
             "PITCH 刚度 [N·m/rad]（同上）", text="0.5")
         self.cl_edits["d_roll"] = self._cl_edit(
-            "ROLL 阻尼 [N·m/(rad/s)]。框架阶段默认 0（不测角速度）；\n"
-            "接线时要传滤波后的角速度，否则编码器差分噪声会直接进入力矩。",
+            "ROLL 阻尼 [N·m/(rad/s)]（2026-11-25 起**已接线**）：\n"
+            "· 角速度由 J16/J17 磁编差分 + 一阶低通（τ=30 ms）得到，\n"
+            "  状态行会显示 `ω=[…]°/s` 与 `D·ė=[…]N·m`，调 D 时看这两个数。\n"
+            "· D 作用在**测量**上（目标角阶跃不产生微分 kick）。\n"
+            "· 填 0 = 无阻尼（可能回中过冲）。起步建议先 K 后 D，D 从 0.01~0.05 试。\n"
+            "· 若腕静止时 `ω` 读数在 ±1°/s 内抖动属正常；>±5°/s 说明编码器有跳变。",
             text="0.0")
         self.cl_edits["d_pitch"] = self._cl_edit(
             "PITCH 阻尼 [N·m/(rad/s)]（同上）", text="0.0")
@@ -3507,6 +3653,18 @@ class ScopeWindow(QMainWindow):
         _add(i2, 1, "τff ROLL", self.cl_edits["tau_ff_r"])
         _add(i2, 2, "τff PITCH", self.cl_edits["tau_ff_p"])
         _imp_v.addLayout(i2)
+        # 2026-11-26：**阻抗自己的死区框**。
+        # 原来阻抗的 `deadband_deg` 读的是位置模式那个 `deadband` 框，而那个框
+        # 所在的「角度参数」行在阻抗模式下整行隐藏 → 阻抗的死区根本改不了。
+        # 留空 = 沿用位置模式的 `deadband`（行为与旧版完全一致）。
+        self.cl_edits["imp_deadband"] = self._cl_edit(
+            "阻抗角度死区 °（**留空 = 沿用位置模式「角度参数」行的「死区」框**）。\n"
+            "· |e| ≤ 死区 时该项力矩置 0，抑制编码器噪声/回中抖动；\n"
+            "· 填 0 = 无死区；填值 = 只用这个值，不再看位置模式那个框。",
+            text="")
+        i3 = _row_grid()
+        _add(i3, 0, "死区°", self.cl_edits["imp_deadband"])
+        _imp_v.addLayout(i3)
         _imp_hint = QLabel("K 单位 N·m/rad，D 单位 N·m/(rad/s)，τff 为 90° 重力力矩幅值；目标角用上方「ROLL目标 / PITCH目标」")
         _imp_hint.setObjectName("muted")
         _imp_hint.setWordWrap(True)
@@ -3553,6 +3711,23 @@ class ScopeWindow(QMainWindow):
         _add(l1, 1, "Ki_f", self.cl_edits["ki_f"])
         _add(l1, 2, "积分上限", self.cl_edits["i_term_lim"])
         _loop_v.addLayout(l1)
+        # 速度阻尼 D 项（2026-11-24）：原料 = 舵机回传的 Present Speed。
+        # 2026-11-25 用户定案：**Kd_f 就是标准 PID 的 D（误差微分）**。
+        # 原来的"速度阻尼"（用舵机 Present Speed）**已彻底删除**。
+        self.cl_edits["kd_f"] = self._cl_edit(
+            "**误差微分 D —— Kd_f [s]**（标准 PID 的 D 项，三个力控模式共用）：\n"
+            "    u = Kp·e + Ki·∫e + Kd·d e/dt\n"
+            "· e = 目标张力 − 实测张力 [N]，`de/dt` 先做一阶低通（α=0.3，τ≈30 ms）\n"
+            "· **0 = 关闭**（默认）。误差在减小时 `de/dt<0` → D 为负 → **自动刹车**，\n"
+            "  所以物理上它就是阻尼：抑制「到顶还在冲」的过冲。\n"
+            "· 参考起点：`Kd ≈ 0.05~0.1 × Kp/15`，即 Kp=15 → 0.05；Kp=25 → 0.08。\n"
+            "· 太大 → 对张力噪声敏感（曲线变毛、舵机嗡嗡）；先小步加，看超调是否单调下降。\n"
+            "· D 内部限幅 ±" + f"{D_TERM_MAX_FRAC:g}" + "×每拍限幅，填错量级也不会失控。"
+            + _PER_CABLE_NOTE,
+            text="0")
+        l1b = _row_grid()
+        _add(l1b, 0, "Kd_f", self.cl_edits["kd_f"])
+        _loop_v.addLayout(l1b)
         self._cl_loop_row_w.setVisible(False)
         cl.addWidget(self._cl_loop_row_w)
 
@@ -3607,6 +3782,36 @@ class ScopeWindow(QMainWindow):
         _add(t2, 2, "相位°", self.cl_edits["sine_phase"])
         self.cl_tension_sine_check.toggled.connect(self._on_tension_sine_toggled)
         t2.addWidget(self.cl_tension_sine_check, 0, 7, 1, 2)
+        # 2026-11-24：**自动调参**——一次起环跑完全部工况（阶跃 + 5 个正弦频率），
+        # 数据自动落盘成 run_data/sine/*.csv，事后离线算 PID 指标。
+        self.cl_auto_tune_check = QCheckBox("自动调参")
+        self.cl_auto_tune_check.setToolTip(
+            "🤖 自动调参序列（张力模式）：起环后自动跑完，无需手动改目标。\n"
+            + wrist_autotune.summary_text() + "\n"
+            "· 阶跃：1.5 → 5.5 N 保持 8 s，再 5.5 → 1.5 N 保持 8 s\n"
+            "· 正弦：A=4 N、基值 5 N（范围 1~9，**最低 1 N**）、"
+            "f=0.1/0.2/0.3/0.4/0.5 Hz\n"
+            "· 三缆给同一目标（共模）→ 三套 PID 在完全相同激励下比较\n"
+            "· 数据写 run_data/sine/，带 stage/kind 两列，便于分档分析\n"
+            "· 与「正弦跟随」互斥：勾这个就不用勾那个\n"
+            "· 全程受安全闸门保护（过载/传感器异常/病态位姿照常停环）")
+        self.cl_auto_tune_check.toggled.connect(self._on_auto_tune_toggled)
+        t2.addWidget(self.cl_auto_tune_check, 0, 9, 1, 2)
+        # 2026-11-25：**自动迭代轮数** —— 每轮跑 110 s，结束后自动按指标改增益并再跑，
+        # 直到轮数用完或指标收敛（每缆 kp 变化 <4%、itl <8%、kd <0.008）。
+        self.cl_edits["auto_rounds"] = self._cl_edit(
+            "🤖 自动调参**循环轮数**（1~6，默认 3）。\n"
+            "每轮 110 s（预紧 12s + 阶跃 2×8s + 正弦 5 档 82s），结束后\n"
+            "程序**自己**根据本轮指标改 kp/ki/i_term_lim/kd，然后立刻再跑一轮：\n"
+            "· 超调 >50% → 该缆 kp×0.80、kd+0.04\n"
+            "· 超调 30~50% → kp×0.88、kd+0.02\n"
+            "· 超调 <12% 且 0.3Hz 幅值比 <0.92 → kp×1.10\n"
+            "· 稳态差 >6% → i_term_lim×1.4（超 10% 再 ki×1.15）\n"
+            "· 收敛（kp<4%、itl<8%、kd<0.008 变化）→ 提前结束\n"
+            "⚠ 全程受安全闸门保护；随时按「停止闭环」即中止，数据已存。",
+            text="3")
+        t2.addWidget(QLabel("轮数"))
+        t2.addWidget(self.cl_edits["auto_rounds"])
         _ten_v.addLayout(t2)
         t3 = _row_grid()
         _add(t3, 0, "符号", self.cl_edits["sine_sign"])
@@ -3668,6 +3873,74 @@ class ScopeWindow(QMainWindow):
             edit = self._cl_edit(tooltip, text=default)
             self._c1_position_edits[key] = edit
             c1_grid.addWidget(edit, r, c * 2 + 1)
+        # 2026-11-26：混合模式的**测试开关**（与张力模式的正弦/自动调参相互独立，
+        # 因为两套模式的被控量和通道完全不同，共用一套开关会互相干扰）。
+        _mix_row = (len(_flat) + 2) // 3
+        self.cl_c1_sine_check = QCheckBox("混合正弦")
+        self.cl_c1_sine_check.setToolTip(
+            "同时给**两路**加正弦（各自参数独立，本模式专用）：\n"
+            "· C1 张力 = 「C1 目标 N」 + 符号·「C1 幅度N」·sin(2πft + «C1 相位°»)，f = «C1 频率Hz»\n"
+            "· ROLL/PITCH 角 = 目标角 + 「ROLL幅值°」/「PITCH幅值°」·sin(2πf₂t)，"
+            "f₂ = «角度Hz»（幅值填 0 就那轴不摇）\n"
+            "两路**共用同一个时间零点**，起点都是基值（不阶跃）。数据自动落盘 run_data/sine/。")
+        self.cl_c1_sine_check.toggled.connect(
+            lambda on: self._on_c1_test_toggled(on, self.cl_c1_auto_check))
+        self.cl_c1_auto_check = QCheckBox("混合自动调参")
+        self.cl_c1_auto_check.setToolTip(
+            "一次起环跑完整序列，并把每档数据落盘：\n" + hybrid_autotune.summary_text()
+            + "\n序列 = 保持 → C1 张力阶跃上/下 → C1 张力正弦扫频 → ROLL/PITCH 角度阶跃。\n"
+            "跑完按指标自动改「C1 Kp/Ki/积分上限/Kd」与「角度 Kp/Ki」，"
+            "共跑「调参轮数」轮（本模式专用）。")
+        self.cl_c1_auto_check.toggled.connect(
+            lambda on: self._on_c1_test_toggled(on, self.cl_c1_sine_check))
+        c1_grid.addWidget(self.cl_c1_sine_check, _mix_row, 0, 1, 2)
+        c1_grid.addWidget(self.cl_c1_auto_check, _mix_row, 2, 1, 2)
+        # 2026-11-26：混合模式**自己的**正弦/调参参数。
+        # 之前混合正弦读的是张力行的 `sine_amp/sine_hz/sine_phase/sine_sign`，
+        # 而那一行在混合模式下**整行隐藏** → 用户根本改不了（实机验证：
+        # 全部 isVisible()=False，跑的一直是看不见的 A=1N / f=0.5Hz）。
+        # 这里按"混合参数一律独立"的口径补齐，布局存档（`c1_position_params`）
+        # 会自动覆盖这些新键，不需要改存档逻辑。
+        _mix_sine = (
+            (
+                ("c1_sine_amp", "C1 幅度N", "3",
+                 "C1 张力正弦幅度 [N]。目标 = 「C1 目标 N」+ 符号·本值·sin(2πft)。"),
+                ("c1_sine_hz", "C1 频率Hz", "0.25", "C1 张力正弦频率 [Hz]，0.01~5。"),
+                ("c1_sine_phase", "C1 相位°", "0", "C1 张力正弦相位 [°]，−360~360。"),
+            ),
+            (
+                ("c1_sine_sign", "C1 符号", "1",
+                 "C1 正弦符号：+1（默认）或 −1。想让张力先降就先填 −1。"),
+                ("c1_auto_rounds", "调参轮数", "3",
+                 "混合自动调参最多跑几轮（1~6）。每轮跑完按指标改增益再重跑。"),
+                ("ang_sine_hz", "角度Hz", "0.2",
+                 "角度正弦频率 [Hz]。ROLL/PITCH 共用同一个频率。"),
+            ),
+            (
+                ("ang_sine_roll", "ROLL幅值°", "0",
+                 "ROLL 正弦幅值 [°]。**0 = 不摇 ROLL**。与 PITCH 各自独立，可只摇一个轴。"),
+                ("ang_sine_pitch", "PITCH幅值°", "0",
+                 "PITCH 正弦幅值 [°]。**0 = 不摇 PITCH**。"),
+            ),
+        )
+        _mix_sine_flat = [f for g in _mix_sine for f in g]
+        _sine_row0 = _mix_row + 1
+        for i, (key, label, default, tooltip) in enumerate(_mix_sine_flat):
+            r, c = divmod(i, 3)
+            lb = QLabel(label)
+            lb.setFixedWidth(76)
+            lb.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            c1_grid.addWidget(lb, _sine_row0 + r, c * 2)
+            edit = self._cl_edit(tooltip, text=default)
+            self._c1_position_edits[key] = edit
+            c1_grid.addWidget(edit, _sine_row0 + r, c * 2 + 1)
+        self._mix_sine_hint = QLabel(
+            "正弦：「混合正弦」勾上后，C1 张力按上面的幅度/频率/相位走；"
+            "ROLL/PITCH 幅值 >0 时角度也同时按「角度Hz」摆（可只摇一个轴）。"
+            "基值分别取「C1 目标 N」与两个目标角。")
+        self._mix_sine_hint.setObjectName("muted")
+        self._mix_sine_hint.setWordWrap(True)
+        c1_grid.addWidget(self._mix_sine_hint, _sine_row0 + len(_mix_sine), 0, 1, 6)
         self._cl_c1_position_row_w.setVisible(False)
         cl.addWidget(self._cl_c1_position_row_w)
 
@@ -3716,14 +3989,33 @@ class ScopeWindow(QMainWindow):
         # 边界行（三力控模式共用）：逐缆 f 界 + 张紧 t 界 + 双向力矩 τ 界。
         # 留空=0=不启用（t_min/t_max/τr/τp）；fmax 为力控 f_max 唯一来源
         # （观测台守卫框独立服务位置模式观测，互不干扰）。
+        # 2026-11-26：**fmin/fmax 单独一行，位置模式也显示**。
+        # 原因：位置模式每拍都跑 `_tension_guard`（张力过载 → 停环），阈值就是
+        # 这两个框；它们原来在「边界」行里、位置模式下整行隐藏 → 过载阈值改不了。
+        self._cl_flim_row_w = QWidget()
+        _fl_v = QHBoxLayout(self._cl_flim_row_w)
+        _fl_v.setContentsMargins(0, 0, 0, 0)
+        self._fl_v = _fl_v
+        self.cl_edits["f_min"] = self._cl_edit(
+            "逐缆张力下限 N（TDA 分配下界；松绳告警仍由观测台守卫负责）", text="0.5")
+        self.cl_edits["fmax_f"] = self._cl_edit(
+            "逐缆张力上限 N（**位置模式也用它做过载停环阈值**；唯一来源，"
+            "观测台守卫框只管观测）", text="30")
+        _fl = _row_grid()
+        _add(_fl, 0, "fmin", self.cl_edits["f_min"])
+        _add(_fl, 1, "fmax", self.cl_edits["fmax_f"])
+        _fl_hint = QLabel("张力界 —— 不只是力控用，**位置模式也靠它做过载停环**")
+        _fl_hint.setObjectName("muted")
+        _fl.addWidget(_fl_hint, 0, 2, 1, 5)
+        _fl_v.addLayout(_fl)
+        self._cl_flim_row_w.setVisible(False)
+        cl.addWidget(self._cl_flim_row_w)
+
+        # 边界行（2026-11-26 起只剩张紧/力矩相关，fmin/fmax 已移到上面那行）
         self._cl_bound_row_w = QWidget()
         _bd_v = QVBoxLayout(self._cl_bound_row_w)
         _bd_v.setContentsMargins(0, 0, 0, 0)
         _bd_v.setSpacing(6)
-        self.cl_edits["f_min"] = self._cl_edit(
-            "逐缆张力下限 N（TDA 分配下界；松绳告警仍由观测台守卫负责）", text="0.5")
-        self.cl_edits["fmax_f"] = self._cl_edit(
-            "逐缆张力上限 N（力控过载停环阈值，唯一来源；观测台守卫框只管观测）", text="30")
         self.cl_edits["t_min"] = self._cl_edit(
             "张紧 t 下限 N，低于则⚠预紧丢失（留空=不启用）", text="")
         self.cl_edits["t_max"] = self._cl_edit(
@@ -3743,18 +4035,14 @@ class ScopeWindow(QMainWindow):
             "⚠ 只翻力矩，不动角度链路（角度符号由 MODEL_AXIS_SIGN 固定）。",
             text="1")
         b1 = _row_grid()
-        _add(b1, 0, "fmin", self.cl_edits["f_min"])
-        _add(b1, 1, "fmax", self.cl_edits["fmax_f"])
-        _add(b1, 2, "tmin", self.cl_edits["t_min"])
+        _add(b1, 0, "tmin", self.cl_edits["t_min"])
+        _add(b1, 1, "tmax", self.cl_edits["t_max"])
         _bd_v.addLayout(b1)
         b2 = _row_grid()
-        _add(b2, 0, "tmax", self.cl_edits["t_max"])
-        _add(b2, 1, "τr上限", self.cl_edits["tau_r_max"])
-        _add(b2, 2, "τp上限", self.cl_edits["tau_p_max"])
+        _add(b2, 0, "τr上限", self.cl_edits["tau_r_max"])
+        _add(b2, 1, "τp上限", self.cl_edits["tau_p_max"])
+        _add(b2, 2, "τ方向", self.cl_edits["roll_tau_sign"])
         _bd_v.addLayout(b2)
-        b3 = _row_grid()
-        _add(b3, 0, "τ方向", self.cl_edits["roll_tau_sign"])
-        _bd_v.addLayout(b3)
         self._cl_bound_row_w.setVisible(False)
         cl.addWidget(self._cl_bound_row_w)
 
@@ -3775,6 +4063,13 @@ class ScopeWindow(QMainWindow):
         self.cl_status.setObjectName("muted")
         self.cl_status.setWordWrap(True)
         cl.addWidget(self.cl_status)
+        # 2026-11-26：构建完立刻按当前模式刷一次可见性。
+        # 否则「布局里没有 cl_mode」（首次启动/存档损坏）时，各行的初始可见状态
+        # 就停在构造时的默认值 —— 表现是"某个框该显示却不显示"（fmin 就踩过）。
+        try:
+            self._apply_cl_mode_visibility()
+        except Exception:
+            pass
         return box
 
     @staticmethod
@@ -3886,6 +4181,13 @@ class ScopeWindow(QMainWindow):
                      "tension_f1_tgt", "tension_f2_tgt", "tension_f3_tgt",
                      "force_tau_roll_tgt", "force_tau_pitch_tgt",
                      "force_tau_roll_meas", "force_tau_pitch_meas", "force_alpha",
+                     "force_trim_1", "force_trim_2", "force_trim_3"],
+        # 2026-11-26：混合模式专用预设 —— 位姿四线 + C1 张力（目标/实测）+ 三电机目标。
+        # 原来默认预设里**没有** pose_*，混合模式要看「角度目标 vs 实测」时
+        # 得自己去树里翻，很容易漏（用户实报：混控下看不到 ROLL/PITCH 曲线）。
+        "混合调试": ["pose_roll", "pose_roll_tgt", "pose_pitch", "pose_pitch_tgt",
+                     "tension_f1", "tension_f1_tgt",
+                     "m27_tgt", "m28_tgt", "m29_tgt",
                      "force_trim_1", "force_trim_2", "force_trim_3"],
         "全磁编raw": [f"enc_raw_{j}" for j in range(ENCODER_COUNT)],
         "M27-29遥测": [f"m{m}_{f}" for m in SERVO_TARGETS for f in ("temp", "volt", "load")],
@@ -5199,7 +5501,7 @@ class ScopeWindow(QMainWindow):
 
     # ---------- 张力链（ZNSV 变送器直连：观测台 = 唯一 UI，驱动直持串口） ----------
     def _toggle_tension_port(self) -> None:
-        """观测台「连接」：直连变送器并启动张力轮询（节奏由 TENSION_POLL_HZ=250 锚定）；已连则断开。
+        """观测台「连接」：直连变送器并按 TENSION_POLL_HZ 轮询；已连则断开。
 
         COM23 同一时刻只能被一个程序打开：连接失败「拒绝访问」时先关掉
         ZNSV Studio 独立实例（znsv_app/启动ZNSV上位机.cmd 或原工程）再试。
@@ -5216,21 +5518,41 @@ class ScopeWindow(QMainWindow):
         try:
             sensor.connect(port, baud)
         except Exception as exc:
+            safety_log("TENSION_LINK", port=port, baud=baud, state="open_failed", error=repr(exc))
             self.tension_status.setText(f"张力：连接失败（{exc}）")
             return
         self._tension_sensor = sensor
+        # 2026-11-25：波特率过低会**直接决定**张力更新率，必须说清楚。
+        # 一帧事务 = 45 字节 × 10 bit：
+        #   9600 → 46.9 ms/帧 ⟹ 最多 ~21 Hz（控制环 100 Hz 会 5 拍才拿到新值）
+        #   115200 → 3.9 ms ⟹ ~250 Hz； 600000 → 0.75 ms ⟹ 轮询上限由 FTDI 决定
+        try:
+            _b = int(baud)
+        except (TypeError, ValueError):
+            _b = 9600
+        if _b < 115200:
+            _hz = 1.0 / max(1e-6, (8 + 37) * 10.0 / _b + 0.001)
+            self.tension_status.setText(
+                f"⚠ {_b} 波特率太慢：一帧 45B 要 {(8+37)*10.0/_b*1000:.0f} ms "
+                f"→ 张力最多 ~{_hz:.0f} Hz（控制环 100 Hz 会拿旧值）"
+                f"；建议 rate_upgrade.py 升到 600000")
         self._tension_port_name = f"{port}@{baud}"
-        self._tension_poll_timer.setInterval(1)   # 起连先 1ms，之后由 _tension_poll 按需排程
-        self._tension_poll_timer.start()
+        # 2026-11-25：轮询交给独立线程（GUI-QTimer 方案实测只有 ~15 Hz）
+        self._tension_feed_count = 0
+        self._tension_arrivals.clear()
+        self._tension_thread = _TensionPollThread(self, sensor, port, baud)
+        self._tension_thread.finished.connect(self._tension_worker_finished)
+        self._refresh_cl_param_cache()  # 首帧就能读取 GUI 侧参数快照
+        self._tension_thread.start()
         self._tension_status_refresh()
 
     def _tension_poll(self) -> None:
-        """按需排程驱动 ZnsvTransmitter 状态机；新 8 通道帧 → _tension_feed。
+        """【已停用，保留仅作参考】旧 GUI-QTimer 轮询路径。
 
-        定时器不再固定 1kHz 空转（2026-11-03）：传输中保持 1ms 让字节及时读走，
-        空闲期按 driver.next_poll_delay() 精确排到下一个请求时隙。这样唤醒次数
-        约减半，采样率不变——实测把间隔直接拉到 2ms 会在 RTT>2ms 时把 250Hz
-        掉到 167Hz（完成检测被量化），见 tools/perf/probe_tension_poll_rate.py。
+        2026-11-25 起张力轮询改由 `_TensionPollThread` 独立线程执行：
+        裸串口实测 249.9 Hz，而这条 QTimer 路径在 GUI 里只有 ~15 Hz
+        （被 60 Hz 绘图 + 100 Hz CSV 写盘拖住）。本函数不再被启动，
+        留着是因为 `tools/perf/probe_tension_poll_rate.py` 复刻了这套排程逻辑。
         """
         sensor = self._tension_sensor
         if sensor is None:
@@ -5250,20 +5572,43 @@ class ScopeWindow(QMainWindow):
         self._tension_feed(raws)
 
     def _tension_disconnect(self, reason: str = "") -> None:
-        """停轮询、关串口、复位按钮与状态行。观测台未开时控件为 None，须防 AttributeError。"""
         self._tension_poll_timer.stop()
-        sensor, self._tension_sensor = self._tension_sensor, None
+        th = self._tension_thread
+        if th is not None:
+            th.stop_reason = reason or "手动断开"
+            th.link_status = "正在关闭串口"
+            th.stop()
+            if not th.wait(150):
+                self._tension_status_refresh()
+                return  # 驱动还在返回，保留所有者；finished 到达后完成断开
+        elif self._tension_sensor is not None:
+            self._tension_sensor.disconnect()
+        self._finish_tension_disconnect(reason)
+
+    def _tension_worker_finished(self) -> None:
+        th = self.sender()
+        if th is not None and th is self._tension_thread:
+            self._finish_tension_disconnect(th.stop_reason)
+
+    def _finish_tension_disconnect(self, reason: str) -> None:
+        th, self._tension_thread = self._tension_thread, None
+        if th is not None:
+            th.deleteLater()
+        self._tension_sensor = None
         if self.rt_window is not None:
             self.rt_window.estimate_panel.invalidate_reference()
         if self._cl_mode == "c1_position":
             self._tension_last = None
-        if sensor is not None:
-            sensor.disconnect()
+        safety_log("TENSION_LINK", port=self._tension_port_name, state="closed",
+                   reason=reason or "手动断开")
         if self.tension_btn is not None:
             self.tension_btn.setText("连接")
         if self.tension_status is not None:
             note = f"（{reason}）" if reason else ""
             self.tension_status.setText(f"张力：已断开{note}")
+        if getattr(self, "_close_after_tension", False):
+            self._close_after_tension = False
+            QTimer.singleShot(0, self.close)
 
     def _tension_feed(self, raws) -> None:
         """每帧回调：按当前通道映射 × 系数 → _on_tension_sample（守卫/τ/CSV 自动接上）；
@@ -5283,6 +5628,7 @@ class ScopeWindow(QMainWindow):
         self._tension_raws_last = tuple(raws)
         zero = self._tension_zero
         self._tension_feed_count += 1
+        self._tension_arrivals.append(time.perf_counter())
         dec = self._tension_feed_count % 5 == 0
         for i, (series, disp, v) in enumerate(zip(self._tension_hist,
                                                   self._tension_hist_disp, fvals)):
@@ -5390,15 +5736,24 @@ class ScopeWindow(QMainWindow):
         if s is None:
             self.tension_status.setText("张力：未连接")
             return
-        last = self._tension_last
-        age = f"{(time.monotonic() - last[0]) * 1000:.0f}ms" if last is not None else "—"
+        received = s.received_at  # 本次串口会话最近一帧，由驱动的 perf_counter 打戳
+        age_s = time.perf_counter() - received if received is not None else None
+        age = f"{age_s * 1000:.0f}ms" if age_s is not None else "—"
         temp = s.temp_c
         chs = "/".join(f"CH{c}" for c in self._tension_ch_map)
         extra = f"  ⚠{s.error}" if s.error else ""
-        write = (f"  写:{s.last_write[0]}→{s.last_write[1]}" if s.last_write else "")
+        last_write = s.last_write
+        write = f"  写:{last_write[0]}→{last_write[1]}" if last_write else ""
+        cutoff = time.perf_counter() - 1.0
+        rate = sum(t > cutoff for t in tuple(self._tension_arrivals))
+        rate_txt = f" 实收{rate}Hz"
+        thread = self._tension_thread
+        state = thread.link_status if thread is not None else ""
+        if age_s is not None and age_s >= 1.0 and not state:
+            state = "数据中断"
         self.tension_status.setText(
             f"张力：{self._tension_port_name} {chs}→C1/C2/C3"
-            f"  龄{age} 累计{s.sequence} 超时{s.timeouts} 错帧{s.protocol_errors}"
+            f"  {state} 龄{age}{rate_txt} 本次{s.sequence}帧 超时{s.timeouts} 错帧{s.protocol_errors}"
             + (f"  {temp:.1f}°C" if temp is not None else "") + write + extra)
 
     def _session_rel(self, now: float) -> float:
@@ -5443,9 +5798,8 @@ class ScopeWindow(QMainWindow):
             elif time.monotonic() - since >= 0.3:
                 self._force_recovery = False
                 self._recovery_ok_since = None
-                self._ctrl_status("🪢 恢复完成：三缆进界并稳定 300ms，"
-                                  "闭环继续持有预紧（手动停止请按停止闭环）",
-                                  log=False)
+                self._ui_call(self._ctrl_status, "🪢 恢复完成：三缆进界并稳定 300ms，"
+                              "闭环继续持有预紧（手动停止请按停止闭环）", log=False)
         else:
             self._recovery_ok_since = None
 
@@ -5800,6 +6154,20 @@ class ScopeWindow(QMainWindow):
         self.sweep_freq.setEnabled(sine)
         self.sweep_speed.setEnabled(not sine)
         self.sweep_amp_p.setEnabled(dual)
+        # 2026-11-26：右侧显示「当前生效的是哪个旋钮」。
+        # 起因：波形默认「三角波」时频率框被禁用、只保留上次的值（0.2），
+        # 看起来像"频率锁死改不了"。这里把它说破。
+        lbl = getattr(self, "sweep_active_label", None)
+        if lbl is not None:
+            try:
+                if sine:
+                    lbl.setText(f"生效：频率 {self.sweep_freq.value():g} Hz"
+                                + ("（双轴固定正弦）" if dual else ""))
+                else:
+                    lbl.setText(f"生效：速度 {self.sweep_speed.value():g} °/s"
+                                "  ← 想按频率走，把「波形」切到「正弦波」")
+            except (AttributeError, RuntimeError):
+                pass
 
     def _sweep_tick(self, dt: float | None = None) -> None:
         """20Hz：闭环运行且勾选扫掠时推进所选轴目标波形（±幅值内）。
@@ -5972,13 +6340,41 @@ class ScopeWindow(QMainWindow):
             self._tension_state.reset()
             self._force_trim = [0.0, 0.0, 0.0]
             self._tau_trim = [0.0, 0.0]        # 力矩修正积分：每轮从零起
+            # 阻抗 D 项：角速度基准与滤波状态每轮清零（否则首拍会拿上一轮残留
+            # 的角度算出一个巨大速度 → D 给反方向尖峰）
+            self._imp_rate.reset()
+            self._imp_omega = (0.0, 0.0)
+            self._imp_d_tau = (0.0, 0.0)
+            self._auto_t0_pc = None             # 自动调参：每轮从第 1 档起
+            self._auto_stage = -1
+            self._auto_kind = ""
             self._force_need_send = True   # 首拍把 base+0 发下去，先按住当前位置
             # 正弦跟随：起环就等于重新开始一次测试（相位归零 + 新记录文件）。
             # 必须放在这里：`_stop_closed_loop_now` 会关闭记录文件，若只在勾选时
             # 开文件，用户"先勾再启动"就会得到一个立刻被关掉的文件。
-            if (self.cl_tension_sine_check is not None
-                    and self.cl_tension_sine_check.isChecked()):
+            # 正弦 / 自动调参：起环 = 一次新测试（相位归零 + 新记录文件）。
+            # ⚠ 2026-11-25 现场事故：只勾了「自动调参」而**没有重新点勾选**
+            # （复选框保持在上次的状态），起环时这里只判了「正弦跟随」→
+            # 整轮 98 s 没有开记录文件，日志却报"数据已保存"。
+            # 现在两个开关任一为真都开文件。
+            _auto_on = (getattr(self, "cl_auto_tune_check", None) is not None
+                        and self.cl_auto_tune_check.isChecked())
+            _sine_on = (getattr(self, "cl_tension_sine_check", None) is not None
+                        and self.cl_tension_sine_check.isChecked())
+            # 2026-11-26：混合模式的测试开关也要在这里归零/开文件，
+            # 否则「先勾选再起环」时计时基准会带着上一轮的残留。
+            _mix_auto = (getattr(self, "cl_c1_auto_check", None) is not None
+                         and self.cl_c1_auto_check.isChecked())
+            _mix_sine = (getattr(self, "cl_c1_sine_check", None) is not None
+                         and self.cl_c1_sine_check.isChecked())
+            if _mix_auto:
+                self._auto_round = 0
+            if _sine_on or _auto_on or _mix_auto or _mix_sine:
                 self._sine_t0 = None
+                self._sine_t0_pc = None
+                self._auto_t0_pc = None
+                self._auto_stage = -1
+                self._auto_kind = ""
                 self._sine_log_open()
         # 本轮闭环实际驱动的电机快照（运行中改勾选会先停闭环，见 _on_cable_enable_toggled）
         motors = self._enabled_motors()
@@ -6183,6 +6579,42 @@ class ScopeWindow(QMainWindow):
         self._apply_cl_mode_visibility()
         self._save_layout()
 
+    # 混合模式必须看得到的四条位姿曲线（当前角 + 目标角 × 两轴）
+    HYBRID_CURVE_KEYS = ("pose_roll", "pose_roll_tgt",
+                         "pose_pitch", "pose_pitch_tgt")
+
+    def _ensure_hybrid_curves(self) -> None:
+        """进入混合模式时**自动勾上**四条位姿曲线（只加不减，幂等）。
+
+        为什么需要（2026-11-26 实报）：混合模式的核心是「C1 张力 + 双轴角度」，
+        没有角度曲线等于瞎调；但默认预设「腕部调试」里**不含** `pose_*`，
+        而通道树默认折叠 —— 现场表现就是"混控模式下看不到 ROLL/PITCH 曲线"。
+        实测确认：四条 `pose_*` 通道在混合模式下**一直在正常写入**，
+        纯粹是没勾选所以不画。
+
+        只加不减：不会清掉用户已经选的其它通道；已经勾上的不动。
+        """
+        channels = getattr(self, "channels", None)
+        if not channels:
+            return
+        added = []
+        for key in self.HYBRID_CURVE_KEYS:
+            ch = channels.get(key)
+            item = getattr(ch, "tree_item", None) if ch is not None else None
+            if item is None:
+                continue
+            if item.checkState(0) != Qt.Checked:
+                # 置勾会触发 itemChanged → `_on_tree_changed` 自动建曲线
+                item.setCheckState(0, Qt.Checked)
+                added.append(ch.name)
+        if added:
+            try:
+                self._ctrl_status("📈 混合模式：已自动勾选位姿曲线 —— "
+                                  + "、".join(added)
+                                  + "（不需要可在通道树里取消）", log=True)
+            except AttributeError:
+                pass
+
     def _apply_cl_mode_visibility(self) -> None:
         """分模式显示切换。力控三模式隐藏角度目标/参数/标定/手填行，
         各自显示专属参数行 + 共用 trim方向/限幅/fmin 行。
@@ -6222,11 +6654,28 @@ class ScopeWindow(QMainWindow):
         self._cl_tight_row_w.setVisible(self._cl_mode == "tight")
         self._cl_force_common_row_w.setVisible(force)
         self._cl_bound_row_w.setVisible(force)
+        # 2026-11-26：fmin/fmax 单独一行，**位置模式也显示** —— 位置模式每拍跑
+        # `_tension_guard`，过载停环阈值就是它们，之前藏在只有力控可见的边界行里。
+        flim_row = getattr(self, "_cl_flim_row_w", None)
+        if flim_row is not None:
+            flim_row.setVisible(not c1_position)
         if force or c1_position:
             self.sweep_check.setChecked(False)      # 扫掠是位置模式专属
             self.sweep_check.setEnabled(False)
         else:
             self.sweep_check.setEnabled(True)
+        # 2026-11-26：混合模式自动补上位姿曲线（进入该模式时调用，只加不减）
+        if c1_position:
+            try:
+                self._ensure_hybrid_curves()
+            except (AttributeError, RuntimeError):
+                pass
+        # 2026-11-26：切完模式也把子控件状态刷一遍（否则从力控切回来时，
+        # 「生效：…」那行会停在旧文字上，仍然让人以为频率锁死）
+        try:
+            self._sync_sweep_widgets()
+        except (AttributeError, RuntimeError):
+            pass
 
     # ---------- 位置环结构（2026-11-23 定案：绳长前馈 + PI，每拍限幅） ----------
     POS_LOOP_NAME = "PID+前馈"
@@ -6315,7 +6764,7 @@ class ScopeWindow(QMainWindow):
             （一键紧绳/力控/位置模式守卫共用这条单源）。镜像
             _tension_guard_saved 由 textChanged 实时写入、随布局落盘，正好补上。
             """
-            if widget is not None:
+            if widget is not None and self._in_gui_thread():
                 txt = widget.text().strip()
                 if txt:
                     return txt
@@ -6473,7 +6922,11 @@ class ScopeWindow(QMainWindow):
                 ki3=self._cl_fval3("ki_f", 20.0, 0.0, 10000.0),
                 max_step3=self._cl_fval3("max_step_f", 20.0, 0.1, 2000.0),
                 i_term_lim3=self._cl_fval3(
-                    "i_term_lim", float(self._tension_i_term_lim(mt)), 0.0, 1e6))
+                    "i_term_lim", float(self._tension_i_term_lim(mt)), 0.0, 1e6),
+                # 速度阻尼（2026-11-24）：与张力模式共用同一个 Kd_f 框
+                # 2026-11-25：`kd_f` = **误差微分 D**（标准 PID）
+                kd=self._cl_fval("kd_f", 0.0, 0.0, 5.0),
+                kd3=self._cl_fval3("kd_f", 0.0, 0.0, 5.0))
         except (ValueError, KeyError):
             return None
 
@@ -6519,7 +6972,9 @@ class ScopeWindow(QMainWindow):
             ms3 = self._cl_fval3("max_step_f", 20.0, 0.1, 2000.0)
             itl3 = self._cl_fval3(
                 "i_term_lim", float(self._tension_i_term_lim(mt)), 0.0, 1e6)
-            if kp3 is None or ki3 is None or ms3 is None or itl3 is None:
+            kd3 = self._cl_fval3("kd_f", 0.0, 0.0, 5.0)
+            if (kp3 is None or ki3 is None or ms3 is None or itl3 is None
+                    or kd3 is None):
                 return None
             return WristTensionParams(
                 f_target=(self._cl_fval("f1_tgt", 2.0, 0.0, 50.0),
@@ -6530,7 +6985,8 @@ class ScopeWindow(QMainWindow):
                 max_trim=mt,
                 f_max=self._force_fmax(),
                 deadband=0.05,
-                kp3=kp3, ki3=ki3, max_step3=ms3, i_term_lim3=itl3)
+                kp3=kp3, ki3=ki3, max_step3=ms3, i_term_lim3=itl3,
+                kd=kd3[0], kd3=kd3)
         except (ValueError, KeyError):
             return None
 
@@ -6619,6 +7075,15 @@ class ScopeWindow(QMainWindow):
             self._cl_fval("tau_ff_p", 0.0, -10.0, 10.0),
             roll, pitch)
 
+    def _imp_deadband(self) -> float:
+        """阻抗模式的角度死区 [deg]。
+
+        2026-11-26：优先用阻抗行自己的 `imp_deadband`；**留空则沿用位置模式的
+        `deadband`**（旧行为，逐位不变）。这样阻抗的死区不再被"藏在位置模式里"。
+        """
+        base = self._cl_fval("deadband", 0.3, 0.0, 10.0)
+        return self._cl_fval("imp_deadband", base, 0.0, 10.0)
+
     def _impedance_params(self, roll: float = 0.0, pitch: float = 0.0):
         """读阻抗行 → WristImpedanceParams | None（2026-11-22 框架）。
 
@@ -6635,7 +7100,7 @@ class ScopeWindow(QMainWindow):
                 tau_ff=tau_ff,
                 tau_r_max=self._cl_fval("tau_r_max", 0.0, 0.0, 100.0),
                 tau_p_max=self._cl_fval("tau_p_max", 0.0, 0.0, 100.0),
-                deadband_deg=self._cl_fval("deadband", 0.3, 0.0, 10.0),
+                deadband_deg=self._imp_deadband(),
             )
         except (ValueError, KeyError):
             return None
@@ -6653,8 +7118,19 @@ class ScopeWindow(QMainWindow):
             return
         roll_tgt = self._cl_fval("roll_tgt", 0.0, -90.0, 90.0)
         pitch_tgt = self._cl_fval("pitch_tgt", 0.0, -90.0, 90.0)
+        # 2026-11-25：**D 项原料** —— 编码器只给角度，这里差分出一阶低通后的
+        # 角速度（`RateFilter`）。`wrist_impedance_torque` 的入参约定是
+        # `q̇* − q̇`，目标速率恒 0 ⇒ 传 `−ω`；于是 D 项出来是"反抗运动"，
+        # 且**目标角阶跃不会产生微分 kick**（D 作用在测量上）。
+        w_roll, w_pitch = self._imp_rate.update(roll, pitch, time.perf_counter())
+        d_roll, d_pitch = -w_roll, -w_pitch
+        self._imp_omega = (w_roll, w_pitch)
+        # D 项这一拍实际贡献的力矩（deadband 对 D 无影响），供状态行拆分显示
+        _d2r = math.pi / 180.0
+        self._imp_d_tau = (ip.d_roll * d_roll * _d2r,
+                           ip.d_pitch * d_pitch * _d2r)
         tau_r, tau_p, fl = wrist_impedance_torque(
-            ip, roll, pitch, roll_tgt, pitch_tgt, 0.0, 0.0)
+            ip, roll, pitch, roll_tgt, pitch_tgt, d_roll, d_pitch)
         if fl & IMP_NO_TARGET:
             self._stop_closed_loop("阻抗控制：位置/目标含非有限值")
             return
@@ -6862,15 +7338,26 @@ class ScopeWindow(QMainWindow):
             if self._cl_tick_count % 30 == 0:      # 每 0.3 s 刷一次能力显示
                 cap_txt = "  " + self._capacity_note(
                     p.r_m, p.null_dir, p.preload_n, p.f_min, p.f_max)
+            # 阻抗模式（2026-11-25）：额外显示 D 项的两样东西 ——
+            #   ω   = 这一拍的角速度（D 项的输入，调 D 时看它是否合理）
+            #   D·ė = D 项实际贡献了多少力矩（对比 τ* 就知道 D 在不在起作用）
+            imp_txt = ""
+            head = "力矩控"
+            if self._cl_mode == "impedance":
+                head = "阻抗控"
+                _w = getattr(self, "_imp_omega", (0.0, 0.0))
+                _d = getattr(self, "_imp_d_tau", (0.0, 0.0))
+                imp_txt = (f"  ω=[{_w[0]:+.1f},{_w[1]:+.1f}]°/s"
+                           f"  D·ė=[{_d[0]:+.3f},{_d[1]:+.3f}]N·m")
             self._cl_status_set(
-                "力矩控  τ*=[%+.3f,%+.3f]→ατ*=[%+.3f,%+.3f]→实测[%+.3f,%+.3f]N·m"
-                "  α=%.3f  m_max=%.3f  t=%.2fN%s  f=[%s]N  trim=[%s]c%s%s%s"
+                head + "  τ*=[%+.3f,%+.3f]→ατ*=[%+.3f,%+.3f]→实测[%+.3f,%+.3f]N·m"
+                "  α=%.3f  m_max=%.3f  t=%.2fN%s  f=[%s]N  trim=[%s]c%s%s%s%s"
                 % (p.tau_d[0], p.tau_d[1], tau_tgt[0], tau_tgt[1],
                    tau_r, tau_p, alpha, m_max, t_used,
                    ("↑" if t_raised else ""),
                    "/".join(f"{v:.2f}" for v in fvals),
                    "/".join(f"{v:+.0f}" for v in self._force_trim),
-                   cap_txt, (f"  {tb}" if tb else ""), trim_txt))
+                   cap_txt, (f"  {tb}" if tb else ""), trim_txt, imp_txt))
 
     def _roll_tau_sign(self) -> float:
         """**力矩链专用的 roll 换号因子**（±1）—— 界面可翻转，2026-11-23。
@@ -7210,9 +7697,39 @@ class ScopeWindow(QMainWindow):
         last = self._force_tick_prelude(roll, pitch, "张力控制")
         if last is None:
             return
-        # 2026-11-24：正弦跟随测试 —— 把常数目标换成 `基值 + 符号·A·sin(2πft+φ)`
         sine_txt = ""
-        if (getattr(self, "cl_tension_sine_check", None) is not None
+        # 自愈（2026-11-25）：正在跑自动调参/正弦但没有记录文件 → 就地开一个，
+        # 避免"跑完 98 s 才发现没落盘"。
+        _want_log = ((getattr(self, "cl_auto_tune_check", None) is not None
+                      and self.cl_auto_tune_check.isChecked())
+                     or (getattr(self, "cl_tension_sine_check", None) is not None
+                         and self.cl_tension_sine_check.isChecked()))
+        if _want_log and getattr(self, "_sine_log_fp", None) is None:
+            self._sine_log_open()
+        # 2026-11-24：**自动调参**优先（与正弦互斥）。序列见 wrist_autotune。
+        if (getattr(self, "cl_auto_tune_check", None) is not None
+                and self.cl_auto_tune_check.isChecked()):
+            if self._auto_t0_pc is None:
+                self._auto_t0_pc = time.perf_counter()
+            t_auto = time.perf_counter() - self._auto_t0_pc
+            fmin_e, fmax_e, _ok = self._effective_flimits()
+            idx, name, kind, tgts, local = wrist_autotune.command_at(
+                t_auto, f_min=fmin_e, f_max=fmax_e)
+            if idx is None:
+                if self._auto_next_round(p):
+                    return
+                self._stop_closed_loop(
+                    f"🤖 自动调参完成（{wrist_autotune.stage_count()} 档 / "
+                    f"{wrist_autotune.total_seconds():g}s，共 "
+                    f"{getattr(self, '_auto_round', 0) + 1} 轮）—— 数据已保存")
+                return
+            p = self._retarget(p, tgts)
+            self._auto_stage = idx
+            self._auto_kind = kind
+            sine_txt = (f"  🤖{idx + 1}/{wrist_autotune.stage_count()} {name}"
+                        f" t={local:.1f}s → {tgts[0]:.2f}N")
+        # 手动正弦跟随（与自动调参互斥）
+        elif (getattr(self, "cl_tension_sine_check", None) is not None
                 and self.cl_tension_sine_check.isChecked()):
             f_sine, why = self._tension_sine_targets(p.f_target)
             if f_sine is None:
@@ -7235,7 +7752,10 @@ class ScopeWindow(QMainWindow):
             return
         # 正弦测试数据自动落盘（只在勾选时写；写失败自动关文件，不影响控制）
         if sine_txt and getattr(self, "_sine_log_fp", None) is not None:
-            self._sine_log_row(roll, pitch, p.f_target, last[1], self._force_trim)
+            self._sine_log_row(
+                roll, pitch, p.f_target, last[1], self._force_trim,
+                stage=getattr(self, "_auto_stage", -1),
+                kind=getattr(self, "_auto_kind", ""))
         if n % 6 == 0:
             tb = self._t_bound_note()
             self._cl_status_set(
@@ -7259,6 +7779,11 @@ class ScopeWindow(QMainWindow):
             os.makedirs(d, exist_ok=True)
             stamp = time.strftime("%Y%m%d_%H%M%S")
             path = os.path.join(d, f"sine_{stamp}.csv")
+            # 同一秒内连开两次（同一轮里勾选→起环）不能覆盖前一个文件
+            _n = 2
+            while os.path.exists(path):
+                path = os.path.join(d, f"sine_{stamp}_{_n}.csv")
+                _n += 1
             fp = io.open(path, "w", encoding="utf-8", newline="")
             amp = self._cl_fval("sine_amp", 1.0, 0.0, 100.0)
             hz = self._cl_fval("sine_hz", 0.5, 0.0, 20.0)
@@ -7266,22 +7791,70 @@ class ScopeWindow(QMainWindow):
             sg = (self.cl_edits["sine_sign"].text()
                   if self.cl_edits.get("sine_sign") is not None else "1,1,1")
             base = [self._cl_fval(f"f{i}_tgt", 2.0, 0.0, 50.0) for i in (1, 2, 3)]
+            # ---- 原文读取器（**必须用输入框原文**，不能用 `_cl_fval`）----
+            # 2026-11-24 教训：逐缆填 "18,30,24" 时 `_cl_fval(float)` 解析失败会
+            # 退回默认值 → 文件头把 kp 记成 15（实际 18/30/24）→ 事后分析误判。
+            def _raw(k):
+                try:
+                    return self.cl_edits[k].text().strip() or "-"
+                except (KeyError, AttributeError):
+                    return "?"
+
+            # 混合行（`_c1_position_edits`）的原文读取器：下面「混合正弦」与
+            # 「混合模式增益」两段都用它，**只定义一次**。
+            def _rawc(k, d="-"):
+                try:
+                    return self._c1_position_edits[k].text().strip() or d
+                except (KeyError, AttributeError):
+                    return "?"
             fp.write(f"# 正弦跟随测试 {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-            fp.write(f"# 幅度A={amp:g}N 频率f={hz:g}Hz 相位={ph:g}deg "
-                     f"符号={sg} 基值={base}\n")
-            fp.write(f"# kp_f={self._cl_fval('kp_f', 15.0, 0.0, 10000.0):g} "
-                     f"ki_f={self._cl_fval('ki_f', 20.0, 0.0, 10000.0):g} "
-                     f"i_term_lim={self._cl_fval('i_term_lim', 20.0, 0.0, 1e6):g} "
-                     f"max_step_f={self._cl_fval('max_step_f', 20.0, 0.1, 2000.0):g} "
-                     f"f_min={self._cl_fval('f_min', 0.3, 0.0, 200.0):g} "
-                     f"fmax_f={self._cl_fval('fmax_f', 30.0, 1.0, 200.0):g}\n")
+            if self._cl_mode == "c1_position":
+                # 目标角框留空时，运行时基值取的是**实测角度** —— 文件头据此写。
+                def _ang_base(k):
+                    try:
+                        return self._c1_position_edits[k].text().strip() or "实测"
+                    except (KeyError, AttributeError):
+                        return "?"
+                fp.write(f"# 混合正弦 C1幅度={_rawc('c1_sine_amp', '3')}N "
+                         f"C1频率={_rawc('c1_sine_hz', '0.25')}Hz "
+                         f"C1相位={_rawc('c1_sine_phase', '0')}deg "
+                         f"C1符号={_rawc('c1_sine_sign', '1')} "
+                         f"基值={_rawc('c1_pos_target', '5')}N | "
+                         f"角度频率={_rawc('ang_sine_hz', '0.2')}Hz "
+                         f"ROLL幅值={_rawc('ang_sine_roll', '0')}deg "
+                         f"PITCH幅值={_rawc('ang_sine_pitch', '0')}deg "
+                         f"角度基值=({_ang_base('roll_tgt')},"
+                         f"{_ang_base('pitch_tgt')})deg "
+                         f"调参轮数={_rawc('c1_auto_rounds', '3')}\n")
+            else:
+                fp.write(f"# 幅度A={amp:g}N 频率f={hz:g}Hz 相位={ph:g}deg "
+                         f"符号={sg} 基值={base}\n")
+            fp.write(f"# kp_f={_raw('kp_f')} ki_f={_raw('ki_f')} "
+                     f"i_term_lim={_raw('i_term_lim')} "
+                     f"max_step_f={_raw('max_step_f')} "
+                     f"f_min={_raw('f_min')} fmax_f={_raw('fmax_f')} "
+                     f"trim_sign={_raw('trim_sign')}\n")
+            # 2026-11-26：混合模式（C1 单路张力 + 双轴角度）单独记一段，
+            # 否则事后无法从文件头判断这组数据是哪套增益跑出来的。
+            if self._cl_mode == "c1_position":
+                fp.write(f"# 混合模式 C1目标={_rawc('c1_pos_target')}N "
+                         f"C1 Kp/Ki/Kd/积分上限="
+                         f"{_rawc('c1_pos_kp')}/{_rawc('c1_pos_ki')}/"
+                         f"{_rawc('c1_pos_kd')}/{_rawc('c1_pos_i_limit')} "
+                         f"C1步长={_rawc('c1_pos_step')} 行程={_rawc('c1_pos_travel')} "
+                         f"角度Kp/Ki/Kd/前馈={_rawc('pos_kp')}/{_rawc('pos_ki')}/"
+                         f"{_rawc('pos_kd')}/{_rawc('pos_ff')} "
+                         f"角度步长={_rawc('pos_step')} 死区={_rawc('pos_deadband')} "
+                         f"限幅={_rawc('pos_limit')}\n")
             fp.write("# 注意：t_s 从勾选时刻起算；tgt=目标张力[N]；f=实测张力[N]；"
                      "trim=本拍位置增量[counts]\n")
             fp.write("t_s,roll_deg,pitch_deg,"
                      "f1_tgt,f2_tgt,f3_tgt,f1,f2,f3,"
-                     "trim1,trim2,trim3\n")
+                     "trim1,trim2,trim3,stage,kind,"
+                     "roll_tgt_deg,pitch_tgt_deg,c1_tgt_n\n")
             self._sine_log_fp = fp
             self._sine_log_path = path
+            self._sine_t0_pc = time.perf_counter()
             self._sine_log_n = 0
             self._ctrl_status(
                 f"📄 正弦数据记录 → {path}",
@@ -7305,18 +7878,47 @@ class ScopeWindow(QMainWindow):
         self._sine_log_fp = None
 
     def _sine_log_row(self, roll: float, pitch: float, f_tgt, f_meas,
-                      trim) -> None:
-        """写一行（100 Hz，每 10 行 flush 一次；任何异常都不打断控制）。"""
+                      trim, stage: int = -1, kind: str = "",
+                      angle_tgt=None, c1_tgt=None) -> None:
+        """写一行（100 Hz，每 10 行 flush 一次；任何异常都不打断控制）。
+
+        `stage`/`kind`（2026-11-24 加）：自动调参时标出"第几档、阶跃还是正弦"，
+        离线分析靠它切段落；手动正弦时是 `-1`/`sine`。
+
+        `angle_tgt` / `c1_tgt`（2026-11-26 加，**只在末尾追加列**）：
+        混合模式要同时看「角度目标 vs 实测」和「C1 目标」，张力模式填 None
+        即写空值。追加在末尾是为了不破坏已有 CSV 的列序。
+        """
         fp = getattr(self, "_sine_log_fp", None)
         if fp is None:
             return
         try:
-            t = time.monotonic() - (self._sine_t0 or time.monotonic())
-            fp.write("%.4f,%.3f,%.3f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.1f,%.1f,%.1f\n"
+            # ⚠ 必须用 perf_counter：Windows 上 `time.monotonic()` 分辨率是
+            # **15.6 ms**（GetTickCount64），写出来的 t_s 会被量化成
+            # "15/16 ms 台阶 + 一堆 0 ms"，看起来像"控制频率低/连跑"，
+            # 实际是时钟分辨率伪影（2026-11-24 血泪教训：
+            #  `CL_RATE` 用 perf_counter 测出 hz=100 与 CSV 的"15 ms"矛盾，
+            #  才发现是日志时钟的问题）。
+            t = time.perf_counter() - (self._sine_t0_pc or time.perf_counter())
+
+            def _num(v):
+                if v is None:
+                    return ""
+                try:
+                    f = float(v)
+                except (TypeError, ValueError):
+                    return ""
+                return "%.4f" % f if math.isfinite(f) else ""
+
+            fp.write("%.4f,%.3f,%.3f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.1f,%.1f,%.1f,"
+                     "%d,%s,%s,%s,%s\n"
                      % (t, roll, pitch,
                         f_tgt[0], f_tgt[1], f_tgt[2],
                         f_meas[0], f_meas[1], f_meas[2],
-                        trim[0], trim[1], trim[2]))
+                        trim[0], trim[1], trim[2], int(stage), str(kind),
+                        _num(None if angle_tgt is None else angle_tgt[0]),
+                        _num(None if angle_tgt is None else angle_tgt[1]),
+                        _num(c1_tgt)))
             self._sine_log_n = getattr(self, "_sine_log_n", 0) + 1
             if self._sine_log_n % 10 == 0:
                 fp.flush()
@@ -7339,10 +7941,133 @@ class ScopeWindow(QMainWindow):
         new.f_target = [float(v) for v in f_target]
         return new
 
+    # ---------- 自动调参的**轮间迭代**（2026-11-25 用户要求）----------
+    def _auto_next_round(self, p) -> bool:
+        """一轮跑完后：算指标 → 改增益 → 决定是否再来一轮。
+
+        Returns:
+            True  = 已切换到下一轮（调用方直接 return，继续跑）
+            False = 结束（调用方去停环）
+        """
+        path = getattr(self, "_sine_log_path", None)
+        self._sine_log_close()
+        rnd = getattr(self, "_auto_round", 0)
+        try:
+            max_rounds = int(max(1.0, min(6.0, self._cl_fval(
+                "auto_rounds", 3.0, 1.0, 6.0))))
+        except (TypeError, ValueError):
+            max_rounds = 3
+        stages = []
+        try:
+            meta, data = wrist_autotune.read_csv(path) if path else (None, None)
+            if data:
+                stages = wrist_autotune.metrics(data)
+        except (OSError, ValueError):
+            stages = []
+        if not stages:
+            self._ctrl_status("⚠ 自动调参：本轮数据读不到 → 结束", log=True)
+            return False
+        cur = {
+            "kp": [float(x) for x in (p.kp3 or [p.kp] * 3)],
+            "ki": [float(x) for x in (p.ki3 or [p.ki] * 3)],
+            "itl": [float(x) for x in (p.i_term_lim3 or [p.i_term_lim] * 3)],
+            "kd": [float(x) for x in (p.kd3 or [p.kd] * 3)],
+        }
+        new, notes, conv = wrist_autotune.tune(
+            stages, cur, max_rounds_hit=(rnd + 1 >= max_rounds))
+        try:
+            self._safety("AUTOTUNE_ROUND", round=rnd + 1, max_rounds=max_rounds,
+                         converged=int(conv), kp=wrist_autotune.fmt(new["kp"]),
+                         ki=wrist_autotune.fmt(new["ki"]),
+                         itl=wrist_autotune.fmt(new["itl"]),
+                         kd=wrist_autotune.fmt(new["kd"]))
+        except Exception:
+            pass
+        for note in notes:
+            self._ctrl_status("🤖 " + note, log=True)
+        if conv:
+            self._ctrl_status("✅ 自动调参收敛（增益变化已小于阈值）", log=True)
+            return False
+        if rnd + 1 >= max_rounds:
+            self._ctrl_status(f"⏹ 自动调参用完 {max_rounds} 轮", log=True)
+            return False
+        # 把新增益写回界面（GUI 线程），等一拍让快照刷新，再开下一轮
+        self._ui_call(self._apply_autotune_gains, new)
+        self._force_state.reset()
+        self._tension_state.reset()
+        self._force_base = [self._motor_pos_now(m) for m in MOTOR_FOR_CABLE]
+        self._force_trim = [0.0, 0.0, 0.0]
+        self._auto_t0_pc = None
+        self._auto_stage = -1
+        self._auto_kind = ""
+        self._auto_round = rnd + 1
+        self._sine_log_open()
+        self._ctrl_status(
+            f"🔁 进入第 {self._auto_round + 1}/{max_rounds} 轮（增益已更新）",
+            log=True)
+        return True
+
+    def _apply_autotune_gains(self, g) -> None:
+        """把新增益写进输入框（**必须在 GUI 线程**，由 `_ui_call` 投递）。"""
+        try:
+            f = wrist_autotune.fmt
+            self.cl_edits["kp_f"].setText(f(g["kp"]))
+            self.cl_edits["ki_f"].setText(f(g["ki"]))
+            self.cl_edits["i_term_lim"].setText(f(g["itl"]))
+            self.cl_edits["kd_f"].setText(f(g["kd"]))
+            self._refresh_cl_param_cache()
+        except (KeyError, AttributeError):
+            pass
+
+    def _on_auto_tune_toggled(self, on: bool) -> None:
+        """自动调参开/关（2026-11-24）。与「正弦跟随」互斥。"""
+        self._auto_t0_pc = None
+        if on:
+            if self.cl_tension_sine_check.isChecked():
+                self.cl_tension_sine_check.setChecked(False)
+            self._sine_log_open()
+            self._ctrl_status("🤖 " + wrist_autotune.summary_text(), log=True)
+            self._ctrl_status(
+                "🤖 自动调参已开：起环后自动跑完 7 档；中途按「停止闭环」即中止并保存",
+                log=False)
+        else:
+            self._sine_log_close()
+            self._ctrl_status("⏹ 自动调参已关", log=False)
+
+    def _on_c1_test_toggled(self, on: bool, other) -> None:
+        """混合模式的「正弦 / 自动调参」开关（2026-11-26）。
+
+        两者互斥；也**不与张力模式的两个开关联动** —— 它们的被控量完全不同
+        （C1 单路 vs 三缆共模），共用一个开关会互相污染。
+        """
+        self._auto_t0_pc = None
+        self._auto_stage = -1
+        self._auto_kind = ""
+        if on:
+            self._sine_t0 = None            # 相位基准归零：从基值起，不跳变
+            try:
+                if other is not None and other.isChecked():
+                    other.setChecked(False)
+            except (AttributeError, RuntimeError):
+                pass
+            self._sine_log_open()           # 每次开启都换一份文件
+            is_auto = other is getattr(self, "cl_c1_sine_check", None)
+            self._ctrl_status(
+                ("🧪 混合自动调参已开：" + hybrid_autotune.summary_text()) if is_auto
+                else "🧪 混合正弦已开：C1 = 「C1 目标 N」+「C1 符号」·「C1 幅度N」"
+                     "·sin(2π·「C1 频率Hz」·t + 「C1 相位°」)；"
+                     "「ROLL幅值°/PITCH幅值°」>0 时角度也按「角度Hz」摆"
+                     "（参数都在本模式行里）", log=False)
+        else:
+            self._sine_log_close()
+
     def _on_tension_sine_toggled(self, on: bool) -> None:
         """正弦跟随开/关（2026-11-24）。重开时把相位基准归零 → 从 sin(0)=0 起，不跳变。"""
         self._sine_t0 = None if on else self._sine_t0
         if on:
+            if getattr(self, "cl_auto_tune_check", None) is not None \
+                    and self.cl_auto_tune_check.isChecked():
+                self.cl_auto_tune_check.setChecked(False)
             self._sine_log_open()          # 每次勾上都开新文件（频率改了就换一份）
             self._ctrl_status(
                 "🔁 正弦跟随已开：目标 = 基值 + 符号·A·sin(2πft+φ)"
@@ -7426,7 +8151,10 @@ class ScopeWindow(QMainWindow):
         tp = WristTensionParams(
             f_target=f_d, kp=p.kp, ki=p.ki, max_step=p.max_step,
             trim_sign=p.trim_sign, max_trim=p.max_trim, f_max=p.f_max,
-            deadband=p.deadband, i_term_lim=p.i_term_lim)
+            deadband=p.deadband, i_term_lim=p.i_term_lim,
+            # 2026-11-24：张紧复用张力环，D 项也要跟着带过来
+            kd=self._cl_fval("kd_f", 0.0, 0.0, 1.0),
+            kd3=self._cl_fval3("kd_f", 0.0, 0.0, 1.0))
         trim, flags = wrist_tension_step(tp, self._tension_state, last[1],
                                          age_ms, self._cl_dt)
         ok, tau, n = self._force_tick_apply("张紧控制", p, trim, flags, last,
@@ -7581,13 +8309,16 @@ class ScopeWindow(QMainWindow):
         """
         if not self._in_gui_thread():
             return
+        # 仅连接观测台时采集线程也会计算实测力矩；紧绳恢复判定还会读取边界。
+        if not self.cl_enabled or self._cl_mode == "c1_position":
+            self._cl_snap = {k: self.cl_edits[k].text()
+                             for k in ("roll_tau_sign", "f_min", "fmax_f")}
         if not self.cl_enabled:
             self._cl_param_cache = None
-            self._cl_snap = None
             self._c1_position_params = None
             return
         if self._cl_mode == "c1_position":
-            self._cl_snap = {"__record_on": self.cl_record_check.isChecked()}
+            self._cl_snap["__record_on"] = self.cl_record_check.isChecked()
             self._cl_param_cache = None
             self._c1_position_params = self._read_c1_position_params()
             return
@@ -7599,12 +8330,178 @@ class ScopeWindow(QMainWindow):
         self._cl_snap["__record_on"] = self.cl_record_check.isChecked()
         self._cl_param_cache = self._read_cl_params()
 
+    # ---------- 混合模式的测试激励（正弦 / 自动调参，2026-11-26）----------
+    # 为什么要单独一套：混合模式的被控量是「C1 单路张力 + 双轴角度」，与张力模式
+    # 的「三缆共模张力」完全不同 —— 共用一套开关会让两边的目标互相污染。
+    MIX_STAGE_MANUAL = -1
+    MIX_STAGE_DONE = -2
+
+    def _c1_fval(self, key: str, default: float) -> float:
+        """读「混合模式专用参数」某一框为 float（解析失败回默认）。"""
+        try:
+            return float(self._c1_position_edits[key].text().strip() or default)
+        except (KeyError, AttributeError, TypeError, ValueError):
+            return float(default)
+
+    def _c1_test_override(self, params):
+        """把「混合正弦 / 混合自动调参」的目标覆盖到 params 上。
+
+        Returns:
+            `(params2, stage, kind, note, done)`
+            · 都没开     → `(params, -1, "", "", False)`
+            · 序列跑完   → `(params, -2, "done", "", True)`（调用方决定下一轮/停环）
+        只改**目标**，不动增益（增益在轮末由 `_c1_auto_next_round` 写回界面）。
+        """
+        auto_on = (getattr(self, "cl_c1_auto_check", None) is not None
+                   and self.cl_c1_auto_check.isChecked())
+        sine_on = (getattr(self, "cl_c1_sine_check", None) is not None
+                   and self.cl_c1_sine_check.isChecked())
+        if not (auto_on or sine_on):
+            return params, self.MIX_STAGE_MANUAL, "", "", False
+        from dataclasses import replace as _rp
+
+        c1_min = max(0.0, self._c1_fval("c1_pos_min_n", 0.2))
+        c1_max = max(c1_min + 0.1, self._c1_fval("c1_pos_max_n", 25.0))
+        if auto_on:
+            if self._auto_t0_pc is None:
+                self._auto_t0_pc = time.perf_counter()
+            t_auto = time.perf_counter() - self._auto_t0_pc
+            idx, name, kind, c1_n, roll_t, pitch_t, local = hybrid_autotune.command_at(
+                t_auto, c1_base_n=params.c1.target_n,
+                roll_base_deg=params.roll_target_deg,
+                pitch_base_deg=params.pitch_target_deg,
+                c1_min=max(0.2, c1_min), c1_max=c1_max,
+                angle_limit_deg=self._c1_fval("pos_limit", 25.0))
+            if idx is None:
+                return params, self.MIX_STAGE_DONE, "done", "", True
+            self._auto_stage, self._auto_kind = idx, kind
+            note = (f"  🤖{idx + 1}/{hybrid_autotune.stage_count()} {name}"
+                    f" t={local:.1f}s C1={c1_n:.2f}N R={roll_t:+.1f}° P={pitch_t:+.1f}°")
+            p2 = _rp(params, roll_target_deg=roll_t, pitch_target_deg=pitch_t,
+                     c1=_rp(params.c1, target_n=c1_n))
+            return p2, idx, kind, note, False
+
+        # ---- 手动正弦：C1 张力 + 角度（两路参数全部来自混合行，2026-11-26）----
+        # 之前这里读的是张力行的 `sine_amp/sine_hz/...`，而那一行在混合模式下
+        # 整行隐藏 → 用户改不了。现在读混合行自己的 5 个框。
+        amp = self._c1_fval("c1_sine_amp", 3.0)
+        hz = self._c1_fval("c1_sine_hz", 0.25)
+        sg = self._c1_fval("c1_sine_sign", 1.0)
+        sg = 1.0 if sg >= 0.0 else -1.0
+        ph = self._c1_fval("c1_sine_phase", 0.0)
+        ang_hz = self._c1_fval("ang_sine_hz", 0.2)
+        amp_r = self._c1_fval("ang_sine_roll", 0.0)
+        amp_p = self._c1_fval("ang_sine_pitch", 0.0)
+        if self._sine_t0 is None:
+            self._sine_t0 = time.monotonic()
+        t = time.monotonic() - self._sine_t0
+        v = (params.c1.target_n + sg * amp
+             * math.sin(2.0 * math.pi * hz * t + math.radians(ph)))
+        v = max(max(0.0, c1_min), min(c1_max, v))
+        roll_t = params.roll_target_deg
+        pitch_t = params.pitch_target_deg
+        if amp_r > 0.0 or amp_p > 0.0:
+            s_a = math.sin(2.0 * math.pi * ang_hz * t)
+            lim_a = abs(self._c1_fval("pos_limit", 25.0))
+            roll_t = roll_t + amp_r * s_a
+            pitch_t = pitch_t + amp_p * s_a
+            roll_t = max(-lim_a, min(lim_a, roll_t))
+            pitch_t = max(-lim_a, min(lim_a, pitch_t))
+        ang_txt = (f" R±{amp_r:g}°/P±{amp_p:g}°@{ang_hz:g}Hz"
+                   if (amp_r > 0.0 or amp_p > 0.0) else "")
+        note = (f"  🔁C1 {amp:.2f}N@{hz:.3f}Hz{ang_txt} t={t:.1f}s"
+                f"→C1 {v:.2f}N")
+        p2 = _rp(params, c1=_rp(params.c1, target_n=v),
+                 roll_target_deg=roll_t, pitch_target_deg=pitch_t)
+        return (p2, self.MIX_STAGE_MANUAL, "sine", note, False)
+
+    def _apply_c1_autotune_gains(self, new) -> None:
+        """把混合自动调参算出的增益写回界面（GUI 线程调用）。"""
+        try:
+            c1, ang = new["c1"], new["ang"]
+            self._c1_position_edits["c1_pos_kp"].setText(hybrid_autotune.fmt([c1["kp"]]))
+            self._c1_position_edits["c1_pos_ki"].setText(hybrid_autotune.fmt([c1["ki"]]))
+            self._c1_position_edits["c1_pos_i_limit"].setText(
+                hybrid_autotune.fmt([c1["itl"]]))
+            self._c1_position_edits["c1_pos_kd"].setText(hybrid_autotune.fmt([c1["kd"]]))
+            self._c1_position_edits["pos_kp"].setText(hybrid_autotune.fmt([ang["kp"]]))
+            self._c1_position_edits["pos_ki"].setText(hybrid_autotune.fmt([ang["ki"]]))
+        except (KeyError, AttributeError, TypeError):
+            return
+        self._refresh_cl_param_cache()
+
+    def _c1_auto_next_round(self) -> bool:
+        """混合自动调参一轮结束：读 CSV → 算指标 → 出新增益 → 是否再来一轮。"""
+        path = getattr(self, "_sine_log_path", None)
+        self._sine_log_close()
+        rnd = getattr(self, "_auto_round", 0)
+        max_rounds = int(max(1.0, min(6.0, self._c1_fval("c1_auto_rounds", 3.0))))
+        rows = []
+        try:
+            _meta, data = wrist_autotune.read_csv(path) if path else (None, None)
+            if data:
+                rows = hybrid_autotune.metrics(data)
+        except (OSError, ValueError):
+            rows = []
+        if not rows:
+            self._ctrl_status("⚠ 混合自动调参：本轮数据读不到（stage 列缺失或太短）→ 结束",
+                              log=True)
+            return False
+        cur = {
+            "c1": {"kp": self._c1_fval("c1_pos_kp", 5.0),
+                   "ki": self._c1_fval("c1_pos_ki", 0.0),
+                   "itl": self._c1_fval("c1_pos_i_limit", 5.0),
+                   "kd": self._c1_fval("c1_pos_kd", 0.0)},
+            "ang": {"kp": self._c1_fval("pos_kp", 0.2),
+                    "ki": self._c1_fval("pos_ki", 0.0)},
+        }
+        new, notes, conv = hybrid_autotune.tune(
+            rows, cur, max_rounds_hit=(rnd + 1 >= max_rounds))
+        try:
+            self._safety("AUTOTUNE_ROUND", mode="c1_position", round=rnd + 1,
+                         max_rounds=max_rounds, converged=int(conv),
+                         c1_kp=new["c1"]["kp"], c1_ki=new["c1"]["ki"],
+                         c1_itl=new["c1"]["itl"], c1_kd=new["c1"]["kd"],
+                         ang_kp=new["ang"]["kp"], ang_ki=new["ang"]["ki"])
+        except Exception:
+            pass
+        for note in notes:
+            self._ctrl_status("🤖 " + note, log=True)
+        if conv:
+            self._ctrl_status("✅ 混合自动调参收敛（增益变化已小于阈值）", log=True)
+            return False
+        if rnd + 1 >= max_rounds:
+            self._ctrl_status(f"⏹ 混合自动调参用完 {max_rounds} 轮", log=True)
+            return False
+        self._ui_call(self._apply_c1_autotune_gains, new)
+        self._c1_position_state.reset()
+        self._c1_angle_state.reset()
+        self._auto_t0_pc = None
+        self._auto_stage = -1
+        self._auto_kind = ""
+        self._auto_round = rnd + 1
+        # 新一轮要重开记录文件（否则上一轮的 stage 会接在一起，指标串档）
+        self._sine_log_open()
+        self._ctrl_status(
+            f"🔁 混合自动调参进入第 {self._auto_round + 1}/{max_rounds} 轮（增益已更新）",
+            log=False)
+        return True
+
     def _cl_tick_c1_position(self, roll: float, pitch: float) -> None:
         params = (self._read_c1_position_params() if self._in_gui_thread()
                   else self._c1_position_params)
         calib = self.wrist_calib
         if params is None or calib is None:
             self._stop_closed_loop("混合模式：专用参数或标定无效")
+            return
+        # 2026-11-26：混合正弦 / 自动调参只覆盖**目标**（增益在轮末写回界面）
+        params, mix_stage, mix_kind, mix_note, mix_done = self._c1_test_override(params)
+        if mix_done:
+            if self._c1_auto_next_round():
+                return
+            self._stop_closed_loop(
+                f"🧪 混合自动调参完成（{hybrid_autotune.stage_count()} 档 / "
+                f"{hybrid_autotune.total_seconds():g}s）—— 数据已保存")
             return
         base, sample, reason = self._c1_position_feedback(params.c1.max_n)
         if reason is not None:
@@ -7664,6 +8561,18 @@ class ScopeWindow(QMainWindow):
             angles.k_ff, params.c1.ff_gain, flags,
             int(c1.step_limited), int(c1.travel_limited), int(pos_limited),
             (now - force_time) * 1000.0, int(bool(sent)), f2, f3))
+        # 2026-11-26：勾了「混合正弦 / 混合自动调参」时同步落盘（与张力模式
+        # 共用同一个 CSV 写入器；多了末尾三列 roll_tgt_deg/pitch_tgt_deg/c1_tgt_n）。
+        if mix_note and getattr(self, "_sine_log_fp", None) is not None:
+            self._sine_log_row(
+                roll, pitch,
+                (params.c1.target_n, math.nan, math.nan),   # 只有 f1 有目标
+                (f1, f2, f3),
+                [float(t - b) if t is not None else 0.0
+                 for t, b in zip(targets, base)],
+                stage=mix_stage, kind=mix_kind,
+                angle_tgt=(roll_target, pitch_target),
+                c1_tgt=params.c1.target_n)
         if self._cl_beat % 6 == 0:
             notes = []
             if c1.travel_limited:
@@ -7674,10 +8583,28 @@ class ScopeWindow(QMainWindow):
                 notes.append("C2/C3 步长限幅")
             notes.extend(name for bit, name in CL_FLAG_NAMES if flags & bit)
             suffix = f"  ⚠{'、'.join(notes)}" if notes else ""
+            # 2026-11-26：显示当前位姿下 C1 的「预紧份额」与耦合比 —— 决定
+            # 这一档 C1 张力能不能加得动而不拽姿态的关键数（见 coupling_ratios）。
+            coup_txt = ""
+            try:
+                _dr, _dp = self.wrist_calib.zero_offset_deg
+                _nd = positive_null_direction(
+                    math.radians(MODEL_AXIS_SIGN[0] * roll + _dr),
+                    math.radians(pitch_model_deg(pitch) + _dp),
+                    out_model=model)
+                _cp = coupling_ratios(_nd) if _nd is not None else None
+                if _cp is not None:
+                    _n1, _s2, _s3 = _cp
+                    coup_txt = (f"  C1预紧{_n1:.2f}"
+                                f"(+1N→C2{_s2:+.1f}/C3{_s3:+.1f}N)")
+                    if _n1 < 0.20:
+                        coup_txt += "⚠耦合重"
+            except Exception:
+                coup_txt = ""
             self._cl_status_set(
                 f"混合控制  C1 {f1:.2f}→{params.c1.target_n:.2f} N  "
                 f"ROLL {roll:+.2f}→{roll_target:+.2f}°  "
-                f"PITCH {pitch:+.2f}→{pitch_target:+.2f}°{suffix}")
+                f"PITCH {pitch:+.2f}→{pitch_target:+.2f}°{suffix}{coup_txt}{mix_note}")
 
     def _cl_tick(self) -> None:
         """100Hz：读 J16/J17 -> 控制律（wrist_control_law）-> M27-29。
@@ -8922,6 +9849,10 @@ class ScopeWindow(QMainWindow):
             close_session_log()
         except Exception:
             pass
+        if self._tension_thread is not None:
+            self._close_after_tension = True
+            event.ignore()
+            return
         super().closeEvent(event)
 
 

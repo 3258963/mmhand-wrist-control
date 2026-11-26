@@ -6,6 +6,62 @@ import math
 from wrist_control_law import WristControlParams
 
 
+def coupling_ratios(null_dir):
+    """C1 与 C2/C3 的**稳态耦合比**（2026-11-26）。
+
+    ## 从 P 矩阵直接推出来的
+
+    静力学：`τ = R·f`（R 为 2×3），内部预紧 `t = n̂ᵀf`，且
+    `P = [R; n̂ᵀ]`、`f = P⁻¹·[τ; t]`，满足 `R·P⁻¹ = [I₂ 0]`、`n̂ᵀP⁻¹ = [0 0 1]`。
+
+    对 `f = P⁻¹[τ;t]` 求「力矩不变、只改 t」的导数：
+
+        ∂f/∂t = P⁻¹ 的第 3 列
+
+    该列同时满足 `R·(∂f/∂t) = 0`（力矩不变）与 `n̂ᵀ(∂f/∂t) = 1`（t 变化 1）。
+    两条约束把方向锁死 ⟹ **∂f/∂t = n̂ / (n̂ᵀn̂)**，取 |n̂|=1 即 `∂f/∂t = n̂`。
+
+    于是「C1 每 +1 N，其余两缆跟着变多少」= 该方向对 f1 归一化：
+
+        s = n̂ / n̂[0]   ⟹   s2 = n̂[1]/n̂[0],  s3 = n̂[2]/n̂[0]
+
+    **不需要求逆**，也不需要 R：耦合比完全由零空间方向定。
+
+    `n̂[0]` 本身就是「C1 在预紧方向里的份额」：
+      · `n̂[0] → 1`：C1 几乎是纯预紧缆，加张力不产生力矩、不打扰 C2/C3（理想）；
+      · `n̂[0] → 0`：C1 几乎纯造力矩，加 1 N 会逼出 C2/C3 几 N（恶劣）。
+
+    Args:
+        null_dir: 全正零空间方向 `(n1, n2, n3)`（可未归一化）
+
+    Returns:
+        `(n1, s2, s3)`；`n1` 太小（C1 不含预紧分量）时返回 `None`。
+    """
+    try:
+        n1, n2, n3 = (float(null_dir[0]), float(null_dir[1]), float(null_dir[2]))
+    except (TypeError, ValueError, IndexError):
+        return None
+    if not all(math.isfinite(v) for v in (n1, n2, n3)):
+        return None
+    if abs(n1) < 1e-9:
+        return None
+    return n1, n2 / n1, n3 / n1
+
+
+def c1_share_of_preload(null_dir):
+    """C1 的预紧份额 `|n̂[0]| / |n̂|`（0~1，越大越"纯预紧"）。"""
+    c = coupling_ratios(null_dir)
+    if c is None:
+        return 0.0
+    try:
+        norm = math.sqrt(sum(float(v) ** 2 for v in null_dir[:3]))
+    except (TypeError, ValueError, IndexError):
+        return 0.0
+    if norm <= 0.0:
+        return 0.0
+    return abs(float(null_dir[0])) / norm
+
+
 @dataclass(frozen=True)
 class C1TensionParams:
     target_n: float
