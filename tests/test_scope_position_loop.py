@@ -15,6 +15,8 @@ import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import math
+
+from wrist_force_law import STALE_MS
 import time
 
 import pytest
@@ -334,7 +336,8 @@ def test_c1_position_angle_targets_control_only_c2_c3(c1_position, axis,
 
 
 @pytest.mark.parametrize(("sample_age", "c1", "reason"),
-                         [(1.0, 5.0, "过期"), (0.0, math.nan, "无效"), (0.0, 30.0, "过载")])
+                         [(STALE_MS / 1000.0 + 0.5, 5.0, "过期"),
+                          (0.0, math.nan, "无效"), (0.0, 30.0, "过载")])
 def test_c1_position_stops_before_sending_on_bad_tension(c1_position, monkeypatch,
                                                          sample_age, c1, reason):
     w, sent = c1_position
@@ -349,7 +352,7 @@ def test_c1_position_stops_before_sending_on_bad_tension(c1_position, monkeypatc
 
 def test_c1_position_rejects_stale_motor_feedback(c1_position, monkeypatch):
     w, sent = c1_position
-    w.channels["m28_abs"].buf.append(-1.0, 2100)
+    w.channels["m28_abs"].buf.append(-(STALE_MS / 1000.0 + 0.5), 2100)
     stopped = []
     monkeypatch.setattr(w, "_stop_closed_loop", stopped.append)
     w._cl_tick()

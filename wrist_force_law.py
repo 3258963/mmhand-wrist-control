@@ -55,7 +55,12 @@ FORCE_SENSOR_FAULT = 1 << 4    # 张力读数物理不可能（< −F_SENSOR_MIN
 F_SENSOR_MIN_N = -2.0
 FORCE_NO_NULL = 1 << 4      # 该位姿无全正零空间方向（张紧模式不可用）
 
-STALE_MS = 300.0
+# 2026-11-25 晚 用户定案：**1000 ms**（先前一度改到 100 ms）。
+# 语义：张力样本超过 1 s 才判"不可信"并冻结（电机保持）。
+# 放宽的理由：串口偶发超时/自动重连期间（50~500 ms）不要一抖就冻结；
+# 代价：最坏会用最多 1 s 的旧值继续下发 —— 张力环是增量式
+# （target = 实测 + step），旧值物理上仍连续，风险可控但确实变大。
+STALE_MS = 1000.0
 
 # ---------- 张力环的"力单位"常数（2026-11-11 用户实测 / 定案） ----------
 # 单位换换算链：k[counts/m] ÷ 1000 = counts/mm；1 count 的力变化 = K/counts_per_mm。
@@ -84,8 +89,79 @@ def tension_i_term_lim_counts(*_ignored) -> float:
     return TENSION_I_TERM_LIM_COUNTS if TENSION_I_TERM_LIM_ENABLED else 0.0
 
 
+# ---------- 速度阻尼（D 项，2026-11-24 用户要求） ----------
+# 为什么需要：张力内环的被控对象**不是纯积分器**——舵机对「位置领先量」的速度响应
+# 有约 75 ms 滞后（固件实测「领先 20c ≈ 267 c/s」，即 K ≈ 13.35 /s）。于是闭环是
+# 二阶，阻尼比 ζ = 1/(2√(S·kp))，Kp 越大越快也越振：
+#     kp=15 → ζ=0.60，过冲  8%，1 N 阶跃稳定 0.44 s
+#     kp=40 → ζ=0.37，过冲 25%，稳定 0.42 s   ← 加 Kp 已无收益，只有过冲
+# 加 D 之后（kp=40）：
+#     kd=0.07 s → ζ=0.71，过冲 2%，稳定 0.18 s  ← 又快又稳（唯一手段）
+# 设计式（取 ζ≈0.7）：kd = (2ζ·TAU·K·√(S·kp) − 1) / K
+#     kp=25 → kd≈0.02 s ; kp=40 → kd≈0.07 s ; kp=60 → kd≈0.10 s
+#
+# 原料：飞特舵机回传的 `Present Speed`（P4 已随遥测上传，上位机存 `m*_speed`，
+# 100 Hz）。不用编码器差分——舵机内部的速度估计更干净。
+#
+# ⚠ 单位：飞特 STS 系列多为 steps/s；若你的型号是 0.1 rpm，把下系数改成 6.83
+#        （1 rpm = 4096/60 counts/s ≈ 68.3，而 0.1rpm 单位下 10 = 1 rpm）。
+# ⚠ 符号：`Present Speed` 与「位置增大方向」是否同号 —— **必须按实机确认**。
+# 飞特 ST3215 的常规约定是「正 = Present Position 增大方向」（= +1）。
+# 若实测「点动 +counts 时速度读数却是负」，说明该台反相，把对应元素改成 -1。
+# **逐缆**给值 —— 三台舵机装反方向不一致时能分别改。
+#
+# 2026-11-24 变更史：先按实机确认改成 (-1,-1,-1)，用户随后要求**改回 +1**，
+# 故当前默认回到厂标约定。改这一项只影响 D 项（`Kd_f=0` 时完全无影响），
+# 但符号错了会变成正反馈放大 → 一定要用下面的方法实测确认：
+#     直控点动 M27 +1000 counts / 1 s，看 `M27 速度`：
+#        读到 ≈ +1000 → 保持 +1
+#        读到 ≈ −1000 → 改成 -1
+# D 项硬上限：|kd·v| ≤ 本系数 × max_step。单位猜错或转速突变时最多吃掉这么多权限，
+# 不会把输出整个顶反——"猜错单位也不失控"的保险。
+D_TERM_MAX_FRAC = 0.8
+
+
 def _finite(v) -> bool:
     return isinstance(v, (int, float)) and math.isfinite(v)
+
+
+def tension_d_err_counts(kd: float, e_now: float, e_prev: float,
+                         dt: float, max_step: float,
+                         d_filt_prev: float = 0.0,
+                         alpha: float = 0.3) -> tuple:
+    """**误差微分 D**（标准 PID 的 D 项，2026-11-25 用户要求）。
+
+        D_raw  = (e_k − e_{k−1}) / dt          # 误差的变化率 [N/s]
+        D_filt = α·D_raw + (1−α)·D_filt_prev   # 一阶低通，防张力噪声放大
+        D      = kd · D_filt                   # [counts]，与速度阻尼同量级
+
+    符号：调用方把它**加**到 `kp·e + ki·I` 上（标准 PID）。误差在减小
+    （接近目标）时 `ė<0` → D 为负 → 自动"刹车"，所以 `+` 就是阻尼。
+
+    为什么必须低通：`dt=10 ms`、张力有 ~0.01 N 量化噪声 ⟹ `ė` 噪声 ~1 N/s，
+    不滤波的 D 会把舵机抖成嗡嗡响。
+
+    Args:
+        kd: 微分增益 [s]（与 ė 相乘得 counts）；`0` = 关闭
+        e_now / e_prev: 本拍/上一拍误差 [N]
+        dt: 拍周期 [s]
+        max_step: 本拍限幅 [counts]（D 绝对值被 `D_TERM_MAX_FRAC·max_step` 夹住）
+        d_filt_prev: 上一拍滤波后的 ė（**滤波状态，调用方保存**）
+        alpha: 低通系数（0.3 → τ≈3 拍 ≈30 ms）
+
+    Returns:
+        `(d_counts, new_d_filt)`；非法输入/`kd≤0` → `(0.0, 0.0)`。
+    """
+    if not (_finite(kd) and _finite(e_now) and _finite(e_prev)
+            and _finite(dt) and _finite(max_step) and _finite(d_filt_prev)):
+        return 0.0, 0.0
+    if kd <= 0.0 or dt <= 0.0 or max_step <= 0.0:
+        return 0.0, 0.0
+    raw = (e_now - e_prev) / dt
+    a = min(1.0, max(0.0, alpha))
+    d_filt = a * raw + (1.0 - a) * d_filt_prev
+    lim = D_TERM_MAX_FRAC * max_step
+    return max(-lim, min(lim, kd * d_filt)), d_filt
 
 
 def _sample_prelude(f_n, age_ms: float, dt: float, f_max: float):
@@ -137,39 +213,26 @@ def _check_common(kp, ki, trim_sign, max_trim, max_step, f_max, deadband,
 
 def _incr_step(e_i: float, integ_i: float, resid_i: float,
                kp: float, ki: float, dt: float,
-               max_step: float, i_term_lim: float) -> tuple:
-    """增量式 PI 基元（三力控模式统一执行器，2026-11-02 用户定案）。
+               max_step: float, i_term_lim: float,
+               d_term: float = 0.0) -> tuple:
+    """增量式 PI 基元（三力控模式统一执行器）。
 
-        I    = clamp(∫e·dt, ±i_term_lim/ki)          # 状态本身钳住（2026-11-11）
-        du   = sat_{±max_step}( kp·e + ki·I )
-        step = round(resid + du)；resid -= step        # 小数残差进位
-    返回 (新integ, 新resid, 本拍整数步长)。
-    条件积分：未饱和（|raw|<max_step）或误差已反向（raw·e<0）才累加 ∫e。
+        I    = clamp(∫e·dt, ±i_term_lim/ki)          # 状态本身钳住
+        du   = sat_{±max_step}( kp·e + ki·I + d_term ) # d_term = 误差微分 D
+        step = round(resid + du)；resid -= step      # 小数残差进位
 
-    2026-11-11 变更：`i_term_lim` 改成"积分贡献"的硬上限（counts），
-    **状态 ∫e 也被钳到 i_term_lim/ki**——否则钳制只卡住贡献、状态仍在涨，
-    反向时要按状态的绝对值慢慢退，等于把"反向滞后"变成无界。
-    P 直接作用在 e 上（非 Δe）：ki=0 时恒速 kp·e 逼近目标，进死区才停。
+    `d_term` 由调用方算好（`tension_d_err_counts(kd, e, e_prev, dt, max_step, ...)`
+    —— 对**张力误差**微分并做一阶低通）。`d_term=0` 时与纯 PI 逐位一致。
 
-    2026-11-20：**两道上限都改成"每拍都夹"**（原来只在本拍要积分时才夹状态，
-    历史残留的 state 能一直撑着贡献上限）。两道都必要：
-      · `integ` 状态上限 = i_term_lim/ki（N·s）——防"状态越攒越多、反向退不完"
-      · `ki·∫e` 贡献上限 = i_term_lim（counts）——防"积分一家把输出顶满"
-
-    2026-11-20 二次变更（用户定案）：**取消条件积分闸门，允许一直累积**。
-    原来 `|raw| < max_step` 才积分，导致两个副作用：
-      · 闸门窗口 = max_step/kp，**改 max_step 会顺手改积分窗口**（max_step 340 时窗口 34 N，
-        等于全程积分；max_step 20 时窗口 1.3 N，松绳期恒不积分）；
-      · 松绳→接触的末段是否积分，取决于限幅值，行为不可预期。
-    现在一律累积、只用**一个可调上限**（i_term_lim）封顶：
-      · 填 0 ⟹ lim_state=0 ⟹ 状态恒 0 ⟹ 纯 P
-      · 饱和期积分会顶在上限（有界 windup），这是用户要的"只给一个累积上限"。
+    Returns:
+        (新integ, 新resid, 本拍整数步长)
     """
     lim_state = (i_term_lim / ki) if ki > 0.0 else 0.0
     if ki > 0.0:                               # 状态上限：每拍都夹，不看是否积分
         integ_i = max(-lim_state, min(lim_state, integ_i))
-    i_term = max(-i_term_lim, min(i_term_lim, ki * integ_i))   # 贡献上限
-    raw = kp * e_i + i_term
+    i_term = max(-i_term_lim, min(i_term_lim, ki * integ_i))
+    # `d_term`：**误差微分 D**（标准 PID，加成对比项）
+    raw = kp * e_i + i_term + (d_term if d_term else 0.0)
     du = max(-max_step, min(max_step, raw))
     if ki > 0.0:                               # 无条件累积（含饱和期），只受上限约束
         integ_i += e_i * dt
@@ -178,6 +241,7 @@ def _incr_step(e_i: float, integ_i: float, resid_i: float,
     step = int(round(resid_i))
     resid_i -= step
     return integ_i, resid_i, step
+
 
 
 def parse_per_cable(text, default, lo: float = 0.0, hi: float = 1e9,
@@ -356,7 +420,7 @@ class WristForceV2Params:
                  "kp_inner", "ki_inner", "trim_sign",
                  "max_trim", "max_step", "f_max", "f_min", "deadband",
                  "r_m", "null_dir", "i_term_lim",
-                 "kp3", "ki3", "max_step3", "i_term_lim3")
+                 "kp3", "ki3", "max_step3", "i_term_lim3", "kd", "kd3")
 
     def __init__(self, tau_d, preload_n: float,
                  kp: float, ki: float, trim_sign,
@@ -364,7 +428,7 @@ class WristForceV2Params:
                  deadband: float, r_m, null_dir, max_step: float = 5.0,
                  kp_inner: float = None, ki_inner: float = None,
                  i_term_lim: float = None, *, kp3=None, ki3=None,
-                 max_step3=None, i_term_lim3=None):
+                 max_step3=None, i_term_lim3=None, kd: float = 0.0, kd3=None):
         if (not isinstance(tau_d, (list, tuple)) or len(tau_d) != 2
                 or not all(_finite(v) for v in tau_d)):
             raise ValueError("tau_d 需为长度 2 的有限数组 [N·m]")
@@ -404,9 +468,15 @@ class WristForceV2Params:
         # 调用方给的 5.0 覆盖成 max_trim(5000)，等于钳制又没生效；现在
         # `_check_common` 直接吃解析好的 i_term_lim，这里只做赋值。
         self.i_term_lim = float(i_term_lim)
+        # 速度阻尼（2026-11-24）：kd [s]，0 = 关闭（默认，行为与旧版完全一致）
+        if not _finite(kd) or kd < 0.0:
+            raise ValueError("kd 需为非负有限数 [s]")
+        self.kd = float(kd)
         # 逐缆覆盖（2026-11-24）：与张力模式同一套"可填 1 个或 3 个"。
+        self.kd = float(kd) if _finite(kd) and kd >= 0.0 else 0.0
         for nm, v in (("kp3", kp3), ("ki3", ki3),
-                      ("max_step3", max_step3), ("i_term_lim3", i_term_lim3)):
+                      ("max_step3", max_step3), ("i_term_lim3", i_term_lim3),
+                      ("kd3", kd3)):
             if v is None:
                 setattr(self, nm, None)
                 continue
@@ -423,15 +493,20 @@ class IncrPiState:
     结构相同的类（字段名一个叫 integ、一个叫 integ_f），现已统一为一份；
     旧名保留为别名，现有调用点/测试不需要改。
     """
-    __slots__ = ("integ", "resid")
+    __slots__ = ("integ", "resid", "e_prev", "d_filt")
 
     def __init__(self) -> None:
         self.integ = [0.0, 0.0, 0.0]
         self.resid = [0.0, 0.0, 0.0]
+        # **误差微分 D**（2026-11-25 用户要求）：上一拍误差 + 一阶低通后的 ė
+        self.e_prev = [0.0, 0.0, 0.0]
+        self.d_filt = [0.0, 0.0, 0.0]
 
     def reset(self) -> None:
         self.integ = [0.0, 0.0, 0.0]
         self.resid = [0.0, 0.0, 0.0]
+        self.e_prev = [0.0, 0.0, 0.0]
+        self.d_filt = [0.0, 0.0, 0.0]
 
 
 # 兼容别名（scope 与测试按这些名字导入）
@@ -499,11 +574,17 @@ def wrist_force_v2_step(p: WristForceV2Params,
     trim = [0.0, 0.0, 0.0]
     for i in range(3):
         f_err = f_d[i] - f_n[i]
+        ms_i = _per_cable(p.max_step3, p.max_step, i)
+        # **误差微分 D**（标准 PID，2026-11-25）：D = Kd·dė/dt（一阶低通）
+        d_e, state.d_filt[i] = tension_d_err_counts(
+            _per_cable(p.kd3, p.kd, i), f_err, state.e_prev[i],
+            dt, ms_i, state.d_filt[i])
+        state.e_prev[i] = f_err
         state.integ[i], state.resid[i], step = _incr_step(
             f_err, state.integ[i], state.resid[i],
             _per_cable(p.kp3, p.kp_inner, i), _per_cable(p.ki3, p.ki_inner, i),
-            dt, _per_cable(p.max_step3, p.max_step, i),
-            _per_cable(p.i_term_lim3, p.i_term_lim, i))
+            dt, ms_i,
+            _per_cable(p.i_term_lim3, p.i_term_lim, i), d_e)
         trim[i] = p.trim_sign[i] * step
     return trim, FORCE_OK, alpha
 
@@ -529,12 +610,13 @@ class WristTensionParams:
 
     __slots__ = ("f_target", "kp", "ki", "trim_sign",
                  "max_trim", "max_step", "f_max", "deadband", "i_term_lim",
-                 "kp3", "ki3", "max_step3", "i_term_lim3")
+                 "kp3", "ki3", "max_step3", "i_term_lim3", "kd", "kd3")
 
     def __init__(self, f_target, kp: float, ki: float, trim_sign,
                  max_trim: float, f_max: float, deadband: float,
                  max_step: float = 5.0, i_term_lim: float = None, *,
-                 kp3=None, ki3=None, max_step3=None, i_term_lim3=None):
+                 kp3=None, ki3=None, max_step3=None, i_term_lim3=None,
+                 kd: float = 0.0, kd3=None):
         if (not isinstance(f_target, (list, tuple)) or len(f_target) != 3
                 or not all(_finite(v) and v >= 0.0 for v in f_target)):
             raise ValueError("f_target 需为长度 3 的非负有限数组 [N]")
@@ -551,9 +633,15 @@ class WristTensionParams:
         self.max_step = max_step
         self.deadband = deadband
         self.i_term_lim = i_term_lim
+        # 速度阻尼（2026-11-24）：kd [s]，0 = 关闭（默认，与旧版行为一致）
+        if not _finite(kd) or kd < 0.0:
+            raise ValueError("kd 需为非负有限数 [s]")
+        self.kd = float(kd)
         # 逐缆覆盖：长度必须 3 且非负有限；给了非法值直接拒绝（不静默忽略）
+        self.kd = float(kd) if _finite(kd) and kd >= 0.0 else 0.0
         for nm, v in (("kp3", kp3), ("ki3", ki3),
-                      ("max_step3", max_step3), ("i_term_lim3", i_term_lim3)):
+                      ("max_step3", max_step3), ("i_term_lim3", i_term_lim3),
+                      ("kd3", kd3)):
             if v is None:
                 setattr(self, nm, None)
                 continue
@@ -568,11 +656,20 @@ class WristTensionParams:
 
 def wrist_tension_cable_step(state: WristTensionState, cable: int, error_n: float,
                             *, kp: float, ki: float, dt: float, max_step: float,
-                            i_term_lim: float, deadband: float = 0.05) -> int:
-    """单缆张力 PI。调用方校验反馈并将收绳为正的步长转换为电机方向。"""
+                            i_term_lim: float, deadband: float = 0.05,
+                            kd: float = 0.0) -> int:
+    """单缆张力 PID。调用方校验反馈并将收绳为正的步长转换为电机方向。
+
+    `kd`（2026-11-25）：**误差微分 D**（标准 PID 的 D），内部按 `+kd·dė/dt` 加上。
+    `kd=0` = 纯 PI（旧行为）。
+    """
     error = 0.0 if abs(error_n) <= deadband else error_n
+    d_e, state.d_filt[cable] = tension_d_err_counts(
+        kd, error, state.e_prev[cable], dt, max_step, state.d_filt[cable])
+    state.e_prev[cable] = error
     state.integ[cable], state.resid[cable], step = _incr_step(
-        error, state.integ[cable], state.resid[cable], kp, ki, dt, max_step, i_term_lim)
+        error, state.integ[cable], state.resid[cable], kp, ki, dt, max_step,
+        i_term_lim, d_e)
     return step
 
 
@@ -582,11 +679,13 @@ def wrist_tension_step(p: WristTensionParams,
     """张力控制一拍：每缆独立 PI，**输出本拍位置增量（相对模式）**。
 
         I    = ∫e·dt（条件积分，饱和时冻结）
-        du   = Kp·e + Ki·I                           # 本拍要走多少 counts
+        du   = Kp·e + Ki·I + Kd·dė/dt               # 本拍要走多少 counts
         du   = clamp(du, ±max_step)                  # 每拍速度上限
         step = round(resid + du); resid -= step      # 小数残差进位
         trim = trim_sign · step
 
+    `Kd` 是**误差微分 D**（标准 PID，2026-11-25 定案）：误差减小时 dė/dt<0
+    → D 为负 → 自动刹车，所以 `+` 就是阻尼。速度阻尼那套已删除。
     调用方按 out = 实测当前位置 + trim 下发；max_trim 由调用方做
     “相对进入点的累计行程”夹紧。死区内 e 归零（不再走）。
     与标准增量式（Kp·Δe）不同：这里 P 直接作用在 e 上，所以 Ki=0 时
@@ -601,12 +700,14 @@ def wrist_tension_step(p: WristTensionParams,
         return None, flags
     trim = [0.0, 0.0, 0.0]
     for i in range(3):
+        ms_i = _per_cable(p.max_step3, p.max_step, i)
+        # 误差微分 D 在 `wrist_tension_cable_step` 里算（那里才有 f_err）
         step = wrist_tension_cable_step(
             state, i, p.f_target[i] - f_n[i],
             kp=_per_cable(p.kp3, p.kp, i), ki=_per_cable(p.ki3, p.ki, i),
-            dt=dt, max_step=_per_cable(p.max_step3, p.max_step, i),
+            dt=dt, max_step=ms_i,
             i_term_lim=_per_cable(p.i_term_lim3, p.i_term_lim, i),
-            deadband=p.deadband)
+            deadband=p.deadband, kd=_per_cable(p.kd3, p.kd, i))
         trim[i] = p.trim_sign[i] * step
     return trim, FORCE_OK
 

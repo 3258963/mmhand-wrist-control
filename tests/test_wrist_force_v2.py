@@ -2,7 +2,7 @@
 import math
 import pytest
 
-from wrist_force_law import (F_SENSOR_MIN_N, FORCE_OK, FORCE_OVERLOAD,
+from wrist_force_law import (STALE_MS, F_SENSOR_MIN_N, FORCE_OK, FORCE_OVERLOAD,
                               FORCE_SENSOR_FAULT, FORCE_STALE,
                               FORCE_TDA_INFEASIBLE,
                               WristForceV2Params, WristForceV2State,
@@ -166,7 +166,7 @@ class TestForceV2:
         f, _, _ = tda_solve(_R, _N, 0, 0, 5.0, 0.5, 30.0)
         wrist_force_v2_step(p, st, f, 10.0, 0.01, tda_solve)  # 预热
         integ_before = list(st.integ)
-        trim, flags, _alpha = wrist_force_v2_step(p, st, f, 350.0, 0.01, tda_solve)
+        trim, flags, _alpha = wrist_force_v2_step(p, st, f, STALE_MS + 50.0, 0.01, tda_solve)
         assert trim is None and flags == FORCE_STALE
         assert st.integ == integ_before          # 过期 → 内环积分也不动
 

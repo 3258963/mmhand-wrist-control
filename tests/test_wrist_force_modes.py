@@ -7,7 +7,7 @@
 import math
 import pytest
 
-from wrist_force_law import (FORCE_OK, FORCE_OVERLOAD, FORCE_STALE,
+from wrist_force_law import (FORCE_OK, FORCE_OVERLOAD, FORCE_STALE, STALE_MS,
                               WristTensionParams, WristTensionState,
                               WristTightParams,
                               wrist_tension_step)
@@ -79,7 +79,7 @@ class TestTensionMode:
     def test_stale_and_overload(self):
         p = WristTensionParams(**T_BASE)
         st = WristTensionState()
-        trim, fl = wrist_tension_step(p, st, (2.0, 2.0, 2.0), 350.0, 0.01)
+        trim, fl = wrist_tension_step(p, st, (2.0, 2.0, 2.0), STALE_MS + 50.0, 0.01)
         assert trim is None and fl == FORCE_STALE
         trim, fl = wrist_tension_step(p, st, (2.0, 2.0, 40.0), 10.0, 0.01)
         assert trim is None and fl == FORCE_OVERLOAD
