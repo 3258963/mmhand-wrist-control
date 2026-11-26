@@ -107,7 +107,14 @@ class ZnsvTransmitter:
         self.request_info = build_read(address, INFO_START, 4)
         self._clock = clock
         self._factory, self._port = serial_factory, None
-        self.timeout_s = 0.06   # 与张力面板一致：界面同线程轮询，放宽到 60 ms
+        # 超时随**波特率**自适应（2026-11-25）。
+        # 一帧事务 = 8B 请求 + 37B 回复 = 45B × 10 bit：
+        #   600000 → 0.75 ms ； 9600 → **46.9 ms**
+        # 现场 `0x001D` 若还是出厂 9600（波特率代码 3），固定 60 ms 超时只有
+        # 1.3 倍余量 → 稍一抖动就超时；固定 30 ms 更是必超。
+        # 这里按 `2×(TX+RX) + 20 ms` 给，9600 → 114 ms，600000 → 30 ms（下限）。
+        self.timeout_s = 0.06
+        self._recalc_timeout(600000)
         self._gap_s = 0.001     # 一次收发结束后的总线间隔（600000 波特率下 45B 事务仅 ~0.8ms，1ms 远大于 3.5 字符静默要求）
         self._writes = collections.deque(maxlen=64)
         self._clear()
@@ -133,26 +140,63 @@ class ZnsvTransmitter:
         self._next_send_at = 0.0
         self._tx_started = 0.0
 
+    def _recalc_timeout(self, baud: int) -> float:
+        """按波特率算合理超时（见 `__init__` 注释）。"""
+        try:
+            baud = int(baud)
+        except (TypeError, ValueError):
+            baud = 9600
+        if baud <= 0:
+            baud = 9600
+        per_byte_s = 10.0 / baud
+        frame_s = (8 + WEIGHT_FRAME_LEN) * per_byte_s      # 请求 + 回复
+        self.timeout_s = max(0.03, 2.0 * frame_s + 0.02)
+        return self.timeout_s
+
     def connect(self, port, baudrate=115200):
         self.disconnect()
         if self._factory is None:
             from serial import Serial
             self._factory = Serial
-        self._port = self._factory(port=port, baudrate=baudrate, timeout=0, write_timeout=0.02)
+        self._port = self._factory(port=port, baudrate=baudrate, timeout=0, write_timeout=0.1)
+        try:
+            # 打开时先放掉方向线（继承上一次状态会把总线占住）
+            self._port.rts = False
+            self._port.dtr = False
+        except Exception:
+            pass
+        # write_timeout 20 → 100 ms（2026-11-25）：电机一动，USB 调度延迟
+        # 轻松超过 20 ms，写超时会抛 SerialTimeoutException —— 旧代码把它当
+        # "串口异常" 直接退出轮询线程 → 张力永久断流 → 力控冻结（现场"卡死"）。
+        # 8 字节在 600000 下只需 0.13 ms，100 ms 只是容忍调度抖动，不影响时序。
+        # 超时按真实波特率重算（9600 → 114 ms，600000 → 30 ms）
+        self._recalc_timeout(baudrate)
+        self._dirty = True     # 新连接先冲一次缓冲
 
     @property
     def connected(self):
-        return self._port is not None and self._port.is_open
+        port = self._port
+        return port is not None and port.is_open
 
     def disconnect(self):
         port, self._port = self._port, None
+        # 2026-11-25：关端口前把 RTS/DTR 拉低（释放 485 方向线）。
+        # 现象：上位机断开后变送器"对所有程序都不回话"，要断电重启才恢复 ——
+        # 典型的适配器方向线被 last-open 状态卡在"发送"，把整条总线占住。
+        if port is not None:
+            try:
+                port.rts = False
+                port.dtr = False
+            except Exception:
+                pass
         self._clear()  # 新连接不能复用旧样本、零碎缓冲与写队列状态
         if port is not None:
             port.close()
 
     @property
     def temp_c(self):
-        return None if self.info is None else temperature_c(self.info[0])
+        info = self.info
+        return None if info is None else temperature_c(info[0])
 
     def submit_write(self, reg, value, label):
         """写命令排队，在两次重量读之间发送；不与读请求同帧竞争总线。"""
@@ -178,9 +222,10 @@ class ZnsvTransmitter:
         if not self.connected:
             return 0.02
         now = self._clock()
-        if self._phase is not None or self._writes:
+        if self._phase is not None:
             return 0.0
-        due = min(self._next_weights, self._next_info, self._next_send_at)
+        request_due = now if self._writes else min(self._next_weights, self._next_info)
+        due = max(request_due, self._next_send_at)
         return max(0.0, due - now)
 
     def poll(self):
@@ -202,8 +247,9 @@ class ZnsvTransmitter:
                 else:
                     return None
                 return None
-            self._buffer.extend(self._port.read(min(self._port.in_waiting,
-                                                    self._expected - len(self._buffer))))
+            waiting = self._port.in_waiting
+            if waiting:
+                self._buffer.extend(self._port.read(min(waiting, self._expected - len(self._buffer))))
             if len(self._buffer) >= 2 and self._buffer[1] & 0x80:
                 self._expected = 5  # 异常响应只有 5 字节
             if len(self._buffer) < self._expected:
@@ -211,6 +257,7 @@ class ZnsvTransmitter:
                     return None
                 self.error = f'变送器响应超时（收到 {len(self._buffer)}/{self._expected} 字节）'
                 self.timeouts += 1
+                self._dirty = True          # 缓冲里可能有半帧 → 下一轮先冲干净
                 self._end()
                 return None
             frame, phase = bytes(self._buffer), self._phase
@@ -227,6 +274,7 @@ class ZnsvTransmitter:
                     self.last_write = (phase[2], '已确认', now)
                     return None
             except ValueError as exc:
+                self._dirty = True  # 错位帧可能在串口缓冲区留有尾字节
                 self.error, self.protocol_errors = str(exc), self.protocol_errors + 1
                 if phase[0] == 'write':
                     self.last_write = (phase[2], f'失败：{exc}', now)
@@ -243,7 +291,13 @@ class ZnsvTransmitter:
 
     def _begin(self, packet, phase):
         self._tx_started = self._clock()  # 轮询节奏锚定请求起点：周期不被响应耗时拉长
-        self._port.reset_input_buffer()
+        # 2026-11-25：**不再每轮都 reset_input_buffer()**。
+        # 那是一次主动"扔缓冲"：FTDI 默认 latency 16 ms，37 字节回复可能还在
+        # 芯片缓冲里，下一轮的 reset 直接把它冲掉 → 丢帧 → 白等一个 timeout。
+        # 只在上一轮**不干净**（超时/错帧/写失败）时才清，正常路径不清。
+        if getattr(self, "_dirty", True):
+            self._port.reset_input_buffer()
+            self._dirty = False
         if self._port.write(packet) != len(packet):
             raise IOError('变送器请求未完整写入')
         self._buffer.clear()

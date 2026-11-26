@@ -153,6 +153,38 @@ def test_timeout_recovery():
     print('timeout recovery ok')
 
 
+def test_shifted_frame_discards_tail_before_next_request():
+    weights = (9,) * 8
+    valid = simulator(weights)
+    first = True
+
+    def respond(request):
+        nonlocal first
+        if first:
+            first = False
+            return b'\x00' + valid(request)
+        return valid(request)
+
+    sensor = ZnsvTransmitter(hz=200, serial_factory=lambda **kw: FakeSerial(respond),
+                             clock=FakeClock())
+    sensor.connect('FAKE', 600000)
+    assert drive(sensor) == weights
+    assert sensor.protocol_errors == 1 and sensor.timeouts == 0
+
+
+def test_idle_delay_respects_period_and_bus_silence():
+    now = 10.0
+    sensor = ZnsvTransmitter(hz=200, serial_factory=lambda **kw: FakeSerial(simulator((0,) * 8)),
+                             clock=lambda: now)
+    sensor.connect('FAKE', 600000)
+    sensor._next_weights = now + 0.005
+    sensor._next_info = now + 1.0
+    sensor._next_send_at = now + 0.001
+    assert abs(sensor.next_poll_delay() - 0.005) < 1e-9
+    sensor.submit_all_tare()
+    assert abs(sensor.next_poll_delay() - 0.001) < 1e-9
+
+
 def test_exception_response():
     def responder(request):
         payload = bytes((1, 0x83, 0x02))

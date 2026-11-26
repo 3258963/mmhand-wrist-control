@@ -291,6 +291,13 @@ def main():
     parser.add_argument('--comm-rate', type=int, default=1280)
     parser.add_argument('--seconds', type=float, default=3.0)
     parser.add_argument('--dry-run', action='store_true', help='只诊断，不写任何寄存器')
+    parser.add_argument('--ch', type=int, default=1,
+                        help='通道号 1..8（配合 --ch-filter / --dump-ch）')
+    parser.add_argument('--dump-ch', action='store_true',
+                        help='打印全部 8 路的 CH 参数（滤波深度/蠕变/动态跟踪/中值/刷新频次）')
+    parser.add_argument('--ch-filter', default='',
+                        help='写 CH 滤波：形如 "1,0,1" = 滤波深度,中值滤波,动态跟踪刷新频次；'
+                             '空 = 不改。⚠ 会改设备参数，务必先 --dry-run')
     args = parser.parse_args()
 
     print('帧构造/CRC 自检（对照说明书示例）：')
@@ -323,6 +330,39 @@ def main():
         params = tx.read_regs(_REG_CH1_PARAMS_START, _REG_CH1_PARAMS_COUNT)
         print(f'CH1 参数：滤波深度 {params[0]}  蠕变跟踪 {params[1]}  动态跟踪 {params[2]}'
               f'  中值滤波 {params[3]}  动态跟踪刷新频次 {params[4]}')
+
+        # ---- CH 滤波参数（2026-11-25 用户要求）----
+        # 寄存器 0x002D 起，每路 5 个：滤波深度/蠕变跟踪/动态跟踪/中值滤波/刷新频次。
+        # 这组滤波是"裸串口 250 Hz 收到帧、数值却 25~40 ms 才变"和 ~170 ms 死区的
+        # 主要嫌疑（见 docs 里的延时分析），所以给它一个可控入口。
+        _CH_STRIDE = 5
+        if args.dump_ch:
+            print('\n各路 CH 参数（滤波深度/蠕变/动态跟踪/中值/刷新频次）：')
+            for chn in range(1, 9):
+                try:
+                    pr = tx.read_regs(_REG_CH1_PARAMS_START + _CH_STRIDE * (chn - 1),
+                                      _REG_CH1_PARAMS_COUNT)
+                    print(f'  CH{chn}: {pr}')
+                except Exception as exc:
+                    print(f'  CH{chn}: 读失败 {exc!r}')
+        if args.ch_filter:
+            try:
+                _d, _m, _r = (int(v) for v in args.ch_filter.split(','))
+            except ValueError:
+                print(f'  --ch-filter 格式应为 "滤波深度,中值滤波,刷新频次"，收到 {args.ch_filter!r}')
+                return 1
+            base = _REG_CH1_PARAMS_START + _CH_STRIDE * (max(1, args.ch) - 1)
+            print(f'\nCH{args.ch} 滤波拟改为：滤波深度 {_d}、中值滤波 {_m}、'
+                  f'动态跟踪刷新频次 {_r}（地址 0x{base:04X}/0x{base+3:04X}/0x{base+4:04X}）')
+            if args.dry_run:
+                print('  --dry-run：不写')
+            else:
+                for off, val in ((0, _d), (3, _m), (4, _r)):
+                    tx.write_reg(base + off, val)
+                back = tx.read_regs(base, _REG_CH1_PARAMS_COUNT)
+                got = (back[0], back[3], back[4])
+                print(f'  已写入，读回确认 = {got}'
+                      + ('' if got == (_d, _m, _r) else '  ← 与目标不符！'))
 
         show_rtt(f'{found_baud} 波特率（VCP）单次往返', rtt_probe(tx))
 
