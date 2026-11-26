@@ -3259,7 +3259,7 @@ class ScopeWindow(QMainWindow):
             ("tight", "张紧控制（预紧度闭环）"),
             ("force", "力矩控制（τ 开环 → 张力闭环）"),
             ("impedance", "阻抗控制（位置→力矩，框架）"),
-            ("c1_position", "混合控制（C1 张力 + 双轴角度）"),
+            ("c1_position", "混合控制（复位绳张力 + 双轴角度）"),
         ):
             self.cl_mode_combo.addItem(label, mode)
         self.cl_mode_combo.setToolTip(
@@ -3272,7 +3272,7 @@ class ScopeWindow(QMainWindow):
             "  因为 τ 误差本身就是内环的响应，带 P 会和内环打架（2026-11-18 实测振荡）。\n"
             "  填 0 = 纯前馈；补不了 R 模型误差与导管摩擦。\n"
             "力控投入后腕停在当前位姿附近，手掰会顺从回力；角度目标被忽略。\n"
-            "混合控制：C1 张力闭环，C2/C3 用位置环控制 ROLL/PITCH；只需 C1 张力反馈。\n"
+            "混合控制：所选复位绳闭环控张力，另外两根绳闭环控 ROLL/PITCH。\n"
             "切换模式会先停止正在运行的闭环。")
         self.cl_mode_combo.currentIndexChanged.connect(self._on_cl_mode_changed)
         mode_row.addWidget(self.cl_mode_combo, 1)
@@ -3282,7 +3282,12 @@ class ScopeWindow(QMainWindow):
         self._tension_state = WristTensionState()   # 张力模式
         self._c1_position_state = C1TensionState()
         self._c1_angle_state = WristPidState()
+        self._hybrid_return_index = 0
         self._c1_position_params = None
+        # 混合模式：本拍**实际下发**的目标 (roll°, pitch°, C1 N)。
+        # 控制线程每拍写、GUI 60Hz 读 —— 用来画「目标曲线」和更新大字标签。
+        # 不用它的话，混控开正弦时屏幕上的目标线一动不动（2026-11-26 实报）。
+        self._c1_cmd_tgt = None
         # 2026-11-19：张紧已改为「逐缆绝对目标 f_d=t*·n̂ + 同一个张力环」，
         # 原来的 _tight_state（单标量 PI 的状态）不再使用，删掉。
         self._pos_pid_state = WristPidState()       # 位置环 PID 状态（两种结构共用）
@@ -3337,44 +3342,38 @@ class ScopeWindow(QMainWindow):
         r1.addLayout(_axis_chk, 0, 4, 1, 3)
         tgt_box.addLayout(r1)
 
-        # 行2：扫掠开关 + 轴 + 波形
+        # 行2：扫掠开关 + 轴 + 频率
+        # 2026-11-26 用户要求：**去掉三角波**，扫掠只剩正弦。
+        # 原来「三角波 / 正弦波」二选一且默认三角波，频率框因此被禁用，
+        # 反复被误当成"频率锁死改不了"。现在没有波形选择，频率永远生效。
         self.sweep_check = QCheckBox("扫掠")
         self.sweep_check.setToolTip(
-            "闭环运行中让目标按所选轴/波形自动摆动（目标框被自动改写）。\n"
-            "三角波=录标定（慢速直线往返）；正弦波=跟随/带宽测试；\n"
-            "双轴正弦=ROLL/PITCH 同时按各自幅值同相位摆。")
+            "闭环运行中让目标按所选轴自动摆**正弦**（目标框被自动改写）。\n"
+            "· 单轴：该轴目标 = 幅值·sin(2πft)\n"
+            "· 双轴正弦：ROLL/PITCH 同时按各自幅值同相位摆（中心见「过零对称」）\n"
+            "位置模式与**阻抗模式**都能用（阻抗的输入就是目标角 q*）。")
         self.sweep_check.toggled.connect(self._on_sweep_toggled)
         self.sweep_axis = QComboBox()
         self.sweep_axis.addItems(["ROLL", "PITCH", "双轴正弦"])
         self.sweep_axis.setMinimumWidth(92)
         self.sweep_axis.currentIndexChanged.connect(self._on_sweep_axis_changed)
-        self.sweep_wave_combo = QComboBox()
-        self.sweep_wave_combo.addItems(["三角波", "正弦波"])
-        self.sweep_wave_combo.setMinimumWidth(92)
-        self.sweep_wave_combo.setToolTip(
-            "三角波：线性往返，按「速度°/s」走——录标定数据用（慢到准）。\n"
-            "正弦波：按「频率 Hz」走——跟随/带宽测试。\n"
-            "（轴=「双轴正弦」时固定用正弦，本下拉失效）")
-        self.sweep_wave_combo.currentIndexChanged.connect(lambda _=0: self._sync_sweep_widgets())
-        r2 = _row_grid()
-        _add(r2, 0, "", self.sweep_check)
-        _add(r2, 1, "轴", self.sweep_axis)
-        _add(r2, 2, "波形", self.sweep_wave_combo)
-        tgt_box.addLayout(r2)
-
-        # 行3：扫掠频率 + 两轴幅值
         self.sweep_freq = QDoubleSpinBox()
-        self.sweep_freq.setRange(0.05, 2.0)
+        self.sweep_freq.setRange(0.01, 5.0)
         self.sweep_freq.setDecimals(2)
         self.sweep_freq.setValue(0.2)
         self.sweep_freq.setSuffix(" Hz")
         self.sweep_freq.setMinimumWidth(84)
         self.sweep_freq.setToolTip(
-            "**正弦频率**（Hz）。⚠ 只有「波形 = 正弦波」或「轴 = 双轴正弦」时才生效；\n"
-            "波形是「三角波」时本框是**禁用**的（灰掉，只保留上次的值），\n"
-            "此时生效的是下面那行的「速度 °/s」。\n"
+            "正弦频率 [Hz]，0.01~5。\n"
             "· 0.05~0.2 Hz 看低频跟随；\n"
             "· 0.5 Hz 以上逐步逼近带宽极限（幅度会缩、相位会滞后）。")
+        r2 = _row_grid()
+        _add(r2, 0, "", self.sweep_check)
+        _add(r2, 1, "轴", self.sweep_axis)
+        _add(r2, 2, "频率", self.sweep_freq)
+        tgt_box.addLayout(r2)
+
+        # 行3：两轴幅值 + 过零对称
         self.sweep_amp = QDoubleSpinBox()
         self.sweep_amp.setRange(0.5, 90.0)
         self.sweep_amp.setDecimals(1)
@@ -3382,8 +3381,8 @@ class ScopeWindow(QMainWindow):
         self.sweep_amp.setSuffix("°")
         self.sweep_amp.setMinimumWidth(76)
         self.sweep_amp.setToolTip(
-            "ROLL 幅值（峰）°：三角/正弦/双轴都用它。\n"
-            "超过「限幅°」时按限幅截断；峰值速度 = 幅值×2πf。")
+            "ROLL 幅值（峰）°：单轴/双轴都用它。\n"
+            "超过「限幅°」时按限幅截断；峰值角速度 = 幅值×2πf。")
         self.sweep_amp_p = QDoubleSpinBox()
         self.sweep_amp_p.setRange(0.5, 90.0)
         self.sweep_amp_p.setDecimals(1)
@@ -3393,31 +3392,6 @@ class ScopeWindow(QMainWindow):
         self.sweep_amp_p.setToolTip(
             "PITCH 幅值（峰）°：只在「双轴正弦」时用；\n"
             "两轴同相位：roll = 中心 + A_r·sin(2πft)，pitch = 中心 + A_p·sin(2πft)。")
-        r3 = _row_grid()
-        _add(r3, 0, "频率", self.sweep_freq)
-        _add(r3, 1, "幅值 ROLL", self.sweep_amp)
-        _add(r3, 2, "幅值 PITCH", self.sweep_amp_p)
-        # 2026-11-26：**哪个旋钮在生效**直接写出来。
-        # 起因：波形默认是「三角波」，此时频率框被禁用、只显示上次的值（0.2），
-        # 看起来像"频率锁死改不了"。这里动态显示当前生效的是频率还是速度，
-        # 并明说"改频率要先把波形切正弦"。
-        self.sweep_active_label = QLabel("")
-        self.sweep_active_label.setObjectName("muted")
-        self.sweep_active_label.setWordWrap(False)
-        r3.addWidget(self.sweep_active_label, 0, 6, 1, 4)
-        # 值一变就把「生效：…」刷新一下（只改文字，不回写数值，无递归）
-        self.sweep_freq.valueChanged.connect(lambda _=0: self._sync_sweep_widgets())
-        tgt_box.addLayout(r3)
-
-        # 行4：三角波速度 + 过零对称
-        self.sweep_speed = QDoubleSpinBox()
-        self.sweep_speed.setRange(0.1, 5.0)
-        self.sweep_speed.setDecimals(1)
-        self.sweep_speed.setValue(0.5)
-        self.sweep_speed.setSuffix("°/s")
-        self.sweep_speed.setMinimumWidth(80)
-        self.sweep_speed.setToolTip("三角波速度（正弦/双轴不用）：标定建议 0.2~0.5°/s（慢到准）")
-        self.sweep_speed.valueChanged.connect(lambda _=0: self._sync_sweep_widgets())
         # 2026-11-23 用户要求：现在扫掠大多只在正半轴（中心偏正），要能跑到正负。
         # 勾「过零」后双轴正弦的中心强制 (0,0)，目标 = ±幅值·sin。
         self.sweep_center0 = QCheckBox("过零对称")
@@ -3426,14 +3400,21 @@ class ScopeWindow(QMainWindow):
             "双轴正弦专用：勾上后中心强制为 (0,0)，目标在 ±幅值 之间往返（正负都到）。\n"
             "取消则用两个目标框里的值当中心（可做偏置扫掠，如中心 +5°）。")
         self.sweep_center0.toggled.connect(lambda _=False: self._sweep_seed())
-        r4 = _row_grid()
-        _add(r4, 0, "三角速度", self.sweep_speed)
-        _add(r4, 1, "", self.sweep_center0)
-        tgt_box.addLayout(r4)
+        r3 = _row_grid()
+        _add(r3, 0, "幅值 ROLL", self.sweep_amp)
+        _add(r3, 1, "幅值 PITCH", self.sweep_amp_p)
+        _add(r3, 2, "", self.sweep_center0)
+        # 右侧「生效：…」实时提示（去掉波形选择后仍保留，方便一眼确认参数）
+        self.sweep_active_label = QLabel("")
+        self.sweep_active_label.setObjectName("muted")
+        self.sweep_active_label.setWordWrap(False)
+        r3.addWidget(self.sweep_active_label, 0, 6, 1, 4)
+        self.sweep_freq.valueChanged.connect(lambda _=0: self._sync_sweep_widgets())
+        self.sweep_amp.valueChanged.connect(lambda _=0: self._sync_sweep_widgets())
+        self.sweep_amp_p.valueChanged.connect(lambda _=0: self._sync_sweep_widgets())
+        tgt_box.addLayout(r3)
         cl.addWidget(self._cl_tgt_row_w)
         self._sync_sweep_widgets()
-        self._sweep_val = 0.0
-        self._sweep_dir = 1.0
         self._sweep_phase = 0.0     # 正弦相位（勾选时刻起算）
         self._sweep_center = (0.0, 0.0)   # 双轴正弦的中心（勾选时的目标框）
         self._sweep_timer = QTimer(self)
@@ -3819,128 +3800,137 @@ class ScopeWindow(QMainWindow):
         self._cl_tension_row_w.setVisible(False)
         cl.addWidget(self._cl_tension_row_w)
 
-        self._cl_c1_position_row_w = QGroupBox("混合模式专用参数")
+        self._cl_c1_position_row_w = QWidget()
+        hybrid_layout = QVBoxLayout(self._cl_c1_position_row_w)
+        hybrid_layout.setContentsMargins(0, 0, 0, 0)
+        hybrid_layout.setSpacing(8)
         self._c1_position_edits = {}
-        c1_grid = QGridLayout(self._cl_c1_position_row_w)
-        c1_grid.setContentsMargins(10, 10, 10, 10)
-        c1_grid.setHorizontalSpacing(10)
-        c1_grid.setVerticalSpacing(6)
-        # 3 组/行 + 固定列宽（标签 76 / 输入 96）：与上面各模式行同一套对齐规则。
-        # 原来是 4 组/行且标签被拉伸 → 标签贴左、输入框贴右，中间一条大缝。
-        for _c in range(3):
-            c1_grid.setColumnMinimumWidth(2 * _c, 76)
-            c1_grid.setColumnMinimumWidth(2 * _c + 1, 96)
-            c1_grid.setColumnStretch(2 * _c + 1, 0)
-        c1_grid.setColumnStretch(6, 1)
-        rows = (
-            (
-                ("roll_tgt", "Roll 目标 °", "", "留空启动时用该轴实测角度。"),
-                ("pitch_tgt", "Pitch 目标 °", "", "留空启动时用该轴实测角度。"),
-                ("c1_pos_target", "C1 目标 N", "5", "C1 张力目标，单位 N。"),
-                ("c1_pos_max_n", "C1 上限 N", "25", "C1 实测张力达到上限时停环。"),
-            ),
-            (
-                ("pos_kp", "角度 Kp", "0.2", "Roll 和 Pitch 共用比例增益，各轴分别计算误差。"),
-                ("pos_ki", "角度 Ki", "0", "角度积分增益，单位 1/s。"),
-                ("pos_kd", "角度 Kd", "0", "角度微分增益，单位 s。"),
-                ("pos_ff", "角度前馈", "0", "C2/C3 绳长前馈系数 0~1，填 0 关闭。"),
-            ),
-            (
-                ("c1_pos_kp", "C1 Kp", "5", "C1 张力比例增益，单位 counts/N。"),
-                ("c1_pos_ki", "C1 Ki", "0", "C1 张力积分增益，单位 counts/(N·s)。"),
-                ("c1_pos_kd", "C1 Kd", "0", "C1 张力反馈微分增益，单位 counts·s/N。"),
-                ("c1_pos_ff", "C1 前馈", "0", "按磁编实测姿态的绳路变化补偿，系数 0~1，填 0 关闭。"),
-            ),
-            (
-                ("pos_step", "C2/C3 步长", "5", "C2/C3 距当前实测位置的单拍增量上限，单位 counts。"),
-                ("c1_pos_step", "C1 步长", "5", "C1 距当前实测位置的单拍增量上限，单位 counts。"),
-                ("c1_pos_travel", "C1 行程 ±c", "3000", "C1 相对启动实测位置的行程，单位 counts。"),
-                ("c1_pos_i_limit", "C1 积分上限", "5", "C1 积分项最大贡献，单位 counts。"),
-            ),
-            (
-                ("pos_deadband", "角度死区 °", "0.3", "混合模式角度误差死区。"),
-                ("pos_limit", "目标限幅 °", "25", "混合模式两轴目标角限幅。"),
-                ("c1_pos_min_n", "C1下限N", "0.2", "用于校验 C1 张力目标。"),
-            ),
-        )
-        _flat = [field for group in rows for field in group]
-        for i, (key, label, default, tooltip) in enumerate(_flat):
-            r, c = divmod(i, 3)
-            lb = QLabel(label)
-            lb.setFixedWidth(76)
-            lb.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            c1_grid.addWidget(lb, r, c * 2)
-            edit = self._cl_edit(tooltip, text=default)
-            self._c1_position_edits[key] = edit
-            c1_grid.addWidget(edit, r, c * 2 + 1)
-        # 2026-11-26：混合模式的**测试开关**（与张力模式的正弦/自动调参相互独立，
-        # 因为两套模式的被控量和通道完全不同，共用一套开关会互相干扰）。
-        _mix_row = (len(_flat) + 2) // 3
+        self._hybrid_tension_labels = {}
+
+        return_group = QGroupBox("复位绳张力控制")
+        angle_group = QGroupBox("角度绳位置控制")
+        sine_group = QGroupBox("混合正弦设置")
+        return_grid = QGridLayout(return_group)
+        angle_grid = QGridLayout(angle_group)
+        sine_grid = QGridLayout(sine_group)
+        for group, grid in ((return_group, return_grid), (angle_group, angle_grid),
+                            (sine_group, sine_grid)):
+            grid.setContentsMargins(10, 10, 10, 10)
+            grid.setHorizontalSpacing(10)
+            grid.setVerticalSpacing(6)
+            for column in range(3):
+                grid.setColumnMinimumWidth(2 * column, 76)
+                grid.setColumnMinimumWidth(2 * column + 1, 96)
+            grid.setColumnStretch(6, 1)
+            hybrid_layout.addWidget(group)
+
+        def _add_hybrid_fields(grid, fields, offset=0):
+            for i, (key, label, default, tooltip) in enumerate(fields, offset):
+                row, column = divmod(i, 3)
+                lb = QLabel(label)
+                lb.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                grid.addWidget(lb, row, 2 * column)
+                edit = self._cl_edit(tooltip, text=default)
+                self._c1_position_edits[key] = edit
+                grid.addWidget(edit, row, 2 * column + 1)
+                if key.startswith("c1_pos_"):
+                    self._hybrid_tension_labels[key] = (lb, label)
+            return (offset + len(fields) + 2) // 3
+
+        self.cl_return_cable_combo = QComboBox()
+        for i, motor in enumerate(MOTOR_FOR_CABLE, 1):
+            self.cl_return_cable_combo.addItem(f"C{i} / M{motor}")
+        self.cl_return_cable_combo.setToolTip("停环后选择复位绳。张力反馈取观测台映射到该绳的实测通道。")
+        self.cl_return_cable_combo.currentIndexChanged.connect(self._on_hybrid_return_changed)
+        return_grid.addWidget(QLabel("复位绳"), 0, 0, Qt.AlignRight)
+        return_grid.addWidget(self.cl_return_cable_combo, 0, 1)
+        _add_hybrid_fields(return_grid, (
+            ("c1_pos_target", "C1 目标 N", "5", "复位绳张力目标，单位 N。"),
+            ("c1_pos_max_n", "C1 上限 N", "25", "复位绳实测张力达到上限时停环。"),
+            ("c1_pos_kp", "C1 Kp", "5", "复位绳张力比例增益，单位 counts/N。"),
+            ("c1_pos_ki", "C1 Ki", "0", "复位绳张力积分增益，单位 counts/(N·s)。"),
+            ("c1_pos_kd", "C1 Kd", "0", "复位绳张力反馈微分增益，单位 counts·s/N。"),
+            ("c1_pos_ff", "C1 前馈", "0", "按实测姿态补偿复位绳的绳路变化，系数 0~1。"),
+            ("c1_pos_step", "C1 步长", "5", "复位绳距实测位置的单拍增量上限，单位 counts。"),
+            ("c1_pos_travel", "C1 行程 ±c", "3000", "复位绳相对启动实测位置的行程，单位 counts。"),
+            ("c1_pos_i_limit", "C1 积分上限", "5", "复位绳积分项最大贡献，单位 counts。"),
+            ("c1_pos_min_n", "C1 下限 N", "0.2", "用于校验复位绳张力目标。"),
+        ), offset=1)
+        defaults = self._hybrid_tension_fields()
+        self._hybrid_tension_profiles = [dict(defaults) for _ in MOTOR_FOR_CABLE]
+
+        ff_row = _add_hybrid_fields(angle_grid, (
+            ("roll_tgt", "Roll 目标 °", "", "留空启动时用该轴实测角度。"),
+            ("pitch_tgt", "Pitch 目标 °", "", "留空启动时用该轴实测角度。"),
+            ("pos_limit", "目标限幅 °", "25", "混合模式两轴目标角限幅。"),
+            ("pos_kp", "默认角 Kp", "0.2", "下方留空的逐绳角度 Kp 使用该值。"),
+            ("pos_ki", "默认角 Ki", "0", "下方留空的逐绳角度 Ki 使用该值，单位 1/s。"),
+            ("pos_kd", "角度 Kd", "0", "角度微分增益，单位 s。"),
+            ("pos_step", "角度绳步长", "5", "角度绳距实测位置的单拍增量上限，单位 counts。"),
+            ("pos_deadband", "角度死区 °", "0.3", "混合模式角度误差死区。"),
+        ))
+        self._hybrid_ff_checks = (QCheckBox("Roll 前馈"), QCheckBox("Pitch 前馈"))
+        for axis, (check, key) in enumerate(zip(self._hybrid_ff_checks, ("pos_ff", "pos_ff_pitch"))):
+            check.setChecked(True)
+            check.setToolTip("只切换该轴的绳长前馈，角度 PI 继续工作。")
+            check.toggled.connect(self._save_layout)
+            angle_grid.addWidget(check, ff_row, axis * 2, Qt.AlignRight)
+            coefficient = self._cl_edit("该轴的绳长前馈系数 0~1。填 0 时该轴无前馈补偿。")
+            coefficient.editingFinished.connect(self._save_layout)
+            self._c1_position_edits[key] = coefficient
+            angle_grid.addWidget(coefficient, ff_row, axis * 2 + 1)
+
+        pi_grid = QGridLayout()
+        for column, title in enumerate(("逐绳角度 PI", "Roll Kp", "Roll Ki", "Pitch Kp", "Pitch Ki")):
+            pi_grid.addWidget(QLabel(title), 0, column)
+        self._hybrid_pi_edits = []
+        self._hybrid_pi_labels = []
+        for i, motor in enumerate(MOTOR_FOR_CABLE):
+            name = QLabel(f"C{i + 1} / M{motor}")
+            self._hybrid_pi_labels.append(name)
+            pi_grid.addWidget(name, i + 1, 0)
+            row = []
+            for column in range(1, 5):
+                edit = self._cl_edit("此绳在该轴上的角度增益。留空使用上方对应默认增益。",
+                                     text="")
+                edit.setPlaceholderText("默认")
+                edit.editingFinished.connect(self._save_layout)
+                pi_grid.addWidget(edit, i + 1, column)
+                row.append(edit)
+            self._hybrid_pi_edits.append(row)
+        angle_grid.addLayout(pi_grid, ff_row + 1, 0, 1, 6)
+        self._show_hybrid_return_selection()
+
         self.cl_c1_sine_check = QCheckBox("混合正弦")
         self.cl_c1_sine_check.setToolTip(
-            "同时给**两路**加正弦（各自参数独立，本模式专用）：\n"
-            "· C1 张力 = 「C1 目标 N」 + 符号·「C1 幅度N」·sin(2πft + «C1 相位°»)，f = «C1 频率Hz»\n"
-            "· ROLL/PITCH 角 = 目标角 + 「ROLL幅值°」/「PITCH幅值°」·sin(2πf₂t)，"
-            "f₂ = «角度Hz»（幅值填 0 就那轴不摇）\n"
-            "两路**共用同一个时间零点**，起点都是基值（不阶跃）。数据自动落盘 run_data/sine/。")
+            "复位绳张力和关节角度使用下方的正弦参数。幅值为 0 时保持该目标。\n"
+            "两路共用一个时间零点，数据保存到 run_data/sine/。")
         self.cl_c1_sine_check.toggled.connect(
             lambda on: self._on_c1_test_toggled(on, self.cl_c1_auto_check))
+        sine_grid.addWidget(self.cl_c1_sine_check, 0, 0, 1, 4, Qt.AlignLeft)
+        _add_hybrid_fields(sine_grid, (
+            ("c1_sine_sign", "张力符号", "1", "复位绳张力正弦符号，+1 或 −1。"),
+            ("c1_sine_amp", "张力幅度 N", "3", "复位绳张力正弦幅度，填 0 保持恒张力。"),
+            ("c1_sine_hz", "张力频率 Hz", "0.25", "复位绳张力正弦频率。"),
+            ("c1_sine_phase", "张力相位 °", "0", "复位绳张力正弦相位，−360~360°。"),
+            ("ang_sine_roll", "Roll 幅值 °", "0", "Roll 正弦幅值，填 0 保持 Roll 目标。"),
+            ("ang_sine_pitch", "Pitch 幅值 °", "0", "Pitch 正弦幅值，填 0 保持 Pitch 目标。"),
+            ("ang_sine_hz", "角度频率 Hz", "0.2", "Roll 与 Pitch 共用的角度正弦频率。"),
+        ), offset=2)
         self.cl_c1_auto_check = QCheckBox("混合自动调参")
         self.cl_c1_auto_check.setToolTip(
-            "一次起环跑完整序列，并把每档数据落盘：\n" + hybrid_autotune.summary_text()
-            + "\n序列 = 保持 → C1 张力阶跃上/下 → C1 张力正弦扫频 → ROLL/PITCH 角度阶跃。\n"
-            "跑完按指标自动改「C1 Kp/Ki/积分上限/Kd」与「角度 Kp/Ki」，"
-            "共跑「调参轮数」轮（本模式专用）。")
+            "一次起环跑完整序列，并把每档数据落盘。\n"
+            + hybrid_autotune.summary_text().replace("C1", "复位绳")
+            + "\n自动调参更新所选绳的张力参数和默认角度 Kp/Ki。逐绳填写的增益由你调节。")
         self.cl_c1_auto_check.toggled.connect(
             lambda on: self._on_c1_test_toggled(on, self.cl_c1_sine_check))
-        c1_grid.addWidget(self.cl_c1_sine_check, _mix_row, 0, 1, 2)
-        c1_grid.addWidget(self.cl_c1_auto_check, _mix_row, 2, 1, 2)
-        # 2026-11-26：混合模式**自己的**正弦/调参参数。
-        # 之前混合正弦读的是张力行的 `sine_amp/sine_hz/sine_phase/sine_sign`，
-        # 而那一行在混合模式下**整行隐藏** → 用户根本改不了（实机验证：
-        # 全部 isVisible()=False，跑的一直是看不见的 A=1N / f=0.5Hz）。
-        # 这里按"混合参数一律独立"的口径补齐，布局存档（`c1_position_params`）
-        # 会自动覆盖这些新键，不需要改存档逻辑。
-        _mix_sine = (
-            (
-                ("c1_sine_amp", "C1 幅度N", "3",
-                 "C1 张力正弦幅度 [N]。目标 = 「C1 目标 N」+ 符号·本值·sin(2πft)。"),
-                ("c1_sine_hz", "C1 频率Hz", "0.25", "C1 张力正弦频率 [Hz]，0.01~5。"),
-                ("c1_sine_phase", "C1 相位°", "0", "C1 张力正弦相位 [°]，−360~360。"),
-            ),
-            (
-                ("c1_sine_sign", "C1 符号", "1",
-                 "C1 正弦符号：+1（默认）或 −1。想让张力先降就先填 −1。"),
-                ("c1_auto_rounds", "调参轮数", "3",
-                 "混合自动调参最多跑几轮（1~6）。每轮跑完按指标改增益再重跑。"),
-                ("ang_sine_hz", "角度Hz", "0.2",
-                 "角度正弦频率 [Hz]。ROLL/PITCH 共用同一个频率。"),
-            ),
-            (
-                ("ang_sine_roll", "ROLL幅值°", "0",
-                 "ROLL 正弦幅值 [°]。**0 = 不摇 ROLL**。与 PITCH 各自独立，可只摇一个轴。"),
-                ("ang_sine_pitch", "PITCH幅值°", "0",
-                 "PITCH 正弦幅值 [°]。**0 = 不摇 PITCH**。"),
-            ),
-        )
-        _mix_sine_flat = [f for g in _mix_sine for f in g]
-        _sine_row0 = _mix_row + 1
-        for i, (key, label, default, tooltip) in enumerate(_mix_sine_flat):
-            r, c = divmod(i, 3)
-            lb = QLabel(label)
-            lb.setFixedWidth(76)
-            lb.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            c1_grid.addWidget(lb, _sine_row0 + r, c * 2)
-            edit = self._cl_edit(tooltip, text=default)
-            self._c1_position_edits[key] = edit
-            c1_grid.addWidget(edit, _sine_row0 + r, c * 2 + 1)
-        self._mix_sine_hint = QLabel(
-            "正弦：「混合正弦」勾上后，C1 张力按上面的幅度/频率/相位走；"
-            "ROLL/PITCH 幅值 >0 时角度也同时按「角度Hz」摆（可只摇一个轴）。"
-            "基值分别取「C1 目标 N」与两个目标角。")
-        self._mix_sine_hint.setObjectName("muted")
-        self._mix_sine_hint.setWordWrap(True)
-        c1_grid.addWidget(self._mix_sine_hint, _sine_row0 + len(_mix_sine), 0, 1, 6)
+        hybrid_test_row = QHBoxLayout()
+        auto_rounds = self._cl_edit("混合自动调参轮数，1~6。", text="3")
+        self._c1_position_edits["c1_auto_rounds"] = auto_rounds
+        for widget in (self.cl_c1_auto_check, QLabel("调参轮数"), auto_rounds):
+            hybrid_test_row.addWidget(widget)
+        hybrid_test_row.addStretch(1)
+        hybrid_layout.addLayout(hybrid_test_row)
         self._cl_c1_position_row_w.setVisible(False)
         cl.addWidget(self._cl_c1_position_row_w)
 
@@ -4199,6 +4189,10 @@ class ScopeWindow(QMainWindow):
         keys = self.PRESETS.get(name)
         if keys is None:
             return
+        if name == "混合调试":
+            role = f"tension_f{self._hybrid_return_index + 1}"
+            keys = [role if key == "tension_f1" else
+                    f"{role}_tgt" if key == "tension_f1_tgt" else key for key in keys]
         for ch in self.channels.values():
             ch.tree_item.setCheckState(0, Qt.Checked if ch.key in keys else Qt.Unchecked)
 
@@ -5670,9 +5664,9 @@ class ScopeWindow(QMainWindow):
             return
         if self._tension_ch_map[cable_idx] == ch:
             return
-        if cable_idx == 0 and self._cl_mode == "c1_position":
+        if cable_idx == self._hybrid_return_index and self._cl_mode == "c1_position":
             if self.cl_enabled:
-                self._stop_closed_loop("C1 张力通道已更改")
+                self._stop_closed_loop(f"C{cable_idx + 1} 复位绳的张力通道已更改")
             self._tension_last = None
         self._tension_ch_map[cable_idx] = ch
         if self.rt_window is not None:
@@ -5723,6 +5717,11 @@ class ScopeWindow(QMainWindow):
         self.tension_status.setText("张力：已排队 全部去皮归零")
 
     def _tension_observer_zero_changed(self, channel: int | None = None) -> None:
+        selected = self._hybrid_return_index
+        if self._cl_mode == "c1_position" and (channel is None or channel == self._tension_ch_map[selected]):
+            if self.cl_enabled:
+                self._stop_closed_loop(f"C{selected + 1} 复位绳的张力零点已更改")
+            self._tension_last = None
         if self.rt_window is not None and (channel is None or channel == self._tension_ch_map[0]):
             self.rt_window.estimate_panel.invalidate_reference()
 
@@ -6104,7 +6103,7 @@ class ScopeWindow(QMainWindow):
             return None
         return roll_deg, pitch_deg, out, rr, pr
 
-    # ---------- 自动慢扫掠（闭环目标三角波；标定录数用） ----------
+    # ---------- 目标扫掠（闭环目标正弦；跟随/带宽测试用） ----------
     def _sweep_key(self) -> str:
         idx = self.sweep_axis.currentIndex()
         return "roll_tgt" if idx == 0 else "pitch_tgt"
@@ -6120,8 +6119,7 @@ class ScopeWindow(QMainWindow):
         idx = self.sweep_axis.currentIndex()
         if idx == 2 and self.sweep_center0.isChecked():
             self._sweep_center = (0.0, 0.0)   # 过零对称：正负都扫到
-        self._sweep_val = self._sweep_center[idx] if idx in (0, 1) else 0.0
-        self._sweep_dir = 1.0 if self._sweep_val <= 0 else -1.0
+        # 2026-11-26 去掉三角波后不再需要 _sweep_val/_sweep_dir（只有三角波用）
         self._sweep_phase = 0.0
         self._sweep_ts = None
 
@@ -6141,41 +6139,38 @@ class ScopeWindow(QMainWindow):
         self._sync_sweep_widgets()
 
     def _sync_sweep_widgets(self) -> None:
-        """按 轴/波形 禁用无关控件，避免"填了不生效"的困惑。
+        """按「轴」禁用无关控件 + 刷新右侧「生效：…」提示。
 
-        · 双轴正弦：波形下拉失效（固定正弦）、三角速度失效、PITCH 幅值生效；
-        · 单轴 + 三角波：速度生效、频率失效、PITCH 幅值失效；
-        · 单轴 + 正弦波：频率生效、速度失效、PITCH 幅值失效。
+        2026-11-26 去掉三角波后，这里只按轴开关 PITCH 幅值：
+        · 单轴（ROLL/PITCH）：PITCH 幅值不生效；
+        · 双轴正弦：PITCH 幅值生效。
+        频率 / ROLL 幅值**永远生效**（不再有"被波形禁用"这一说）。
         """
         idx = self.sweep_axis.currentIndex()
         dual = idx == 2
-        sine = dual or self.sweep_wave_combo.currentIndex() == 1
-        self.sweep_wave_combo.setEnabled(not dual)
-        self.sweep_freq.setEnabled(sine)
-        self.sweep_speed.setEnabled(not sine)
-        self.sweep_amp_p.setEnabled(dual)
-        # 2026-11-26：右侧显示「当前生效的是哪个旋钮」。
-        # 起因：波形默认「三角波」时频率框被禁用、只保留上次的值（0.2），
-        # 看起来像"频率锁死改不了"。这里把它说破。
+        amp_p = getattr(self, "sweep_amp_p", None)
+        if amp_p is not None:
+            amp_p.setEnabled(dual)
         lbl = getattr(self, "sweep_active_label", None)
         if lbl is not None:
             try:
-                if sine:
-                    lbl.setText(f"生效：频率 {self.sweep_freq.value():g} Hz"
-                                + ("（双轴固定正弦）" if dual else ""))
-                else:
-                    lbl.setText(f"生效：速度 {self.sweep_speed.value():g} °/s"
-                                "  ← 想按频率走，把「波形」切到「正弦波」")
+                axis = self.sweep_axis.currentText()
+                txt = (f"生效：{axis} · {self.sweep_freq.value():g} Hz"
+                       f" · 幅值 {self.sweep_amp.value():g}°")
+                if dual:
+                    txt += f"/{self.sweep_amp_p.value():g}°"
+                lbl.setText(txt)
             except (AttributeError, RuntimeError):
                 pass
 
     def _sweep_tick(self, dt: float | None = None) -> None:
-        """20Hz：闭环运行且勾选扫掠时推进所选轴目标波形（±幅值内）。
+        """20Hz：闭环运行且勾选扫掠时推进所选轴的**正弦**目标。
 
-        三角波：按速度°/s 线性往返（录标定用，慢到准）。
-        正弦波：目标 = A·sin(2πf·t)，A=「幅值°」框（默认跟随限幅）、f=频率框、
-        相位从勾选时刻起算。峰值速度需求 = A·2πf——超过每拍限幅折算的速度
-        上限（max_step_f×100Hz）就会削顶/滞后，正是带宽测试要观察的现象。
+        2026-11-26 用户要求去掉三角波 —— 现在只有正弦：
+          · 单轴：target = 幅值·sin(2πf·t)（中心 0，正负都到）
+          · 双轴正弦：target = 中心 + 各自幅值·sin(2πf·t)
+        峰值角速度需求 = 幅值×2πf —— 超过每拍限幅折算的速度上限
+        （max_step_f×100Hz）就会削顶/滞后，正是带宽测试要观察的现象。
 
         dt：本拍步长（s）。缺省按真实墙钟算——旧版写死 0.05，主线程忙时
         定时器延迟会让实际频率低于设定值，带宽测试会系统性低估（2026-11-10 修复）。
@@ -6190,32 +6185,19 @@ class ScopeWindow(QMainWindow):
             # 首拍按标称 50ms；卡顿/挂起时钳到 0.2s，别让相位一次跳半圈
             dt = 0.05 if last is None else min(max(now - last, 0.001), 0.2)
         lim = self._cl_fval("limit", 25.0, 1.0, 90.0)
-        idx = self.sweep_axis.currentIndex()
-        if idx == 2:                                     # 双轴正弦（同相位）
-            self._sweep_phase = (self._sweep_phase
-                                 + 2.0 * math.pi * self.sweep_freq.value() * dt)
-            self._sweep_phase %= 2.0 * math.pi
-            s = math.sin(self._sweep_phase)
-            ar = min(self.sweep_amp.value(), lim)
+        self._sweep_phase = (self._sweep_phase
+                             + 2.0 * math.pi * self.sweep_freq.value() * dt)
+        self._sweep_phase %= 2.0 * math.pi
+        s = math.sin(self._sweep_phase)
+        amp = min(self.sweep_amp.value(), lim)
+        if self.sweep_axis.currentIndex() == 2:          # 双轴正弦（同相位）
             ap = min(self.sweep_amp_p.value(), lim)
-            r = max(-lim, min(lim, self._sweep_center[0] + ar * s))
+            r = max(-lim, min(lim, self._sweep_center[0] + amp * s))
             p = max(-lim, min(lim, self._sweep_center[1] + ap * s))
             self.cl_edits["roll_tgt"].setText(f"{r:+.2f}")
             self.cl_edits["pitch_tgt"].setText(f"{p:+.2f}")
             return
-        amp = min(self.sweep_amp.value(), lim)
-        if self.sweep_wave_combo.currentIndex() == 1:      # 正弦波
-            self._sweep_phase = (self._sweep_phase
-                                 + 2.0 * math.pi * self.sweep_freq.value() * dt)
-            self._sweep_phase %= 2.0 * math.pi
-            v = amp * math.sin(self._sweep_phase)
-        else:                                              # 三角波（原有）
-            v = self._sweep_val + self._sweep_dir * self.sweep_speed.value() * dt
-            if v >= amp:
-                v, self._sweep_dir = amp, -1.0
-            elif v <= -amp:
-                v, self._sweep_dir = -amp, 1.0
-        self._sweep_val = v
+        v = max(-lim, min(lim, amp * s))
         self.cl_edits[self._sweep_key()].setText(f"{v:+.2f}")
 
     def _toggle_closed_loop(self) -> None:
@@ -6261,12 +6243,12 @@ class ScopeWindow(QMainWindow):
             params = self._read_c1_position_params()
             if params is None:
                 return "混合模式：专用参数无效，请检查目标、增益和限幅"
-            _, _, reason = self._c1_position_feedback(params.c1.max_n)
+            _, _, reason = self._c1_position_feedback(params.c1.max_n, params.return_cable)
             if reason is not None:
                 return f"混合模式：{reason}"
             pose = self._wrist_pose_now()
-            if pose is not None and self._c1_position_geometry(*pose) is None:
-                return "混合模式：姿态无效或 C2/C3 无法独立控制双轴"
+            if pose is not None and self._c1_position_geometry(*pose, params.return_cable) is None:
+                return "混合模式：姿态无效或两根角度绳无法独立控制双轴"
         motors = self._enabled_motors()
         if self._cl_mode == "c1_position" and not set(MOTOR_FOR_CABLE).issubset(motors):
             return "混合模式：C1、C2、C3 对应的电机都需勾选"
@@ -6381,6 +6363,7 @@ class ScopeWindow(QMainWindow):
         self._cl_motor_on = frozenset(motors)
         self._overload_streak = 0        # 过载去抖计数每轮从零起
         self.cl_enabled = True
+        self.cl_return_cable_combo.setEnabled(False)
         self.cl_btn.setText("■ 停止闭环")
         self.cl_btn.setStyleSheet(
             f"font-weight: bold; padding: 6px; color: white; background-color: {AT.T('good')};")
@@ -6418,7 +6401,7 @@ class ScopeWindow(QMainWindow):
         elif self._cl_mode == "tight":
             mode = "张紧控制"
         elif self._cl_mode == "c1_position":
-            mode = "C1 张力 + ROLL/PITCH 角度"
+            mode = f"C{self._hybrid_return_index + 1} 张力 + ROLL/PITCH 角度"
         else:
             # 位置模式只有一种结构：PID+前馈（绳长前馈 + PI，每拍限幅）
             mode = "位置·" + self._pos_loop_name()
@@ -6497,6 +6480,8 @@ class ScopeWindow(QMainWindow):
         """
         self._cl_stop_request = reason or "停止"
         self._sine_log_close()               # 停环就把正弦记录收口（2026-11-24）
+        # 2026-11-26：停环后目标曲线回到「界面框的值」，不再用上一拍的命令值
+        self._c1_cmd_tgt = None
         loop = self._cl_loop
         self._cl_loop = None
         if loop is not None:
@@ -6530,6 +6515,7 @@ class ScopeWindow(QMainWindow):
         self._tighten_cl_active = False
         self._overload_streak = 0        # 停环清去抖计数
         self.cl_enabled = False
+        self.cl_return_cable_combo.setEnabled(True)
         self._apply_run_prio()       # 停环恢复全速（主图 33FPS、表格 30Hz、观测台 20Hz）
         self._want_closed_loop = False
         self.cl_btn.setText("▶ 启动闭环")
@@ -6659,11 +6645,14 @@ class ScopeWindow(QMainWindow):
         flim_row = getattr(self, "_cl_flim_row_w", None)
         if flim_row is not None:
             flim_row.setVisible(not c1_position)
-        if force or c1_position:
-            self.sweep_check.setChecked(False)      # 扫掠是位置模式专属
-            self.sweep_check.setEnabled(False)
-        else:
-            self.sweep_check.setEnabled(True)
+        # 2026-11-26：扫掠允许 **位置模式 + 阻抗模式**。
+        # 阻抗的输入就是目标角 q*，而扫掠改的正是 q* —— 这是测阻抗阶跃/频响
+        # 最直接的手段。之前把 impedance 一并算进"力控家族"禁掉，
+        # 表现就是"阻抗模式下扫掠那块看得见却是灰的"（用户实报）。
+        sweep_ok = self._cl_mode in ("position", "impedance")
+        if not sweep_ok:
+            self.sweep_check.setChecked(False)
+        self.sweep_check.setEnabled(sweep_ok)
         # 2026-11-26：混合模式自动补上位姿曲线（进入该模式时调用，只加不减）
         if c1_position:
             try:
@@ -7628,7 +7617,7 @@ class ScopeWindow(QMainWindow):
 
         位置模式：t_s, roll, pitch, tgt_roll, tgt_pitch, 下发目标 counts, 实测 counts（20 Hz）
         力控/张力：t_s, mode, roll, pitch, f1..f3, t_meas, τ(2), 预紧, trim(3)（20 Hz）
-        混合模式：同上 + 末列 c2_n / c3_n（C2/C3 不参与本模式控制，仅记录观测值）
+        混合模式：三绳实测张力、电机位置、复位绳及两轴前馈状态。
         """
         if self._cl_mode == "c1_position":
             rows = list(self._c1_diag_rows)
@@ -7643,7 +7632,12 @@ class ScopeWindow(QMainWindow):
                         "meas_c1_c", "meas_c2_c", "meas_c3_c", "c1_pid_c", "c1_ff_c",
                         "angle_ff_gain", "c1_ff_gain", "angle_flags",
                         "c1_step_limited", "c1_travel_limited", "c23_step_limited",
-                        "c1_age_ms", "command_sent", "c2_n", "c3_n"],
+                        "c1_age_ms", "command_sent", "c2_n", "c3_n",
+                        "return_cable", "return_n", "return_target_n", "return_pid_c",
+                        "return_ff_c", "return_ff_gain", "return_step_limited",
+                        "return_travel_limited", "angle_step_limited",
+                        "return_age_ms", "roll_ff_on", "pitch_ff_on",
+                        "roll_ff_gain", "pitch_ff_gain"],
                 t=[row[0] for row in rows],
                 columns=[list(col) for col in zip(*(row[1:] for row in rows))])
             self._ctrl_status(
@@ -7809,16 +7803,17 @@ class ScopeWindow(QMainWindow):
                     return "?"
             fp.write(f"# 正弦跟随测试 {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
             if self._cl_mode == "c1_position":
+                label = f"C{self._hybrid_return_index + 1}"
                 # 目标角框留空时，运行时基值取的是**实测角度** —— 文件头据此写。
                 def _ang_base(k):
                     try:
                         return self._c1_position_edits[k].text().strip() or "实测"
                     except (KeyError, AttributeError):
                         return "?"
-                fp.write(f"# 混合正弦 C1幅度={_rawc('c1_sine_amp', '3')}N "
-                         f"C1频率={_rawc('c1_sine_hz', '0.25')}Hz "
-                         f"C1相位={_rawc('c1_sine_phase', '0')}deg "
-                         f"C1符号={_rawc('c1_sine_sign', '1')} "
+                fp.write(f"# 混合正弦 复位绳={label} {label}幅度={_rawc('c1_sine_amp', '3')}N "
+                         f"{label}频率={_rawc('c1_sine_hz', '0.25')}Hz "
+                         f"{label}相位={_rawc('c1_sine_phase', '0')}deg "
+                         f"{label}符号={_rawc('c1_sine_sign', '1')} "
                          f"基值={_rawc('c1_pos_target', '5')}N | "
                          f"角度频率={_rawc('ang_sine_hz', '0.2')}Hz "
                          f"ROLL幅值={_rawc('ang_sine_roll', '0')}deg "
@@ -7837,15 +7832,20 @@ class ScopeWindow(QMainWindow):
             # 2026-11-26：混合模式（C1 单路张力 + 双轴角度）单独记一段，
             # 否则事后无法从文件头判断这组数据是哪套增益跑出来的。
             if self._cl_mode == "c1_position":
-                fp.write(f"# 混合模式 C1目标={_rawc('c1_pos_target')}N "
-                         f"C1 Kp/Ki/Kd/积分上限="
+                fp.write(f"# 混合模式 {label}目标={_rawc('c1_pos_target')}N "
+                         f"{label} Kp/Ki/Kd/积分上限="
                          f"{_rawc('c1_pos_kp')}/{_rawc('c1_pos_ki')}/"
                          f"{_rawc('c1_pos_kd')}/{_rawc('c1_pos_i_limit')} "
-                         f"C1步长={_rawc('c1_pos_step')} 行程={_rawc('c1_pos_travel')} "
-                         f"角度Kp/Ki/Kd/前馈={_rawc('pos_kp')}/{_rawc('pos_ki')}/"
-                         f"{_rawc('pos_kd')}/{_rawc('pos_ff')} "
+                         f"{label}步长={_rawc('c1_pos_step')} 行程={_rawc('c1_pos_travel')} "
+                         f"角度Kp/Ki/Kd={_rawc('pos_kp')}/{_rawc('pos_ki')}/{_rawc('pos_kd')} "
                          f"角度步长={_rawc('pos_step')} 死区={_rawc('pos_deadband')} "
                          f"限幅={_rawc('pos_limit')}\n")
+                gains = ["C" + str(i + 1) + "=" + "/".join(edit.text().strip() or "默认"
+                         for edit in row) for i, row in enumerate(self._hybrid_pi_edits)]
+                ff_roll, ff_pitch = (int(check.isChecked()) for check in self._hybrid_ff_checks)
+                fp.write(f"# Roll前馈={ff_roll} 系数={_rawc('pos_ff')} "
+                         f"Pitch前馈={ff_pitch} 系数={_rawc('pos_ff_pitch')} 逐绳Roll/Pitch PI "
+                         + " ".join(gains) + "\n")
             fp.write("# 注意：t_s 从勾选时刻起算；tgt=目标张力[N]；f=实测张力[N]；"
                      "trim=本拍位置增量[counts]\n")
             fp.write("t_s,roll_deg,pitch_deg,"
@@ -8053,9 +8053,8 @@ class ScopeWindow(QMainWindow):
             self._sine_log_open()           # 每次开启都换一份文件
             is_auto = other is getattr(self, "cl_c1_sine_check", None)
             self._ctrl_status(
-                ("🧪 混合自动调参已开：" + hybrid_autotune.summary_text()) if is_auto
-                else "🧪 混合正弦已开：C1 = 「C1 目标 N」+「C1 符号」·「C1 幅度N」"
-                     "·sin(2π·「C1 频率Hz」·t + 「C1 相位°」)；"
+                ("🧪 混合自动调参已开：" + hybrid_autotune.summary_text().replace("C1", "复位绳")) if is_auto
+                else "🧪 混合正弦已开。复位绳按张力正弦参数变化，张力幅度填 0 时保持恒定。"
                      "「ROLL幅值°/PITCH幅值°」>0 时角度也按「角度Hz」摆"
                      "（参数都在本模式行里）", log=False)
         else:
@@ -8177,18 +8176,96 @@ class ScopeWindow(QMainWindow):
         return tuple(float(self._c1_position_edits[key].text().strip() or value)
                      for key, value in zip(("roll_tgt", "pitch_tgt"), pose))
 
+    def _hybrid_tension_fields(self):
+        return {key: self._c1_position_edits[key].text() for key in self._hybrid_tension_labels}
+
+    def _show_hybrid_return_selection(self) -> None:
+        selected = self._hybrid_return_index
+        for label, original in self._hybrid_tension_labels.values():
+            label.setText(original.replace("C1", f"C{selected + 1}"))
+        for i, motor in enumerate(MOTOR_FOR_CABLE):
+            is_return = i == selected
+            self._hybrid_pi_labels[i].setText(f"C{i + 1} / M{motor}" + (" · 复位" if is_return else ""))
+            for edit in self._hybrid_pi_edits[i]:
+                edit.setEnabled(not is_return)
+
+    def _on_hybrid_return_changed(self, index: int) -> None:
+        previous = self._hybrid_return_index
+        if index == previous:
+            return
+        combo = self.cl_return_cable_combo
+        if self.cl_enabled or index not in range(len(MOTOR_FOR_CABLE)):
+            blocked = combo.blockSignals(True)
+            combo.setCurrentIndex(previous)
+            combo.blockSignals(blocked)
+            return
+        self._hybrid_tension_profiles[previous] = self._hybrid_tension_fields()
+        self._hybrid_return_index = index
+        for key, value in self._hybrid_tension_profiles[index].items():
+            self._c1_position_edits[key].setText(value)
+        self._show_hybrid_return_selection()
+        self._c1_position_state.reset()
+        self._c1_angle_state.reset()
+        if self.preset_combo.currentText() == "混合调试":
+            self._apply_preset(self.preset_combo.currentIndex())
+        self._save_layout()
+
+    def _restore_hybrid_settings(self, data) -> None:
+        # 旧存档里的单套张力增益只迁给 C1。
+        self._hybrid_tension_profiles[0] = self._hybrid_tension_fields()
+        saved = data.get("hybrid_tension_profiles")
+        if isinstance(saved, list):
+            for profile, row in zip(self._hybrid_tension_profiles, saved):
+                if isinstance(row, dict):
+                    profile.update({key: str(row[key]) for key in profile if key in row})
+        selected = data.get("hybrid_return_cable", 0)
+        if not isinstance(selected, int) or selected not in range(len(MOTOR_FOR_CABLE)):
+            selected = 0
+        self._hybrid_return_index = selected
+        blocked = self.cl_return_cable_combo.blockSignals(True)
+        self.cl_return_cable_combo.setCurrentIndex(selected)
+        self.cl_return_cable_combo.blockSignals(blocked)
+        for key, value in self._hybrid_tension_profiles[selected].items():
+            self._c1_position_edits[key].setText(value)
+        gains = data.get("hybrid_angle_pi")
+        if isinstance(gains, list):
+            for edits, values in zip(self._hybrid_pi_edits, gains):
+                if isinstance(values, list):
+                    for edit, value in zip(edits, values):
+                        edit.setText(str(value))
+        axes = data.get("hybrid_ff_axes")
+        if isinstance(axes, list):
+            for check, value in zip(self._hybrid_ff_checks, axes):
+                if isinstance(value, bool):
+                    blocked = check.blockSignals(True)
+                    check.setChecked(value)
+                    check.blockSignals(blocked)
+        self._show_hybrid_return_selection()
+
     def _read_c1_position_params(self):
         try:
             roll, pitch = self._c1_position_targets(self._wrist_pose_now() or (0.0, 0.0))
             v = {key: float(edit.text()) for key, edit in self._c1_position_edits.items()
                  if key not in ("roll_tgt", "pitch_tgt")}
+            gain_keys = ("pos_kp", "pos_ki", "c1_pos_kp", "c1_pos_ki")
+            if not all(math.isfinite(v[key]) and v[key] >= 0.0 for key in gain_keys):
+                return None
+            defaults = (v["pos_kp"], v["pos_ki"]) * 2
+            cable_pi = []
+            for i, row in enumerate(self._hybrid_pi_edits):
+                values = ((0.0,) * 4 if i == self._hybrid_return_index else
+                          tuple(float(edit.text().strip() or default)
+                                for edit, default in zip(row, defaults)))
+                if not all(math.isfinite(value) and value >= 0.0 for value in values):
+                    return None
+                cable_pi.append((values[:2], values[2:]))
         except ValueError:
             return None
         ranges = {
-            "pos_kp": (0, 5), "pos_ki": (0, 100), "pos_kd": (0, 10),
-            "pos_ff": (0, 1), "pos_step": (1, 2000),
+            "pos_kd": (0, 10), "pos_ff": (0, 1), "pos_ff_pitch": (0, 1),
+            "pos_step": (1, 2000),
             "pos_deadband": (0, 10), "pos_limit": (1, 90),
-            "c1_pos_kp": (0, 10000), "c1_pos_ki": (0, 10000), "c1_pos_kd": (0, 10000),
+            "c1_pos_kd": (0, 10000),
             "c1_pos_ff": (0, 1), "c1_pos_step": (1, 2000),
             "c1_pos_travel": (1, 50000), "c1_pos_i_limit": (0, 2000),
             "c1_pos_min_n": (0, 200), "c1_pos_max_n": (1, 200),
@@ -8202,7 +8279,9 @@ class ScopeWindow(QMainWindow):
             return None
         angles = WristControlParams()
         angles.kp, angles.ki, angles.kd = v["pos_kp"], v["pos_ki"], v["pos_kd"]
-        angles.k_ff = v["pos_ff"]
+        angles.ff_axis_gains = (v["pos_ff"], v["pos_ff_pitch"])
+        angles.cable_pi = tuple(cable_pi)
+        angles.ff_axes = tuple(check.isChecked() for check in self._hybrid_ff_checks)
         angles.max_step = int(v["pos_step"])
         angles.deadband_deg = v["pos_deadband"]
         angles.target_limit_deg = v["pos_limit"]
@@ -8214,18 +8293,19 @@ class ScopeWindow(QMainWindow):
             ff_gain=v["c1_pos_ff"], max_step=int(v["c1_pos_step"]),
             travel=int(v["c1_pos_travel"]), i_limit=v["c1_pos_i_limit"],
             min_n=f_min, max_n=f_max)
-        return HybridWristParams(angles, roll, pitch, c1)
+        return HybridWristParams(angles, roll, pitch, c1, self._hybrid_return_index)
 
-    def _c1_position_feedback(self, f_max):
+    def _c1_position_feedback(self, f_max, return_cable=0):
+        label = f"C{return_cable + 1}"
         last = self._tension_last
         fresh_s = STALE_MS / 1000.0
         if last is None or not (0.0 <= time.monotonic() - last[0] <= fresh_s):
-            return None, None, "C1 张力无数据或已过期"
-        f1 = last[1][0]
-        if not math.isfinite(f1) or f1 < F_SENSOR_MIN_N:
-            return None, None, "C1 张力读数无效"
-        if f1 >= f_max:
-            return None, None, f"C1 张力过载 {f1:.2f} N（上限 {f_max:g} N）"
+            return None, None, f"{label} 张力无数据或已过期"
+        force = last[1][return_cable]
+        if not math.isfinite(force) or force < F_SENSOR_MIN_N:
+            return None, None, f"{label} 张力读数无效"
+        if force >= f_max:
+            return None, None, f"{label} 张力过载 {force:.2f} N（上限 {f_max:g} N）"
 
         t0 = self.t0
         if t0 is None:
@@ -8236,16 +8316,18 @@ class ScopeWindow(QMainWindow):
         for name, (sample_t, value) in zip(names, samples):
             if not math.isfinite(value) or not (0.0 <= age_at - sample_t <= fresh_s):
                 return None, None, f"{name} 反馈无效或已过期"
-        return [int(value) for _, value in samples[2:]], (last[0], f1), None
+        return [int(value) for _, value in samples[2:]], last, None
 
-    def _c1_position_geometry(self, roll, pitch):
+    def _c1_position_geometry(self, roll, pitch, return_cable=0):
         dr, dp = self.wrist_calib.zero_offset_deg
         model = wrist_eval(math.radians(MODEL_AXIS_SIGN[0] * roll + dr),
                            math.radians(pitch_model_deg(pitch) + dp))
         if not model.math_valid or not model.angle_in_range:
             return None
-        # C2/C3 必须能独立产生双轴修正。相对判据与力臂的单位无关。
-        (_, a, b), (_, c, d) = model.r_m
+        # 参与位置控制的两根绳必须能独立产生双轴修正。
+        i, j = (i for i in range(len(MOTOR_FOR_CABLE)) if i != return_cable)
+        a, b = model.r_m[ROLL][i], model.r_m[ROLL][j]
+        c, d = model.r_m[PITCH][i], model.r_m[PITCH][j]
         if abs(a * d - b * c) <= 1e-6 * (a * a + b * b + c * c + d * d):
             return None
         return model
@@ -8362,6 +8444,7 @@ class ScopeWindow(QMainWindow):
 
         c1_min = max(0.0, self._c1_fval("c1_pos_min_n", 0.2))
         c1_max = max(c1_min + 0.1, self._c1_fval("c1_pos_max_n", 25.0))
+        label = f"C{params.return_cable + 1}"
         if auto_on:
             if self._auto_t0_pc is None:
                 self._auto_t0_pc = time.perf_counter()
@@ -8375,8 +8458,8 @@ class ScopeWindow(QMainWindow):
             if idx is None:
                 return params, self.MIX_STAGE_DONE, "done", "", True
             self._auto_stage, self._auto_kind = idx, kind
-            note = (f"  🤖{idx + 1}/{hybrid_autotune.stage_count()} {name}"
-                    f" t={local:.1f}s C1={c1_n:.2f}N R={roll_t:+.1f}° P={pitch_t:+.1f}°")
+            note = (f"  🤖{idx + 1}/{hybrid_autotune.stage_count()} {name.replace('C1', label)}"
+                    f" t={local:.1f}s {label}={c1_n:.2f}N R={roll_t:+.1f}° P={pitch_t:+.1f}°")
             p2 = _rp(params, roll_target_deg=roll_t, pitch_target_deg=pitch_t,
                      c1=_rp(params.c1, target_n=c1_n))
             return p2, idx, kind, note, False
@@ -8409,8 +8492,8 @@ class ScopeWindow(QMainWindow):
             pitch_t = max(-lim_a, min(lim_a, pitch_t))
         ang_txt = (f" R±{amp_r:g}°/P±{amp_p:g}°@{ang_hz:g}Hz"
                    if (amp_r > 0.0 or amp_p > 0.0) else "")
-        note = (f"  🔁C1 {amp:.2f}N@{hz:.3f}Hz{ang_txt} t={t:.1f}s"
-                f"→C1 {v:.2f}N")
+        note = (f"  🔁{label} {amp:.2f}N@{hz:.3f}Hz{ang_txt} t={t:.1f}s"
+                f"→{label} {v:.2f}N")
         p2 = _rp(params, c1=_rp(params.c1, target_n=v),
                  roll_target_deg=roll_t, pitch_target_deg=pitch_t)
         return (p2, self.MIX_STAGE_MANUAL, "sine", note, False)
@@ -8440,7 +8523,7 @@ class ScopeWindow(QMainWindow):
         try:
             _meta, data = wrist_autotune.read_csv(path) if path else (None, None)
             if data:
-                rows = hybrid_autotune.metrics(data)
+                rows = hybrid_autotune.metrics(data, self._hybrid_return_index)
         except (OSError, ValueError):
             rows = []
         if not rows:
@@ -8460,6 +8543,7 @@ class ScopeWindow(QMainWindow):
         try:
             self._safety("AUTOTUNE_ROUND", mode="c1_position", round=rnd + 1,
                          max_rounds=max_rounds, converged=int(conv),
+                         return_cable=self._hybrid_return_index + 1,
                          c1_kp=new["c1"]["kp"], c1_ki=new["c1"]["ki"],
                          c1_itl=new["c1"]["itl"], c1_kd=new["c1"]["kd"],
                          ang_kp=new["ang"]["kp"], ang_ki=new["ang"]["ki"])
@@ -8503,46 +8587,54 @@ class ScopeWindow(QMainWindow):
                 f"🧪 混合自动调参完成（{hybrid_autotune.stage_count()} 档 / "
                 f"{hybrid_autotune.total_seconds():g}s）—— 数据已保存")
             return
-        base, sample, reason = self._c1_position_feedback(params.c1.max_n)
+        return_cable = params.return_cable
+        return_label = f"C{return_cable + 1}"
+        angle_cables = [i for i in range(len(MOTOR_FOR_CABLE)) if i != return_cable]
+        base, sample, reason = self._c1_position_feedback(params.c1.max_n, return_cable)
         if reason is not None:
             self._stop_closed_loop(f"混合模式：{reason}")
             return
-        model = self._c1_position_geometry(roll, pitch)
+        model = self._c1_position_geometry(roll, pitch, return_cable)
         if model is None:
-            self._stop_closed_loop("混合模式：姿态无效或 C2/C3 无法独立控制双轴")
+            self._stop_closed_loop("混合模式：姿态无效或两根角度绳无法独立控制双轴")
             return
 
         roll_target, pitch_target = params.roll_target_deg, params.pitch_target_deg
+        # 2026-11-26：把本拍**实际下发**的目标交给 GUI（`_update_tables` 60Hz 读它
+        # 画目标曲线 + 更新大字）。没有这一行，混控开正弦时屏幕上目标线不动。
+        self._c1_cmd_tgt = (roll_target, pitch_target, params.c1.target_n)
         sign = MODEL_AXIS_SIGN[0]
         angles = params.angles
+        ff_gains = angles.ff_axis_gains
+        ff_active = tuple(on and gain > 0.0 for on, gain in zip(angles.ff_axes, ff_gains))
         outputs, flags = wrist_control_step_pid(
             angles, calib, self._c1_angle_state,
             sign * roll, pitch_model_deg(pitch),
             sign * roll_target, pitch_model_deg(pitch_target), self._cl_dt,
-            feedforward=False, base_counts=base, chord_from_fb=angles.k_ff > 0.0)
+            feedforward=False, base_counts=base, chord_from_fb=any(ff_active))
         if outputs is None:
             self._stop_closed_loop("混合模式：双轴位置指令无效")
             return
 
-        force_time, f1 = sample
-        # C2/C3 只作观测（本模式不控它们），但和 C1 同一帧记进诊断 CSV，便于事后对账。
-        _last_f = self._tension_last
-        f2, f3 = ((_last_f[1][1], _last_f[1][2]) if _last_f is not None
-                  else (math.nan, math.nan))
-        c1 = c1_tension_target(
-            params.c1, self._c1_position_state, force_n=f1, force_time=force_time,
-            length_m=model.s_m[ROLL][0] + model.s_m[PITCH][0],
-            counts=base[0], origin=angles.origin[0], spool_k=calib.k_counts_per_m[0],
+        force_time, forces = sample
+        force = forces[return_cable]
+        tension_output = c1_tension_target(
+            params.c1, self._c1_position_state, force_n=force, force_time=force_time,
+            length_m=model.s_m[ROLL][return_cable] + model.s_m[PITCH][return_cable],
+            counts=base[return_cable], origin=angles.origin[return_cable],
+            spool_k=calib.k_counts_per_m[return_cable],
             dt=self._cl_dt)
-        if c1 is None:
-            self._stop_closed_loop("混合模式：C1 实测位置超出专用行程")
+        if tension_output is None:
+            self._stop_closed_loop(f"混合模式：{return_label} 实测位置超出专用行程或张力指令无效")
             return
 
-        pos_steps = [out - curr for out, curr in zip(outputs[1:], base[1:])]
-        pos_limited = any(abs(step) > angles.max_step for step in pos_steps)
-        targets = [c1.counts] + [
-            curr + max(-angles.max_step, min(angles.max_step, step))
-            for curr, step in zip(base[1:], pos_steps)]
+        targets = list(base)
+        targets[return_cable] = tension_output.counts
+        pos_limited = False
+        for i in angle_cables:
+            step = outputs[i] - base[i]
+            pos_limited |= abs(step) > angles.max_step
+            targets[i] = base[i] + max(-angles.max_step, min(angles.max_step, step))
         outs = {m: target for m, target in zip(MOTOR_FOR_CABLE, targets)
                 if m in self._cl_motor_on and target != self.targets.get(m)}
         sent = bool(outs) and self._send_motor_batch(outs)
@@ -8555,32 +8647,41 @@ class ScopeWindow(QMainWindow):
         for m, target in zip(MOTOR_FOR_CABLE, applied):
             if target is not None:
                 self.channels[f"m{m}_tgt"].buf.append(rel, target)
+        force_age_ms = (now - force_time) * 1000.0
+        return_fields = (params.c1.target_n, tension_output.pid_counts, tension_output.ff_counts,
+                         params.c1.ff_gain, int(tension_output.step_limited),
+                         int(tension_output.travel_limited))
+        # 旧列继续表示物理 C1，角色相关的通用列另列。
+        c1_fields = return_fields if return_cable == 0 else (math.nan,) * len(return_fields)
+        shared_ff_gain = ff_gains[0] if ff_gains[0] == ff_gains[1] else math.nan
         self._c1_diag_rows.append((
-            rel, roll, pitch, roll_target, pitch_target, f1, params.c1.target_n,
-            *applied, *base, c1.pid_counts, c1.ff_counts,
-            angles.k_ff, params.c1.ff_gain, flags,
-            int(c1.step_limited), int(c1.travel_limited), int(pos_limited),
-            (now - force_time) * 1000.0, int(bool(sent)), f2, f3))
+            rel, roll, pitch, roll_target, pitch_target, forces[0], c1_fields[0],
+            *applied, *base, c1_fields[1], c1_fields[2],
+            shared_ff_gain, c1_fields[3], flags, c1_fields[4], c1_fields[5],
+            int(pos_limited) if return_cable == 0 else math.nan,
+            force_age_ms if return_cable == 0 else math.nan, int(bool(sent)), *forces[1:],
+            return_cable + 1, force, *return_fields, int(pos_limited), force_age_ms,
+            *(int(on) for on in ff_active), *ff_gains))
         # 2026-11-26：勾了「混合正弦 / 混合自动调参」时同步落盘（与张力模式
         # 共用同一个 CSV 写入器；多了末尾三列 roll_tgt_deg/pitch_tgt_deg/c1_tgt_n）。
         if mix_note and getattr(self, "_sine_log_fp", None) is not None:
+            force_targets = [math.nan] * len(MOTOR_FOR_CABLE)
+            force_targets[return_cable] = params.c1.target_n
             self._sine_log_row(
-                roll, pitch,
-                (params.c1.target_n, math.nan, math.nan),   # 只有 f1 有目标
-                (f1, f2, f3),
+                roll, pitch, force_targets, forces,
                 [float(t - b) if t is not None else 0.0
                  for t, b in zip(targets, base)],
                 stage=mix_stage, kind=mix_kind,
                 angle_tgt=(roll_target, pitch_target),
-                c1_tgt=params.c1.target_n)
+                c1_tgt=params.c1.target_n if return_cable == 0 else None)
         if self._cl_beat % 6 == 0:
             notes = []
-            if c1.travel_limited:
-                notes.append("C1 行程限幅")
-            if c1.step_limited:
-                notes.append("C1 步长限幅")
+            if tension_output.travel_limited:
+                notes.append(f"{return_label} 行程限幅")
+            if tension_output.step_limited:
+                notes.append(f"{return_label} 步长限幅")
             if pos_limited:
-                notes.append("C2/C3 步长限幅")
+                notes.append("角度绳步长限幅")
             notes.extend(name for bit, name in CL_FLAG_NAMES if flags & bit)
             suffix = f"  ⚠{'、'.join(notes)}" if notes else ""
             # 2026-11-26：显示当前位姿下 C1 的「预紧份额」与耦合比 —— 决定
@@ -8592,17 +8693,18 @@ class ScopeWindow(QMainWindow):
                     math.radians(MODEL_AXIS_SIGN[0] * roll + _dr),
                     math.radians(pitch_model_deg(pitch) + _dp),
                     out_model=model)
-                _cp = coupling_ratios(_nd) if _nd is not None else None
+                _cp = coupling_ratios(_nd, return_cable) if _nd is not None else None
                 if _cp is not None:
-                    _n1, _s2, _s3 = _cp
-                    coup_txt = (f"  C1预紧{_n1:.2f}"
-                                f"(+1N→C2{_s2:+.1f}/C3{_s3:+.1f}N)")
-                    if _n1 < 0.20:
+                    share, *ratios = _cp
+                    detail = "/".join(f"C{i + 1}{gain:+.1f}"
+                                      for i, gain in zip(angle_cables, ratios))
+                    coup_txt = f"  {return_label}预紧{share:.2f}(+1N→{detail}N)"
+                    if share < 0.20:
                         coup_txt += "⚠耦合重"
             except Exception:
                 coup_txt = ""
             self._cl_status_set(
-                f"混合控制  C1 {f1:.2f}→{params.c1.target_n:.2f} N  "
+                f"混合控制  {return_label} {force:.2f}→{params.c1.target_n:.2f} N  "
                 f"ROLL {roll:+.2f}→{roll_target:+.2f}°  "
                 f"PITCH {pitch:+.2f}→{pitch_target:+.2f}°{suffix}{coup_txt}{mix_note}")
 
@@ -9396,6 +9498,14 @@ class ScopeWindow(QMainWindow):
             else:
                 r_tgt = self._cl_fval("roll_tgt", 0.0, -999.0, 999.0)
                 p_tgt = self._cl_fval("pitch_tgt", 0.0, -999.0, 999.0)
+            # 2026-11-26：混合模式**运行中**要用它实际下发的目标（正弦/阶跃），
+            # 不能用界面框里的基值 —— 否则「混合正弦」开着时屏幕上的目标线
+            # 一动不动，看上去像"正弦没生效"（内部目标其实一直在变，
+            # CSV 的 `c1_tgt_n` / `roll_tgt_deg` 列可以证明）。
+            _cmd = getattr(self, "_c1_cmd_tgt", None)
+            if (self._cl_mode == "c1_position" and self.cl_enabled
+                    and _cmd is not None):
+                r_tgt, p_tgt = _cmd[0], _cmd[1]
             if pose is not None:
                 # 位置模式只显示角度：目标角 vs 当前角。
                 # （不再换算/显示"目标编码器值"：那是 raw 口径，pitch 的
@@ -9411,6 +9521,15 @@ class ScopeWindow(QMainWindow):
                 self.channels["pose_pitch"].buf.append(rel, pose[1])
                 self.channels["pose_roll_tgt"].buf.append(rel, r_tgt)
                 self.channels["pose_pitch_tgt"].buf.append(rel, p_tgt)
+                # 2026-11-26：混合模式还要把 **C1 张力目标** 推上曲线。
+                # 张力/力控模式由 `_force_tick_apply` 里的 `_push_tension_tgt_curves`
+                # 负责；混合模式不走那条链，所以原来 `tension_f1_tgt` 从来没被写过
+                # （实测计数恒为 0）。
+                if (self._cl_mode == "c1_position" and self.cl_enabled
+                        and _cmd is not None):
+                    ch = self.channels.get(f"tension_f{self._hybrid_return_index + 1}_tgt")
+                    if ch is not None and math.isfinite(_cmd[2]):
+                        ch.buf.append(rel, float(_cmd[2]))
         roll_raw = self._enc_filt_raw[16]
         pitch_raw = self._enc_filt_raw[17]
         for axis, j, big, detail in (
@@ -9644,9 +9763,12 @@ class ScopeWindow(QMainWindow):
                 # 旧版只有 C1 参数归属混合模式，公用角度参数由专用默认值接替。
                 hybrid = {k: v for k, v in data.get("cl_params", {}).items()
                           if k in ("c1_pos_target", "c1_pos_kp", "c1_pos_ki", "c1_pos_travel")}
+            # 旧布局的 pos_ff 同时用于两轴。
+            hybrid = {"pos_ff_pitch": hybrid.get("pos_ff", "0"), **hybrid}
             for key, edit in self._c1_position_edits.items():
                 if key in hybrid:
                     edit.setText(str(hybrid[key]))
+            self._restore_hybrid_settings(data)
             # 2026-11-18 合并后：t_tgt 是 preload 的只读镜像，旧布局里可能存着
             # 过时的 t*（如 15）而 preload 是 5 —— 加载完强制以 preload 为准。
             self.cl_edits["t_tgt"].setText(self.cl_edits["preload"].text())
@@ -9772,6 +9894,10 @@ class ScopeWindow(QMainWindow):
         import os
         if os.environ.get("QT_QPA_PLATFORM") == "offscreen":
             return  # 离屏测试实例不写布局，防止污染用户配置
+        hybrid_profiles = [dict(profile) for profile in self._hybrid_tension_profiles]
+        hybrid_profiles[self._hybrid_return_index] = self._hybrid_tension_fields()
+        legacy_hybrid = {key: edit.text() for key, edit in self._c1_position_edits.items()}
+        legacy_hybrid.update(hybrid_profiles[0])
         data = {
             "checked": [k for k, ch in self.channels.items()
                         if ch.tree_item.checkState(0) == Qt.Checked],
@@ -9787,7 +9913,11 @@ class ScopeWindow(QMainWindow):
             "ramp_rate": self.ramp_rate_spin.value(),
             "step": self.step_combo.currentText(),
             "cl_params": {k: e.text() for k, e in self.cl_edits.items()},
-            "c1_position_params": {k: e.text() for k, e in self._c1_position_edits.items()},
+            "c1_position_params": legacy_hybrid,
+            "hybrid_return_cable": self._hybrid_return_index,
+            "hybrid_tension_profiles": hybrid_profiles,
+            "hybrid_angle_pi": [[edit.text() for edit in row] for row in self._hybrid_pi_edits],
+            "hybrid_ff_axes": [check.isChecked() for check in self._hybrid_ff_checks],
             # 位置环结构固定为「每拍递增 PID」。`pos_loop=2` / `cl_model_on=False`
             # 是给能读这两个键的旧版本看的（它们会落回自己的默认档）。
             "pos_loop": 2,

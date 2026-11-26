@@ -284,6 +284,7 @@ def c1_position(win):
     win._c1_diag_rows.clear()
     fields = {"roll_tgt": "0", "pitch_tgt": "0", "pos_kp": "0.2",
               "pos_ki": "0", "pos_kd": "0", "pos_ff": "0", "pos_step": "5",
+              "pos_ff_pitch": "0",
               "c1_pos_target": "5", "c1_pos_kp": "15", "c1_pos_ki": "0", "c1_pos_kd": "0",
               "c1_pos_ff": "0", "c1_pos_step": "50", "c1_pos_max_n": "25"}
     for key, value in fields.items():
@@ -295,6 +296,12 @@ def c1_position(win):
     win._tension_last = (now, [5.0, math.nan, math.nan])
     yield win, sent
     win.cl_mode_combo.setCurrentIndex(win.cl_mode_combo.findData("position"))
+    win.cl_return_cable_combo.setCurrentIndex(0)
+    for row in win._hybrid_pi_edits:
+        for edit in row:
+            edit.clear()
+    for check in win._hybrid_ff_checks:
+        check.setChecked(True)
 
 
 def test_c1_position_displays_all_three_tensions(c1_position):
@@ -407,13 +414,13 @@ def test_c1_position_ignores_other_modes_tuning(c1_position):
 def test_c1_position_feedforward_channels_are_independent(c1_position):
     w, sent = c1_position
     w._c1_position_edits["pos_kp"].setText("0")
-    w._c1_position_edits["pos_ff"].setText("0.25")
+    w._c1_position_edits["pos_ff_pitch"].setText("0.25")
     w._c1_position_edits["pitch_tgt"].setText("2")
     w._cl_tick()
     assert sent == {27: 1100, 28: 2105, 29: 3105}
     assert w._c1_diag_rows[-1][14] == 0.0       # C1 FF 关闭
 
-    w._c1_position_edits["pos_ff"].setText("0")
+    w._c1_position_edits["pos_ff_pitch"].setText("0")
     w._c1_position_edits["c1_pos_ff"].setText("0.5")
     w._enc_filt_raw[17] -= 2.0                   # 模型 pitch 变大，C1 绳路变长
     sent.clear()
@@ -442,6 +449,58 @@ def test_c1_position_exports_its_own_diagnostics(c1_position, monkeypatch):
     assert columns["c1_ff_c"] == [0.0, 0.0]
 
 
+def test_hybrid_scales_each_axis_feedforward_independently(c1_position, monkeypatch):
+    w, sent = c1_position
+    fields = {"roll_tgt": "2", "pitch_tgt": "3", "pos_ff": "0.2",
+              "pos_ff_pitch": "0.7", "pos_kp": "0", "pos_step": "1000"}
+    for key, value in fields.items():
+        w._c1_position_edits[key].setText(value)
+    w._cl_tick()
+
+    target = wrist_eval(math.radians(scope.MODEL_AXIS_SIGN[0] * 2),
+                        math.radians(scope.pitch_model_deg(3)))
+    actual = wrist_eval(0.0, 0.0)
+    assert sent[27] == 1100
+    for i, motor in ((1, 28), (2, 29)):
+        roll_delta = target.s_m[ROLL][i] - actual.s_m[ROLL][i]
+        pitch_delta = target.s_m[PITCH][i] - actual.s_m[PITCH][i]
+        counts = w.wrist_calib.k_counts_per_m[i] * (0.2 * roll_delta + 0.7 * pitch_delta)
+        assert sent[motor] == round(1100 + 1000 * i + counts)
+
+    w._cl_tick()
+    exported = {}
+    monkeypatch.setattr(scope, "dump_csv", lambda name, **kw: exported.update(kw) or name)
+    w._export_diag_csv()
+    columns = dict(zip(exported["header"], exported["columns"]))
+    assert columns["roll_ff_gain"] == [0.2, 0.2]
+    assert columns["pitch_ff_gain"] == [0.7, 0.7]
+
+
+def test_hybrid_accepts_high_pi_gains_with_output_limits(c1_position):
+    w, sent = c1_position
+    fields = {"roll_tgt": "2", "pos_kp": "8", "pos_ki": "150",
+              "c1_pos_kp": "12000", "c1_pos_ki": "14000"}
+    for key, value in fields.items():
+        w._c1_position_edits[key].setText(value)
+    for edit, value in zip(w._hybrid_pi_edits[1], ("9", "110", "7", "120")):
+        edit.setText(value)
+    params = w._read_c1_position_params()
+    assert (params.c1.kp, params.c1.ki) == (12000, 14000)
+    assert params.angles.cable_pi[1] == ((9, 110), (7, 120))
+    assert params.angles.cable_pi[2] == ((8, 150), (8, 150))
+
+    w._tension_last = (time.monotonic(), [4.0, math.nan, math.nan])
+    w._cl_tick()
+    assert sent[27] - 1100 == 50
+    assert abs(sent[28] - 2100) == abs(sent[29] - 3100) == 5
+
+    w._hybrid_pi_edits[1][0].setText("inf")
+    assert w._read_c1_position_params() is None
+    w._hybrid_pi_edits[1][0].clear()
+    w._c1_position_edits["pos_kp"].setText("-1")
+    assert w._read_c1_position_params() is None
+
+
 def test_c1_position_layout_keeps_separate_gains(c1_position, monkeypatch):
     w, _ = c1_position
     w.cl_edits["kp"].setText("0.7")
@@ -461,3 +520,134 @@ def test_c1_position_layout_keeps_separate_gains(c1_position, monkeypatch):
     w._load_layout()
     assert w._read_c1_position_params().angles.kp == pytest.approx(0.31)
     assert w._read_c1_position_params().c1.ff_gain == pytest.approx(0.2)
+
+
+def test_hybrid_migrates_old_shared_feedforward_gain(c1_position, monkeypatch):
+    w, _ = c1_position
+    monkeypatch.setattr(scope, "load_layout_json", lambda: {"c1_position_params": {"pos_ff": "0.4"}})
+    w._load_layout()
+    assert w._read_c1_position_params().angles.ff_axis_gains == (0.4, 0.4)
+
+
+@pytest.mark.parametrize("selected", [1, 2])
+def test_hybrid_routes_selected_tension_to_its_motor(c1_position, monkeypatch, selected):
+    w, sent = c1_position
+    w.cl_return_cable_combo.setCurrentIndex(selected)
+    w._c1_position_edits["c1_pos_kp"].setText("10")
+    w._c1_position_edits["c1_pos_step"].setText("30")
+    samples = [math.nan] * 3
+    samples[selected] = 4.0
+    w._tension_last = (time.monotonic(), samples)
+    assert w._start_cl_gate_reason() is None
+    w._cl_tick()
+    expected = {27: 1100, 28: 2100, 29: 3100}
+    expected[27 + selected] += 10
+    assert sent == expected
+
+    sent.clear()
+    samples[selected] = math.nan
+    samples[0] = 4.0
+    w._tension_last = (time.monotonic(), samples)
+    stopped = []
+    monkeypatch.setattr(w, "_stop_closed_loop", stopped.append)
+    w._cl_tick()
+    assert stopped and f"C{selected + 1} 张力读数无效" in stopped[0]
+    assert not sent
+
+
+@pytest.mark.parametrize("axis", [0, 1])
+def test_hybrid_c2_return_axis_ff_and_cable_pi_are_independent(c1_position, axis):
+    w, _ = c1_position
+    w.cl_return_cable_combo.setCurrentIndex(1)
+    w._tension_last = (time.monotonic(), [math.nan, 5.0, math.nan])
+    w._c1_position_edits[("pos_ff", "pos_ff_pitch")[axis]].setText("0.5")
+    w._c1_position_edits["pos_step"].setText("100")
+    w._c1_position_edits[("roll_tgt", "pitch_tgt")[axis]].setText("2")
+    for cable in (0, 2):
+        for edit in w._hybrid_pi_edits[cable]:
+            edit.setText("0")
+    w._hybrid_ff_checks[axis].setChecked(False)
+    w._hybrid_pi_edits[0][axis * 2].setText("1")
+    w._cl_tick()
+    assert w.targets[27] != 1100
+    assert w.targets[28] == 2100
+    assert w.targets[29] == 3100
+
+    w._hybrid_ff_checks[axis].setChecked(True)
+    w._cl_tick()
+    assert w.targets[28] == 2100
+    assert w.targets[29] != 3100
+
+
+def test_hybrid_uses_angle_cables_for_rank_check(c1_position, monkeypatch):
+    w, _ = c1_position
+    from types import SimpleNamespace
+
+    result = SimpleNamespace(math_valid=True, angle_in_range=True,
+                             r_m=((1.0, 0.0, 0.0), (0.0, 1.0, 2.0)))
+    monkeypatch.setattr(scope, "wrist_eval", lambda *unused: result)
+    assert w._c1_position_geometry(0, 0, 0) is None
+    assert w._c1_position_geometry(0, 0, 1) is result
+    assert w._c1_position_geometry(0, 0, 2) is result
+
+
+def test_hybrid_role_profiles_and_position_settings_survive_reload(c1_position, monkeypatch):
+    w, _ = c1_position
+    w._c1_position_edits["c1_pos_kp"].setText("12")
+    w.cl_return_cable_combo.setCurrentIndex(1)
+    w._c1_position_edits["c1_pos_kp"].setText("23")
+    w._c1_position_edits["c1_pos_ki"].setText("4")
+    w._hybrid_pi_edits[2][3].setText("1.5")
+    w._c1_position_edits["pos_ff"].setText("0.2")
+    w._c1_position_edits["pos_ff_pitch"].setText("0.7")
+    w._hybrid_ff_checks[1].setChecked(False)
+
+    saved = {}
+    monkeypatch.setattr(scope, "save_layout_json", saved.update)
+    monkeypatch.delenv("QT_QPA_PLATFORM")
+    w._save_layout()
+    saved_layout = dict(saved)
+    assert saved_layout["c1_position_params"]["c1_pos_kp"] == "12"
+    w.cl_return_cable_combo.setCurrentIndex(0)
+    assert w._read_c1_position_params().c1.kp == 12
+    monkeypatch.setattr(scope, "load_layout_json", lambda: saved_layout)
+    w._load_layout()
+    params = w._read_c1_position_params()
+    assert params.return_cable == 1
+    assert (params.c1.kp, params.c1.ki) == (23, 4)
+    assert params.angles.cable_pi[2][1][1] == 1.5
+    assert params.angles.ff_axes == (True, False)
+    assert params.angles.ff_axis_gains == (0.2, 0.7)
+
+    w.cl_enabled = True
+    try:
+        w.cl_return_cable_combo.setCurrentIndex(2)
+        assert w.cl_return_cable_combo.currentIndex() == w._hybrid_return_index == 1
+    finally:
+        w.cl_enabled = False
+
+
+def test_hybrid_c2_return_routes_targets_and_diagnostics(c1_position, monkeypatch):
+    w, _ = c1_position
+    w.cl_return_cable_combo.setCurrentIndex(1)
+    w._tension_last = (time.monotonic(), [1.0, 4.0, 3.0])
+    monkeypatch.setattr(w, "_c1_test_override", lambda params: (params, -1, "sine", "test", False))
+    monkeypatch.setattr(w, "_sine_log_fp", object())
+    samples = []
+    monkeypatch.setattr(w, "_sine_log_row", lambda *args, **kw: samples.append((args, kw)))
+    w._cl_tick()
+    w._cl_tick()
+    assert samples[-1][0][2][1] == 5.0
+    assert math.isnan(samples[-1][0][2][0])
+    assert samples[-1][0][3] == [1.0, 4.0, 3.0]
+    assert samples[-1][1]["c1_tgt"] is None
+
+    exported = {}
+    monkeypatch.setattr(scope, "dump_csv", lambda name, **kw: exported.update(kw) or name)
+    w._export_diag_csv()
+    cols = dict(zip(exported["header"], exported["columns"]))
+    assert cols["return_cable"] == [2, 2]
+    assert cols["return_target_n"] == [5.0, 5.0]
+    assert cols["return_n"] == cols["c2_n"] == [4.0, 4.0]
+    assert cols["c1_n"] == [1.0, 1.0]
+    assert all(math.isnan(value) for value in cols["c1_target_n"])

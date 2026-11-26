@@ -132,60 +132,62 @@ def test_visibility_correct_without_saved_mode(win):
     win._apply_cl_mode_visibility()
     assert _eff_visible(win.cl_edits["f_min"])
 
-# ---------------- 4. 扫掠频率"锁死 0.2"的可见性提示（2026-11-26） ----------------
+# ---------------- 4. 扫掠：只剩正弦（2026-11-26 去掉三角波） ----------------
 
-def test_sweep_freq_disabled_on_triangle(win):
-    """三角波下频率框必须禁用 —— 这就是"频率只能固定 0.2"的原因。"""
+def test_sweep_has_no_triangle_wave(win):
+    """三角波已删除：不再有波形下拉/速度框，频率永远可用。"""
+    assert not hasattr(win, "sweep_wave_combo")
+    assert not hasattr(win, "sweep_speed")
     _set_mode(win, "position")
-    win.sweep_axis.setCurrentIndex(0)
-    win.sweep_wave_combo.setCurrentIndex(0)          # 三角波
-    assert not win.sweep_freq.isEnabled()
-    assert win.sweep_speed.isEnabled()
-
-
-def test_sweep_freq_enabled_on_sine(win):
-    _set_mode(win, "position")
-    win.sweep_axis.setCurrentIndex(0)
-    win.sweep_wave_combo.setCurrentIndex(1)          # 正弦波
     assert win.sweep_freq.isEnabled()
-    assert not win.sweep_speed.isEnabled()
+
+
+def test_sweep_freq_always_enabled(win):
+    """三种轴下频率框都必须可编辑（修前三角波下是灰的）。"""
+    _set_mode(win, "position")
+    for ax in (0, 1, 2):
+        win.sweep_axis.setCurrentIndex(ax)
+        assert win.sweep_freq.isEnabled(), f"轴={ax} 时频率被禁用"
     win.sweep_freq.setValue(0.35)
     assert win.sweep_freq.value() == pytest.approx(0.35)
 
 
-def test_sweep_freq_enabled_on_dual(win):
-    _set_mode(win, "position")
-    win.sweep_wave_combo.setCurrentIndex(0)          # 双轴时波形失效
-    win.sweep_axis.setCurrentIndex(2)                # 双轴正弦
-    assert win.sweep_freq.isEnabled()
-
-
-def test_sweep_hint_label_tells_which_knob(win):
-    """右侧「生效：…」必须跟着 轴/波形 变，避免再把"禁用"看成"锁死"。"""
+def test_sweep_pitch_amp_only_on_dual(win):
     _set_mode(win, "position")
     win.sweep_axis.setCurrentIndex(0)
-    win.sweep_wave_combo.setCurrentIndex(0)
-    assert "速度" in win.sweep_active_label.text()
-    assert "正弦波" in win.sweep_active_label.text()   # 给出怎么切
-    win.sweep_wave_combo.setCurrentIndex(1)
-    assert "频率" in win.sweep_active_label.text()
+    assert not win.sweep_amp_p.isEnabled()
+    win.sweep_axis.setCurrentIndex(2)
+    assert win.sweep_amp_p.isEnabled()
 
 
-def test_sweep_hint_label_follows_value(win):
+def test_sweep_hint_label_shows_active_params(win):
     _set_mode(win, "position")
     win.sweep_axis.setCurrentIndex(0)
-    win.sweep_wave_combo.setCurrentIndex(1)
     win.sweep_freq.setValue(0.75)
-    assert "0.75" in win.sweep_active_label.text()
+    txt = win.sweep_active_label.text()
+    assert "ROLL" in txt and "0.75" in txt
 
 
-def test_sweep_hint_survives_mode_roundtrip(win):
+def test_sweep_hint_shows_both_amps_on_dual(win):
     _set_mode(win, "position")
-    win.sweep_axis.setCurrentIndex(0)
-    win.sweep_wave_combo.setCurrentIndex(1)
-    _set_mode(win, "tension")
+    win.sweep_axis.setCurrentIndex(2)
+    win.sweep_amp.setValue(7.0)
+    win.sweep_amp_p.setValue(3.0)
+    txt = win.sweep_active_label.text()
+    assert "7" in txt and "3" in txt
+
+
+def test_sweep_allowed_in_position_and_impedance_only(win):
+    """扫掠：位置 + 阻抗可用；三个力控模式与混合模式禁用。"""
     _set_mode(win, "position")
-    assert "频率" in win.sweep_active_label.text()
+    assert win.sweep_check.isEnabled()
+    _set_mode(win, "impedance")
+    assert win.sweep_check.isEnabled(), "阻抗模式应当允许扫掠（输入就是 q*）"
+    for mode in ("force", "tension", "tight", "c1_position"):
+        _set_mode(win, mode)
+        assert not win.sweep_check.isEnabled(), mode
+    _set_mode(win, "position")
+
 
 # ---------------- 5. 混合模式自动勾上位姿曲线（2026-11-26） ----------------
 
@@ -234,3 +236,68 @@ def test_hybrid_preset_exists_and_covers_pose(win):
     for k in _POSE_KEYS:
         assert k in keys
     assert "tension_f1" in keys
+
+# ---------------- 6. 混合模式的目标曲线必须跟着正弦走（2026-11-26 实报） ----------------
+
+def _pose_ready(win):
+    """让 `_wrist_pose_now()` 返回 (0,0)、并给一个时间基准。"""
+    win._enc_filt_raw[16] = 5000
+    win._enc_filt_raw[17] = 5000
+    win.angle_baseline[16] = win._axis_deg(16, 5000)
+    win.angle_baseline[17] = win._axis_deg(17, 5000)
+    win._latest_t = 1.0
+
+
+def test_hybrid_cmd_targets_drive_curves(win):
+    """`_c1_cmd_tgt` 一设，pose_*_tgt 与 tension_f1_tgt 必须跟着变。
+
+    修前：pose_*_tgt 用的是界面框（常数），tension_f1_tgt 从来没被写过
+    —— 表现就是"开了混合正弦，目标曲线一动不动"。
+    """
+    _set_mode(win, "c1_position")
+    _pose_ready(win)
+    win.cl_enabled = True
+    try:
+        win._c1_cmd_tgt = (5.0, -10.0, 8.0)
+        win._update_tables()
+        assert win.channels["pose_roll_tgt"].buf.last() == pytest.approx(5.0)
+        assert win.channels["pose_pitch_tgt"].buf.last() == pytest.approx(-10.0)
+        assert win.channels["tension_f1_tgt"].buf.last() == pytest.approx(8.0)
+        # 换一个相位
+        win._c1_cmd_tgt = (-5.0, 10.0, 2.0)
+        win._update_tables()
+        assert win.channels["pose_roll_tgt"].buf.last() == pytest.approx(-5.0)
+        assert win.channels["tension_f1_tgt"].buf.last() == pytest.approx(2.0)
+    finally:
+        win._c1_cmd_tgt = None
+        win.cl_enabled = False
+
+
+def test_hybrid_cmd_targets_update_big_labels(win):
+    _set_mode(win, "c1_position")
+    _pose_ready(win)
+    win.cl_enabled = True
+    try:
+        win._c1_cmd_tgt = (5.0, -10.0, 8.0)
+        win._update_tables()
+        assert "+5.00" in win.cl_roll_now.text()
+        assert "-10.00" in win.cl_pitch_now.text()
+    finally:
+        win._c1_cmd_tgt = None
+        win.cl_enabled = False
+
+
+def test_hybrid_curves_fall_back_to_ui_when_stopped(win):
+    """停环（`_c1_cmd_tgt=None`）后目标曲线回到界面框的值，不再停在命令值。"""
+    _set_mode(win, "c1_position")
+    _pose_ready(win)
+    win.cl_enabled = True
+    try:
+        win._c1_cmd_tgt = (5.0, -10.0, 8.0)
+        win._update_tables()
+        win._c1_cmd_tgt = None                  # 等价于停环后的状态
+        win._update_tables()
+        # 界面目标角留空 → 用实测角 0；不应再是 5.0
+        assert win.channels["pose_roll_tgt"].buf.last() == pytest.approx(0.0, abs=1e-6)
+    finally:
+        win.cl_enabled = False
